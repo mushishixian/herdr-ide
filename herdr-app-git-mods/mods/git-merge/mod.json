@@ -1,0 +1,11 @@
+{
+  "place": "none",
+  "title": "Merge Branch",
+  "overlay": {
+    "kind": "popup",
+    "at": "top",
+    "offset": 40,
+    "width": 540,
+    "height": 0.72
+  }
+}

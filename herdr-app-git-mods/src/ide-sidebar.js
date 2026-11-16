@@ -1,0 +1,1539 @@
+import { View, div, svg } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
+import {
+  spaces, panes, agents, terminals, focused, exec, readTextFile, writeTextFile, watchFolder,
+  theme, settings, openOverlay, notify, checking, appHome, window as win,
+  run, shared, setShared,
+} from "herdr";
+
+const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
+
+function locationKey() {
+  const l = getContext();
+  return JSON.stringify({ cwd: l.cwd, on: l.on, space: l.space?.id });
+}
+
+async function listDirectory(path, on) {
+  if (!on && win()?.platform === "windows") {
+    const r = await exec(
+      "powershell",
+      ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 500 | ForEach-Object { @{ name=$_.Name; dir=$_.PSIsContainer } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"],
+      { on },
+    );
+    if (r.code !== 0) throw new Error(r.stderr || "Cannot list folder");
+    const res = JSON.parse(r.stdout || "[]");
+    return Array.isArray(res) ? res : [res];
+  }
+  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
+  const r = await exec("sh", ["-c", script, "files", path], { on });
+  if (r.code !== 0) throw new Error(r.stderr || "Cannot list folder");
+  const fields = r.stdout.split("\0"), out = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) out.push({ name: fields[i + 1], dir: fields[i] === "d" });
+  return out;
+}
+
+export default class IdeSidebar extends View {
+  init(p, cx) {
+    this.view = p?.view || "scm"; // "explorer" | "search" | "scm" | "settings"
+    this.entries = new Map();
+    this.folders = new Set();
+    this.pendingFolders = new Set();
+    this.marks = {};
+    this.newPrompt = null; // null | "file" | "dir"
+    this.confirmDel = null;
+    this.confirmGit = null; // { prompt, args, title }
+    this.renameFrom = null;
+    this.clipboard = null; // { mode: "copy" | "cut", path }
+    this.lastMenuSeq = shared("ide.menu.action")?.seq ?? 0;
+    this.lastDirtySeq = shared("ide.git.dirtySeq") ?? 0;
+    this.lastJumpSeq = shared("ide.terminalEditor.jump")?.seq ?? 0;
+    this.seenTabPanes = new Map();
+    this.lastStatusRaw = null;
+
+    // SCM state
+    this.branch = null;
+    this.ahead = 0;
+    this.behind = 0;
+    this.hasUpstream = false;
+    this.lastCoolKey = null;
+    this.lastFetchAt = 0;
+    this.fetching = false;
+    this.conflicts = [];
+    this.staged = [];
+    this.unstaged = [];
+    this.commits = [];
+    this.stashes = [];
+    this.showCommits = false;
+    this.showStashes = false;
+    this.busy = false;
+    this.error = null;
+    this.note = null;
+    this.message = "";
+    this.thinking = "off";
+    this.autoTriedSpaces = new Set();
+
+    // Search state
+    this.searchResults = [];
+    this.searchBusy = false;
+
+    this.handle = cx.focus_handle();
+    this.commitInput = InputState.new({ placeholder: "Commit message (Ctrl+Enter)…" });
+    this.commitInput.on("change", (_e, cx) => { this.message = this.commitInput.value(); cx.notify(); });
+    this.commitInput.on("submit", (_e, cx) => this.commit(cx));
+
+    this.newNameInput = InputState.new({ placeholder: "Relative path (e.g. src/foo.ts)…" });
+    this.newNameInput.on("submit", (_e, cx) => this.createItem(cx));
+
+    this.renameInput = InputState.new({ placeholder: "New path…" });
+    this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
+
+    this.searchInput = InputState.new({ placeholder: "Search in repo…" });
+    this.searchInput.on("submit", (_e, cx) => this.runInlineSearch(cx));
+
+    this.aiUrlInput = InputState.new({ placeholder: "https://api.openai.com/v1" });
+    this.aiKeyInput = InputState.new({ placeholder: "API Key (sk-…)" });
+    this.aiModelInput = InputState.new({ placeholder: "gpt-4o-mini" });
+
+    if (checking()) return;
+    setShared("ide.sidebar.alive", true);
+    this.bootSettings(cx);
+    this.refresh(cx);
+    cx.timer.every(25, (cx2) => this.pollSharedSignals(cx2));
+    cx.timer.every(1500, (cx) => {
+      if (this.view === "scm" && this.root && !this.loading && !this.probing) {
+        this.probeStatus(cx);
+      }
+      const cfg = getIdeSettings();
+      const now = Date.now();
+      if (!this.lastTick || now - this.lastTick >= cfg.refreshSec * 1000) {
+        this.lastTick = now;
+        this.refresh(cx);
+      }
+      const { space, on: ctxOn } = getContext();
+      if (space) {
+        recordWorkspaceSnapshot(space, this.root, this.view);
+        const activeTab = space.tabs?.find((t) => t.active)?.id;
+        if (activeTab) {
+          const sig = panes().filter((p) => p.tab === activeTab).map((p) => p.pane).join(",");
+          if (this.seenTabPanes.get(activeTab) !== sig) {
+            this.seenTabPanes.set(activeTab, sig);
+            enforceTabEditorOrderAndMouse(activeTab, cfg);
+          } else {
+            for (const p of panes().filter((x) => x.tab === activeTab && x.terminal && isEditorPane(x, null))) {
+              const term = terminals().find((t) => t.address === p.terminal);
+              if (term && term.labels?.["herdr.right-click"] !== "program") {
+                run("terminal.right_click", { terminal: p.terminal, to: "program" });
+              }
+            }
+          }
+          const edRoot = this.root || this.cwd || space.folder;
+          if ((ctxOn !== null || win()?.platform !== "windows") && edRoot) {
+            const daemonName = `ide-${shortHash(`${activeTab}:${edRoot}`)}`;
+            const coolKey = `${daemonName}:${cfg.coolInactiveFresh ? 1 : 0}`;
+            if (coolKey !== this.lastCoolKey) {
+              this.lastCoolKey = coolKey;
+              cx.spawn(async () => syncFreshCooling(daemonName, cfg.coolInactiveFresh, ctxOn));
+            }
+          }
+        }
+      }
+      if (cfg.fetchSec > 0 && this.root && this.hasUpstream && !this.fetching && (!this.lastFetchAt || now - this.lastFetchAt >= cfg.fetchSec * 1000)) {
+        this.lastFetchAt = now;
+        this.fetching = true;
+        const fRoot = this.root;
+        const fOn = this.on;
+        cx.spawn(async (cx2) => {
+          try {
+            await exec("git", ["fetch", "--quiet"], { cwd: fRoot, on: fOn, timeout: 15000 }).catch(() => {});
+            this.probeStatus(cx2);
+          } finally {
+            this.fetching = false;
+          }
+        });
+      }
+    });
+  }
+
+  pollSharedSignals(cx) {
+    const act = shared("ide.menu.action");
+    if (act?.seq && act.seq !== this.lastMenuSeq) {
+      this.lastMenuSeq = act.seq;
+      this.handleMenuAction(act, cx);
+    }
+    const dirtySeq = shared("ide.git.dirtySeq") ?? 0;
+    if (dirtySeq !== this.lastDirtySeq) {
+      this.lastDirtySeq = dirtySeq;
+      this.refresh(cx);
+    }
+    const jump = shared("ide.terminalEditor.jump");
+    if (jump?.seq && jump.seq !== this.lastJumpSeq) {
+      this.lastJumpSeq = jump.seq;
+      cx.spawn(async (cx2) => execTerminalEditorJump(jump, cx2));
+    }
+  }
+
+  probeStatus(cx) {
+    if (!this.root || this.probing || this.loading) return;
+    this.probing = true;
+    const root = this.root;
+    const on = this.on;
+    cx.spawn(async (cx) => {
+      try {
+        const st = await exec("git", [...READ, "status", "--porcelain=v1", "--branch", "-z", "--no-renames", "--untracked-files=all"], { cwd: root, on });
+        if (st.code === 0 && st.stdout !== this.lastStatusRaw) {
+          this.applyStatusOutput(st.stdout);
+          cx.notify();
+        }
+      } catch {}
+      finally {
+        this.probing = false;
+      }
+    });
+  }
+
+  applyStatusOutput(raw) {
+    this.lastStatusRaw = raw;
+    const conflicts = [], staged = [], unstaged = [], marks = {};
+    let ahead = 0, behind = 0, hasUpstream = false;
+    for (const entry of (raw ?? "").split("\0").filter(Boolean)) {
+      if (entry.startsWith("## ")) {
+        hasUpstream = entry.includes("...");
+        ahead = Number(/ahead (\d+)/.exec(entry)?.[1] ?? 0);
+        behind = Number(/behind (\d+)/.exec(entry)?.[1] ?? 0);
+        continue;
+      }
+      const x = entry[0], y = entry[1], path = entry.slice(3);
+      const full = `${this.root}/${path}`;
+      if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D")) {
+        conflicts.push({ path, status: "!" });
+        marks[full] = "U";
+      } else {
+        if (x !== " " && x !== "?") {
+          staged.push({ path, status: x });
+          marks[full] = x;
+        }
+        if (y !== " ") {
+          const s = x === "?" && y === "?" ? "?" : y;
+          unstaged.push({ path, status: s });
+          if (!marks[full]) marks[full] = s === "?" ? "A" : s;
+        }
+      }
+    }
+    this.conflicts = conflicts;
+    this.staged = staged;
+    this.unstaged = unstaged;
+    this.marks = marks;
+    this.ahead = ahead;
+    this.behind = behind;
+    this.hasUpstream = hasUpstream;
+    const activeSp = spaces().find((s) => s.active);
+    if (activeSp?.id) {
+      setShared("ide.gitSyncBySpace", {
+        ...(shared("ide.gitSyncBySpace") ?? {}),
+        [activeSp.id]: { ahead, behind, hasUpstream },
+      });
+    }
+  }
+
+  async bootSettings(cx) {
+    try {
+      const rawIde = await readTextFile(`${appHome()}/ide-settings.json`);
+      if (rawIde) {
+        const parsed = JSON.parse(rawIde);
+        setShared("ide.settings", { ...DEFAULT_IDE_SETTINGS, ...parsed });
+      }
+    } catch {}
+    try {
+      const raw = await readTextFile(`${appHome()}/ai-commit.json`);
+      if (raw) {
+        const cfg = JSON.parse(raw);
+        this.aiUrlInput.set_value(cfg.api_url ?? "");
+        this.aiKeyInput.set_value(cfg.api_key ?? "");
+        this.aiModelInput.set_value(cfg.model ?? "");
+        this.thinking = cfg.thinking ?? "off";
+      }
+    } catch {}
+    cx.notify();
+  }
+
+  async saveAiSettings(cx) {
+    try {
+      const path = `${appHome()}/ai-commit.json`;
+      const prev = await readTextFile(path);
+      const data = JSON.stringify({
+        api_url: this.aiUrlInput.value().trim(),
+        api_key: this.aiKeyInput.value().trim(),
+        model: this.aiModelInput.value().trim(),
+        thinking: this.thinking,
+      }, null, 2);
+      await writeTextFile(path, data, prev);
+      notify({ title: "AI Commit Settings", body: "Saved ai-commit.json", level: "success" });
+      cx.notify();
+    } catch (e) {
+      this.error = String(e?.message ?? e);
+      cx.notify();
+    }
+  }
+
+  watch(root, cx) {
+    if (this.on || this.watched === root) return;
+    this.watched = root;
+    cx.spawn(async (cx) => {
+      try {
+        while (this.watched === root) {
+          await watchFolder(root);
+          if (this.watched === root) this.refresh(cx);
+        }
+      } catch {
+        this.watched = null;
+      }
+    });
+  }
+
+  hasLiveAgent(space) {
+    if (!space) return false;
+    const tabIds = new Set((space.tabs ?? []).map((t) => t.id));
+    return agents().some((a) => tabIds.has(a.tab)) || terminals().some((t) => tabIds.has(t.tab) && t.program?.agent);
+  }
+
+  refresh(cx) {
+    const { cwd, on, space } = getContext();
+    const k = locationKey();
+    const cfg = getIdeSettings();
+    const switched = k !== this.context;
+    if (switched) {
+      this.context = k;
+      this.cwd = cwd;
+      this.on = on;
+      this.root = null;
+      this.entries = new Map();
+      this.folders = new Set();
+      this.pendingFolders = new Set();
+      this.marks = {};
+      this.watched = null;
+      this.error = null;
+      this.note = null;
+      this.confirmDel = null;
+    }
+    if (!cwd) return;
+    if (this.view === "explorer" && !this.loadingExplorer) {
+      this.loadingExplorer = true;
+      const targetContext = this.context;
+      cx.spawn(async (cx) => {
+        try {
+          const top = this.root ? null : await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
+          const rootPath = this.root || (top?.code === 0 ? top.stdout.trim() : null);
+          if (rootPath) this.root = rootPath;
+          const base = this.root || cwd;
+          const cfgNow = getIdeSettings();
+          const folderList = ["", ...this.folders];
+          const results = await Promise.all(
+            folderList.map(async (folder) => ({
+              folder,
+              items: await listDirectory(folder ? `${base}/${folder}` : base, on),
+            })),
+          );
+          if (this.context !== targetContext) return;
+          for (const { folder, items } of results) {
+            this.entries.set(
+              folder,
+              items
+                .filter((e) => cfgNow.showHidden || !e.name.startsWith("."))
+                .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)),
+            );
+          }
+        } catch (e) {
+          this.error = String(e?.message ?? e);
+        } finally {
+          this.loadingExplorer = false;
+          cx.notify();
+        }
+      });
+    }
+    if (this.loading) return;
+    this.loading = true;
+    cx.spawn(async (cx) => {
+      try {
+        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
+        this.root = top?.code === 0 ? top.stdout.trim() : null;
+        const base = this.root || cwd;
+        this.watch(base, cx);
+
+        const snap = recordWorkspaceSnapshot(space, this.root, this.view);
+        if (switched && space && !this.autoTriedSpaces.has(space.id)) {
+          this.autoTriedSpaces.add(space.id);
+          if (snap?.lastView && this.view !== snap.lastView) this.view = snap.lastView;
+          if (cfg.autoResumeAgent && snap?.agentName && !this.hasLiveAgent(space)) {
+            resumeWorkspaceAgent(snap, cx);
+          }
+          if (cfg.autoRestoreFiles && snap?.lastFiles?.length) {
+            const first = snap.lastFiles[0];
+            openInCenterEditor({ file: first.file, root: base, on, line: first.line ?? 1 }, cx);
+          }
+        }
+
+        if (this.root) {
+          const git = (args) => exec("git", [...READ, ...args], { cwd: this.root, on });
+          const [br, st, logR, stashR] = await Promise.all([
+            git(["symbolic-ref", "--short", "HEAD"]),
+            git(["status", "--porcelain=v1", "--branch", "-z", "--no-renames", "--untracked-files=all"]),
+            git(["log", "-n", "12", "--pretty=%h%x09%s%x09%cr"]),
+            git(["stash", "list", "--pretty=%gd%x09%s"]),
+          ]);
+          this.branch = br.code === 0 ? br.stdout.trim() : "HEAD";
+          const activeSp = spaces().find((s) => s.active);
+          if (activeSp?.id && this.branch && this.branch !== "HEAD") {
+            const bySpace = { ...(shared("ide.branchBySpace") ?? {}) };
+            if (bySpace[activeSp.id] !== this.branch) {
+              bySpace[activeSp.id] = this.branch;
+              setShared("ide.branchBySpace", bySpace);
+            }
+          }
+          this.applyStatusOutput(st.stdout ?? "");
+          this.commits = (logR.stdout ?? "").split("\n").filter(Boolean).map((l) => {
+            const [hash, subject, rel] = l.split("\t");
+            return { hash, subject, rel };
+          });
+          this.stashes = (stashR.stdout ?? "").split("\n").filter(Boolean).map((l) => {
+            const [ref, msg] = l.split("\t");
+            return { ref, msg };
+          });
+        }
+        this.error = null;
+      } catch (e) {
+        this.error = String(e?.message ?? e);
+      } finally {
+        this.loading = false;
+        cx.notify();
+      }
+    });
+  }
+
+  loadSingleFolder(folder, cx) {
+    const base = this.root || this.cwd;
+    if (!base || this.pendingFolders.has(folder)) return;
+    const on = this.on;
+    const targetContext = this.context;
+    this.pendingFolders.add(folder);
+    cx.spawn(async (cx) => {
+      try {
+        const items = await listDirectory(folder ? `${base}/${folder}` : base, on);
+        if (this.context !== targetContext) return;
+        const cfgNow = getIdeSettings();
+        this.entries.set(
+          folder,
+          items
+            .filter((e) => cfgNow.showHidden || !e.name.startsWith("."))
+            .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)),
+        );
+      } catch (e) {
+        if (this.context === targetContext) this.error = String(e?.message ?? e);
+      } finally {
+        this.pendingFolders.delete(folder);
+        cx.notify();
+      }
+    });
+  }
+
+  toggleFolder(path, cx) {
+    if (this.folders.has(path)) {
+      this.folders.delete(path);
+    } else {
+      this.folders.add(path);
+      this.loadSingleFolder(path, cx);
+    }
+    cx.notify();
+  }
+
+  openFile(path, line, cx) {
+    const base = this.root || this.cwd;
+    if (!base) return;
+    openInCenterEditor({ file: path, root: base, on: this.on, line: typeof line === "number" ? line : 1, direct: true }, cx);
+  }
+
+  createItem(cx) {
+    const rel = this.newNameInput.value().trim();
+    if (!rel) return;
+    const base = this.root || this.cwd;
+    const kind = this.newPrompt;
+    this.newPrompt = null;
+    this.newNameInput.set_value("");
+    cx.spawn(async (cx) => {
+      try {
+        const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+        const abs = `${base}${sep}${rel}`;
+        if (kind === "dir") {
+          if (!this.on && win()?.platform === "windows") {
+            await exec("powershell", ["-NoProfile", "-Command", `New-Item -ItemType Directory -Force -Path '${abs.replace(/'/g, "''")}'`], { on: this.on });
+          } else {
+            await exec("mkdir", ["-p", abs], { on: this.on });
+          }
+        } else {
+          await saveText(abs, "", null, this.on);
+        }
+        this.refresh(cx);
+      } catch (e) {
+        this.note = String(e?.message ?? e);
+        cx.notify();
+      }
+    });
+  }
+
+  deleteItem(rel, cx) {
+    const base = this.root || this.cwd;
+    if (!base) return;
+    this.confirmDel = null;
+    cx.spawn(async (cx) => {
+      try {
+        const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+        const abs = `${base}${sep}${rel}`;
+        if (!this.on && win()?.platform === "windows") {
+          await exec("powershell", ["-NoProfile", "-Command", `Remove-Item -LiteralPath '${abs.replace(/'/g, "''")}' -Recurse -Force`], { on: this.on });
+        } else {
+          await exec("rm", ["-rf", abs], { on: this.on });
+        }
+        notify({ title: "Deleted", body: rel, level: "info" });
+        this.refresh(cx);
+      } catch (e) {
+        this.note = String(e?.message ?? e);
+        cx.notify();
+      }
+    });
+  }
+
+  async copyTextToClipboard(text) {
+    const b64 = toBase64Utf8(text);
+    if (!this.on && win()?.platform === "windows") {
+      await exec("powershell", ["-NoProfile", "-Command", `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')) | Set-Clipboard`], {}).catch(() => {});
+    } else {
+      await exec("sh", ["-c", 'printf %s "$1" | base64 -d | clip.exe 2>/dev/null || printf %s "$1" | base64 -d | xclip -selection clipboard 2>/dev/null || true', "clip", b64], { on: this.on }).catch(() => {});
+    }
+    notify({ title: "Copied", body: text, level: "info" });
+  }
+
+  finishRename(cx) {
+    const from = this.renameFrom;
+    const to = this.renameInput.value().trim();
+    this.renameFrom = null;
+    if (!from || !to || from === to) {
+      cx.notify();
+      return;
+    }
+    const base = this.root || this.cwd;
+    const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+    cx.spawn(async (cx) => {
+      try {
+        if (!this.on && win()?.platform === "windows") {
+          await exec("powershell", ["-NoProfile", "-Command", `Move-Item -LiteralPath '${base}${sep}${from}' -Destination '${base}${sep}${to}'`], {});
+        } else {
+          await exec("mv", [`${base}/${from}`, `${base}/${to}`], { on: this.on });
+        }
+        notify({ title: "Renamed", body: `${from} → ${to}`, level: "success" });
+        this.refresh(cx);
+      } catch (e) {
+        this.note = String(e?.message ?? e);
+        cx.notify();
+      }
+    });
+  }
+
+  async pasteInto(targetDir, cx) {
+    if (!this.clipboard?.path) return;
+    const base = this.root || this.cwd;
+    const srcRel = this.clipboard.path;
+    const name = srcRel.split("/").pop();
+    const destRel = targetDir ? `${targetDir}/${name}` : name;
+    const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+    const srcAbs = `${base}${sep}${srcRel}`;
+    let destAbs = `${base}${sep}${destRel}`;
+    if (srcAbs === destAbs) destAbs = `${base}${sep}${targetDir ? `${targetDir}/` : ""}copy-${name}`;
+    try {
+      if (!this.on && win()?.platform === "windows") {
+        const cmd = this.clipboard.mode === "cut"
+          ? `Move-Item -LiteralPath '${srcAbs}' -Destination '${destAbs}'`
+          : `Copy-Item -LiteralPath '${srcAbs}' -Destination '${destAbs}' -Recurse`;
+        await exec("powershell", ["-NoProfile", "-Command", cmd], {});
+      } else {
+        if (this.clipboard.mode === "cut") await exec("mv", [srcAbs, destAbs], { on: this.on });
+        else await exec("cp", ["-r", srcAbs, destAbs], { on: this.on });
+      }
+      if (this.clipboard.mode === "cut") this.clipboard = null;
+      this.refresh(cx);
+    } catch (e) {
+      this.note = String(e?.message ?? e);
+      cx.notify();
+    }
+  }
+
+  async addToGitignore(rel, cx) {
+    if (!this.root) return;
+    const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+    const gi = `${this.root}${sep}.gitignore`;
+    const cur = (await readTextFile(gi, { on: this.on })) ?? "";
+    const line = `/${rel}`;
+    if (!cur.split("\n").some((l) => l.trim() === line || l.trim() === rel)) {
+      const next = (cur && !cur.endsWith("\n") ? `${cur}\n` : cur) + `${line}\n`;
+      await saveText(gi, next, cur, this.on);
+    }
+    notify({ title: ".gitignore", body: `Added ${line}`, level: "info" });
+    this.refresh(cx);
+  }
+
+  openExplorerMenu(entry, path) {
+    const parentDir = entry.dir ? path : (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
+    const items = [];
+    if (!entry.dir) {
+      items.push({ id: "open", label: "Open in Editor", hint: "Enter" });
+      items.push({ sep: true });
+    }
+    items.push({ id: "new_file", label: "New File…" });
+    items.push({ id: "new_folder", label: "New Folder…" });
+    items.push({ sep: true });
+    items.push({ id: "cut", label: "Cut" });
+    items.push({ id: "copy", label: "Copy" });
+    if (this.clipboard) items.push({ id: "paste", label: `Paste (${this.clipboard.path.split("/").pop()})` });
+    if (!entry.dir) items.push({ id: "duplicate", label: "Duplicate" });
+    items.push({ sep: true });
+    items.push({ id: "rename", label: "Rename…" });
+    items.push({ id: "delete", label: "Delete", danger: true });
+    items.push({ sep: true });
+    items.push({ id: "copy_path", label: "Copy Path" });
+    items.push({ id: "copy_rel", label: "Copy Relative Path" });
+    if (this.root) {
+      items.push({ sep: true });
+      items.push({ id: "stage", label: "Git: Stage (git add)" });
+      items.push({ id: "gitignore", label: "Add to .gitignore" });
+    }
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 220,
+      props: { items, payload: { source: "explorer", path, dir: entry.dir, parentDir } },
+    });
+  }
+
+  openScmMenu(f, kind) {
+    const staged = kind === "staged";
+    const conflict = kind === "conflict";
+    const items = [];
+    if (conflict) {
+      items.push({ id: "resolve", label: "Resolve Conflicts (3-Way)" });
+      items.push({ sep: true });
+    }
+    items.push({ id: "open", label: "Open in Editor" });
+    if (!conflict) items.push({ id: "diff", label: "View Diff" });
+    items.push({ sep: true });
+    if (staged) {
+      items.push({ id: "unstage", label: "Unstage Changes" });
+    } else if (!conflict) {
+      items.push({ id: "stage", label: "Stage Changes" });
+      if (f.status === "?") {
+        items.push({ id: "delete", label: "Delete Untracked File", danger: true });
+      } else {
+        items.push({ id: "discard", label: "Discard Changes", danger: true });
+      }
+    }
+    items.push({ sep: true });
+    items.push({ id: "copy_rel", label: "Copy Relative Path" });
+    items.push({ id: "gitignore", label: "Add to .gitignore" });
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 230,
+      props: { items, payload: { source: "scm", path: f.path, staged, status: f.status, untracked: f.status === "?" } },
+    });
+  }
+
+  openCommitMenu(c) {
+    const items = [
+      { id: "show_ref", label: "Show Changes" },
+      { sep: true },
+      { id: "cherry_pick", label: "Cherry-Pick" },
+      { id: "revert", label: "Revert Commit" },
+      { id: "checkout_ref", label: "Checkout (Detached HEAD)" },
+      { sep: true },
+      { id: "reset_soft", label: "Soft Reset Here…", danger: true },
+      { id: "reset_mixed", label: "Mixed Reset Here…", danger: true },
+      { sep: true },
+      { id: "copy_hash", label: "Copy Commit Hash" },
+      { id: "copy_msg", label: "Copy Commit Message" },
+    ];
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 230,
+      props: { items, payload: { source: "commit", hash: c.hash, subject: c.subject } },
+    });
+  }
+
+  openStashMenu(s) {
+    const items = [
+      { id: "show_stash", label: "Show Stash Diff" },
+      { sep: true },
+      { id: "stash_apply", label: "Apply Stash" },
+      { id: "stash_pop", label: "Pop Stash" },
+      { id: "stash_drop", label: "Drop Stash…", danger: true },
+    ];
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 210,
+      props: { items, payload: { source: "stash", ref: s.ref, msg: s.msg } },
+    });
+  }
+
+  showRefDiff(ref, isStash, cx) {
+    const base = this.root || this.cwd;
+    if (!base || !ref) return;
+    openDiffInCenterEditor({
+      title: isStash ? `Stash: ${ref}` : `Commit: ${ref}`,
+      ref,
+      isStash,
+      root: base,
+      on: this.on,
+    }, cx);
+  }
+
+  handleMenuAction(act, cx) {
+    const p = act.payload ?? {};
+    if (p.source === "commit") {
+      if (act.id === "show_ref") return this.showRefDiff(p.hash, false, cx);
+      if (act.id === "cherry_pick") return this.runGit(["cherry-pick", "--", p.hash], `Cherry-picked ${p.hash}`, cx);
+      if (act.id === "revert") return this.runGit(["revert", "--no-edit", "--", p.hash], `Reverted ${p.hash}`, cx);
+      if (act.id === "checkout_ref") return this.runGit(["checkout", p.hash], `Checked out ${p.hash}`, cx);
+      if (act.id === "reset_soft") {
+        this.confirmGit = { prompt: `Soft reset HEAD to ${p.hash}?`, args: ["reset", "--soft", p.hash], title: `Soft reset to ${p.hash}` };
+        cx.notify();
+        return;
+      }
+      if (act.id === "reset_mixed") {
+        this.confirmGit = { prompt: `Mixed reset HEAD to ${p.hash}?`, args: ["reset", "--mixed", p.hash], title: `Mixed reset to ${p.hash}` };
+        cx.notify();
+        return;
+      }
+      if (act.id === "copy_hash") return cx.spawn(async () => this.copyTextToClipboard(p.hash));
+      if (act.id === "copy_msg") return cx.spawn(async () => this.copyTextToClipboard(p.subject));
+      return;
+    }
+    if (p.source === "stash") {
+      if (act.id === "show_stash") return this.showRefDiff(p.ref, true, cx);
+      if (act.id === "stash_apply") return this.runGit(["stash", "apply", "--", p.ref], `Applied ${p.ref}`, cx);
+      if (act.id === "stash_pop") return this.runGit(["stash", "pop", "--", p.ref], `Popped ${p.ref}`, cx);
+      if (act.id === "stash_drop") {
+        this.confirmGit = { prompt: `Drop ${p.ref} (${p.msg})?`, args: ["stash", "drop", "--", p.ref], title: `Dropped ${p.ref}` };
+        cx.notify();
+      }
+      return;
+    }
+    const path = p.path;
+    const base = this.root || this.cwd;
+    if (!path && act.id !== "new_file" && act.id !== "new_folder") return;
+
+    if (act.id === "open") return this.openFile(path, 1, cx);
+    if (act.id === "diff") return this.showDiff(path, Boolean(p.staged), Boolean(p.untracked || p.status === "?"), cx);
+    if (act.id === "resolve") {
+      return openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 32, width: 960, height: 0.82, props: { file: path } });
+    }
+    if (act.id === "new_file" || act.id === "new_folder") {
+      this.view = "explorer";
+      this.newPrompt = act.id === "new_folder" ? "dir" : "file";
+      const prefix = p.parentDir ? `${p.parentDir}/` : "";
+      this.newNameInput.set_value(prefix);
+      this.newNameInput.focus();
+      cx.notify();
+      return;
+    }
+    if (act.id === "cut" || act.id === "copy") {
+      this.clipboard = { mode: act.id, path };
+      notify({ title: act.id === "cut" ? "Cut" : "Copied", body: path, level: "info" });
+      return;
+    }
+    if (act.id === "paste") {
+      cx.spawn(async (cx) => this.pasteInto(p.parentDir ?? "", cx));
+      return;
+    }
+    if (act.id === "duplicate") {
+      this.clipboard = { mode: "copy", path };
+      cx.spawn(async (cx) => this.pasteInto(p.parentDir ?? "", cx));
+      return;
+    }
+    if (act.id === "rename") {
+      this.renameFrom = path;
+      this.renameInput.set_value(path);
+      this.renameInput.focus();
+      cx.notify();
+      return;
+    }
+    if (act.id === "delete") {
+      if (getIdeSettings().confirmDelete) {
+        this.confirmDel = path;
+        cx.notify();
+      } else {
+        this.deleteItem(path, cx);
+      }
+      return;
+    }
+    if (act.id === "copy_path") {
+      const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+      cx.spawn(async () => this.copyTextToClipboard(`${base}${sep}${path}`));
+      return;
+    }
+    if (act.id === "copy_rel") {
+      cx.spawn(async () => this.copyTextToClipboard(path));
+      return;
+    }
+    if (act.id === "stage") return this.runGit(["add", "--", path], null, cx);
+    if (act.id === "unstage") return this.runGit(["reset", "HEAD", "--", path], null, cx);
+    if (act.id === "discard") return this.runGit(["checkout", "--", path], null, cx);
+    if (act.id === "gitignore") {
+      cx.spawn(async (cx) => this.addToGitignore(path, cx));
+    }
+  }
+
+  runGit(args, title, cx) {
+    if (!this.root || this.busy) return;
+    this.busy = true;
+    this.note = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const r = await exec("git", args, { cwd: this.root, on: this.on });
+      this.busy = false;
+      if (r.code !== 0) {
+        this.note = (r.stderr || r.stdout || "git command failed").trim();
+      } else if (title) {
+        notify({ title, body: r.stdout.trim() || "Done", level: "success" });
+      }
+      this.refresh(cx);
+    });
+  }
+
+  showDiff(path, staged, untracked, cx) {
+    const base = this.root || this.cwd;
+    if (!base || !path) return;
+    openDiffInCenterEditor({
+      title: `Diff: ${path.split("/").pop()}`,
+      file: path,
+      staged: Boolean(staged),
+      untracked: Boolean(untracked),
+      root: base,
+      on: this.on,
+    }, cx);
+  }
+
+  commit(cx) {
+    const msg = this.message.trim();
+    if (!msg || !this.root || this.busy) return;
+    this.busy = true;
+    this.note = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      if (this.staged.length === 0) {
+        const add = await exec("git", ["add", "-A"], { cwd: this.root, on: this.on });
+        if (add.code !== 0) {
+          this.busy = false;
+          this.note = add.stderr;
+          cx.notify();
+          return;
+        }
+      }
+      const r = await exec("git", ["commit", "-m", msg], { cwd: this.root, on: this.on });
+      this.busy = false;
+      if (r.code === 0) {
+        this.message = "";
+        this.commitInput.set_value("");
+        notify({ title: "Git Commit", body: msg, level: "success" });
+        this.refresh(cx);
+      } else {
+        this.note = (r.stderr || r.stdout).trim();
+        cx.notify();
+      }
+    });
+  }
+
+  draftAi(cx) {
+    if (!this.root || this.busy) return;
+    this.busy = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const stat = await exec("git", [...READ, "diff", "--cached", "--stat"], { cwd: this.root, on: this.on });
+        const useStaged = Boolean(stat.stdout.trim());
+        const diffStat = useStaged ? stat.stdout : (await exec("git", [...READ, "diff", "--stat"], { cwd: this.root, on: this.on })).stdout;
+        const patch = (await exec("git", [...READ, "diff", ...(useStaged ? ["--cached"] : []), "--no-color"], { cwd: this.root, on: this.on })).stdout.slice(0, 5000);
+        let msg = "";
+        try {
+          const raw = await readTextFile(`${appHome()}/ai-commit.json`);
+          if (raw) {
+            const cfg = JSON.parse(raw);
+            if (cfg.api_key) {
+              const base = (cfg.api_url || "https://api.openai.com/v1").replace(/\/+$/, "");
+              const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
+              const payload = JSON.stringify({
+                model: cfg.model || "gpt-4o-mini",
+                messages: [
+                  { role: "system", content: "Write ONE concise Conventional Commit line (max 72 chars, no quotes)." },
+                  { role: "user", content: `${diffStat}\n\n${patch}` },
+                ],
+              });
+              const resp = await exec("curl", [
+                "-sS", "-X", "POST", url,
+                "-H", "Content-Type: application/json",
+                "-H", `Authorization: Bearer ${cfg.api_key}`,
+                "-d", payload,
+              ], { timeout: 15000 });
+              if (resp.code === 0 && resp.stdout) msg = JSON.parse(resp.stdout)?.choices?.[0]?.message?.content?.trim()?.split("\n")[0] ?? "";
+            }
+          }
+        } catch {}
+        if (!msg) {
+          const files = diffStat.split("\n").filter((l) => l.includes("|")).map((l) => l.split("|")[0].trim().split("/").pop()).slice(0, 4);
+          msg = files.length ? `chore: update ${files.join(", ")}` : "chore: update changes";
+        }
+        this.message = msg.replace(/^["'`]+|["'`]+$/g, "");
+        this.commitInput.set_value(this.message);
+      } finally {
+        this.busy = false;
+        cx.notify();
+      }
+    });
+  }
+
+  runInlineSearch(cx) {
+    const q = this.searchInput.value().trim();
+    const base = this.root || this.cwd;
+    if (!q || !base) return;
+    this.searchBusy = true;
+    this.searchQueried = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      let r = await execRg([
+        "--line-number", "--no-heading", "--color", "never", "-i", "-F",
+        "--max-filesize", "512K", "--max-columns", "240", "--max-count", "50",
+        "-g", "!vendor/**", "-g", "!node_modules/**", "-g", "!public/**", "-g", "!*.min.js",
+        "--", q, ".",
+      ], base, this.on);
+      if (!r) {
+        r = await exec("git", ["grep", "-n", "-i", "-F", "--", q], { cwd: base, on: this.on }).catch(() => null);
+      }
+      this.searchBusy = false;
+      this.searchResults = (r?.stdout ?? "").split("\n").filter(Boolean).slice(0, 120).map((rawLine) => {
+        const line = rawLine.replace(/\r$/, "");
+        const m = /^(.+?):(\d+):(.*)$/.exec(line);
+        return m ? { path: m[1].replace(/^\.\//, "").replace(/\\/g, "/"), line: Number(m[2]), text: m[3].trim() } : null;
+      }).filter(Boolean);
+      cx.notify();
+    });
+  }
+
+  renderResumeBanner(t, cx) {
+    const { space } = getContext();
+    if (!space) return null;
+    const key = wsHistoryKey(space, this.root);
+    const snap = shared("ide.ws.history")?.[key];
+    if (!snap?.agentName || this.hasLiveAgent(space)) return null;
+
+    return h_flex()
+      .mx(6)
+      .mt(6)
+      .px(8)
+      .py(6)
+      .gap(6)
+      .items_center()
+      .rounded(7)
+      .bg(t.raised)
+      .border_1()
+      .border_color(t.accent)
+      .child(
+        v_flex()
+          .flex_1()
+          .min_w(0)
+          .child(div().text_size(11).font_semibold().text_color(t.foreground).truncate().child(`Last: ${snap.agentName}`))
+          .when(Boolean(snap.title), (el) => el.child(div().text_size(10.5).text_color(t.dim).truncate().child(snap.title))),
+      )
+      .child(
+        div()
+          .id("ide-resume-agent")
+          .px(8)
+          .py(4)
+          .rounded(5)
+          .bg(t.accent)
+          .text_size(11)
+          .font_semibold()
+          .text_color("#ffffff")
+          .cursor_pointer()
+          .on_click((_e, cx) => resumeWorkspaceAgent(snap, cx))
+          .child("Resume"),
+      );
+  }
+
+  renderExplorer(t, cx) {
+    const cfg = getIdeSettings();
+    const base = this.root || this.cwd;
+    const rows = [];
+    const walk = (prefix, depth) => {
+      if (rows.length >= 600 || depth > 25) return;
+      for (const entry of this.entries.get(prefix) ?? []) {
+        const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const open = this.folders.has(path);
+        const mark = cfg.gitDecorations ? this.marks[`${base}/${path}`] : null;
+        rows.push(
+          h_flex()
+            .id(`ide-f-${path}`)
+            .h(26)
+            .flex_none()
+            .pl(8 + depth * 14)
+            .pr(6)
+            .gap(6)
+            .items_center()
+            .rounded(6)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => (entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx)))
+            .on_mouse_down("right", () => this.openExplorerMenu(entry, path))
+            .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(11).text_color(t.dim) : div().w(11))
+            .child(renderFileIcon(div, svg, entry.name, entry.dir, open, cfg.iconTheme, t))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).child(entry.name))
+            .when(entry.dir && this.pendingFolders.has(path), (el) => el.child(div().text_size(10.5).text_color(t.dim).child("…")))
+            .when(Boolean(mark), (el) =>
+              el.child(div().text_size(10.5).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark)),
+            )
+            .child(
+              div()
+                .id(`ide-del-${path}`)
+                .px(4)
+                .rounded(4)
+                .text_size(11)
+                .text_color(t.dim)
+                .hover((s) => s.bg(t.raised).text_color(t.ansi1))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => {
+                  if (cfg.confirmDelete) {
+                    this.confirmDel = path;
+                    cx.notify();
+                  } else {
+                    this.deleteItem(path, cx);
+                  }
+                })
+                .child("×"),
+            ),
+        );
+        if (entry.dir && open) walk(path, depth + 1);
+      }
+    };
+    walk("", 0);
+
+    const tinyBtn = (id, label, active, onClick) =>
+      div().id(id).px(6).py(2).rounded(4).text_size(11).text_color(active ? t.accent : t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .child(
+        h_flex()
+          .h(34)
+          .px(10)
+          .gap(4)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .child(div().flex_1().truncate().text_size(12).font_semibold().child(base?.split(/[\\/]/).pop() ?? "Explorer"))
+          .child(tinyBtn("ide-exp-newf", "+F", false, (_e, cx) => { this.newPrompt = "file"; this.newNameInput.focus(); cx.notify(); }))
+          .child(tinyBtn("ide-exp-newd", "+D", false, (_e, cx) => { this.newPrompt = "dir"; this.newNameInput.focus(); cx.notify(); }))
+          .child(tinyBtn("ide-exp-hid", ".*", cfg.showHidden, (_e, cx) => { updateIdeSettings({ showHidden: !cfg.showHidden }); this.refresh(cx); }))
+          .child(tinyBtn("ide-exp-ref", "↻", false, (_e, cx) => this.refresh(cx))),
+      )
+      .when(Boolean(this.confirmDel), (el) =>
+        el.child(
+          h_flex().p(8).gap(6).items_center().bg(t.raised).border_b(1).border_color(t.blocked)
+            .child(div().flex_1().truncate().text_size(11.5).child(`Delete ${this.confirmDel}?`))
+            .child(tinyBtn("ide-del-yes", "Delete", true, (_e, cx) => this.deleteItem(this.confirmDel, cx)))
+            .child(tinyBtn("ide-del-no", "Cancel", false, (_e, cx) => { this.confirmDel = null; cx.notify(); })),
+        ),
+      )
+      .when(Boolean(this.renameFrom), (el) =>
+        el.child(
+          h_flex().p(6).gap(6).border_b(1).border_color(t.accent)
+            .child(div().text_size(11).text_color(t.dim).child("Rename:"))
+            .child(div().flex_1().h(28).px(8).rounded(6).border_1().border_color(t.accent).child(Input.new(this.renameInput).h_full().text_size(12)))
+            .child(tinyBtn("ide-ren-cancel", "×", false, (_e, cx) => { this.renameFrom = null; cx.notify(); })),
+        ),
+      )
+      .when(Boolean(this.newPrompt), (el) =>
+        el.child(
+          h_flex().p(6).gap(6).border_b(1).border_color(t.border)
+            .child(div().flex_1().h(28).px(8).rounded(6).border_1().border_color(t.accent).child(Input.new(this.newNameInput).h_full().text_size(12)))
+            .child(tinyBtn("ide-new-cancel", "×", false, (_e, cx) => { this.newPrompt = null; cx.notify(); })),
+        ),
+      )
+      .child(
+        div().flex_1().min_h(0).relative()
+          .child(
+            v_flex().id("ide-exp-tree").absolute().inset_0().overflow_y_scroll().p(4)
+              .children(rows)
+              .when(rows.length === 0, (el) => el.child(div().p(10).text_size(12).text_color(t.dim).child(this.error || (this.loadingExplorer ? "Loading files…" : "No files")))),
+          )
+          .child(Scrollbar.vertical("ide-exp-tree").absolute().inset_0()),
+      );
+  }
+
+  renderSearch(t, cx) {
+    const popBtn = (id, label, modName) =>
+      div()
+        .id(id)
+        .px(7)
+        .py(3)
+        .rounded(5)
+        .bg(t.raised)
+        .text_size(11)
+        .text_color(t.muted)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_click(() => openOverlay({ mod: modName, kind: "popup", at: "top", offset: 32, width: 940, height: 0.80 }))
+        .child(label);
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .p(8)
+      .gap(8)
+      .child(
+        h_flex().gap(4).flex_wrap()
+          .child(popBtn("ide-qo", "Files (Ctrl+Q)", "quick-open"))
+          .child(popBtn("ide-cs", "Search (Ctrl+Alt+F)", "content-search"))
+          .child(popBtn("ide-rp", "Replace (Ctrl+Alt+E)", "replace-popup"))
+          .child(popBtn("ide-sy", "Symbols (Ctrl+Alt+Q)", "symbol-search")),
+      )
+      .child(
+        h_flex().h(32).px(8).gap(6).items_center().rounded(7).border_1().border_color(t.border).bg(t.surface)
+          .child(svg("mods/workspace-chrome/search.svg").size(13).text_color(t.dim))
+          .child(Input.new(this.searchInput).flex_1().h_full().text_size(12).text_color(t.foreground)),
+      )
+      .child(
+        div().flex_1().min_h(0).relative().child(
+          v_flex().id("ide-sr-list").absolute().inset_0().overflow_y_scroll().gap(2)
+            .when(this.searchBusy, (el) => el.child(div().p(8).text_color(t.dim).child("Searching…")))
+            .when(!this.searchBusy && this.searchQueried && this.searchResults.length === 0, (el) => el.child(div().p(8).text_color(t.dim).child("No matches found")))
+            .children(
+              this.searchResults.map((m, i) =>
+                v_flex()
+                  .id(`ide-sr-${i}`)
+                  .p(6)
+                  .rounded(6)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, cx) => this.openFile(m.path, m.line, cx))
+                  .child(div().text_size(11).text_color(t.accent).truncate().child(`${m.path}:${m.line}`))
+                  .child(div().text_size(11.5).text_color(t.foreground).truncate().child(m.text)),
+              ),
+            ),
+        ).child(Scrollbar.vertical("ide-sr-list").absolute().inset_0()),
+      );
+  }
+
+  renderScm(t, cx) {
+    const cfg = getIdeSettings();
+    const miniBtn = (id, label, tip, onClick) =>
+      div().id(id).px(6).py(2).rounded(4).text_size(11).text_color(t.muted).cursor_pointer().tooltip(tip).hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
+
+    const fileRow = (f, kind, idx, labelOverride) => {
+      const staged = kind === "staged";
+      const conflict = kind === "conflict";
+      const actBtn = (suffix, txt, tip, fn) =>
+        div().id(`scm-${kind}-${suffix}-${idx}`).px(5).py(1).rounded(4).text_size(11).text_color(t.dim).tooltip(tip).hover((s) => s.bg(t.raised).text_color(t.foreground)).on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(fn).child(txt);
+
+      return h_flex()
+        .id(`scm-row-${kind}-${idx}`)
+        .h(26)
+        .px(6)
+        .gap(5)
+        .items_center()
+        .rounded(5)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover))
+        .on_mouse_down("right", () => this.openScmMenu(f, kind))
+        .on_click((_e, cx) => {
+          if (conflict) {
+            openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 32, width: 960, height: 0.82, props: { file: f.path } });
+          } else {
+            this.showDiff(f.path, staged, f.status === "?", cx);
+          }
+        })
+        .child(div().w(12).text_size(11).font_semibold().text_color(conflict || f.status === "D" ? t.ansi1 : f.status === "A" || f.status === "?" ? t.ansi2 : t.blocked).child(f.status))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).child(labelOverride ?? f.path))
+        .when(conflict, (el) => el.child(actBtn("res", "Resolve", "Open 3-way merge editor", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 32, width: 960, height: 0.82, props: { file: f.path } }))))
+        .when(staged, (el) =>
+          el
+            .child(actBtn("open", "↗", "Open in Editor", (_e, cx) => this.openFile(f.path, 1, cx)))
+            .child(actBtn("un", "-", "Unstage", (_e, cx) => this.runGit(["reset", "HEAD", "--", f.path], null, cx))),
+        )
+        .when(!staged && !conflict, (el) =>
+          el
+            .child(actBtn("open", "↗", "Open in Editor", (_e, cx) => this.openFile(f.path, 1, cx)))
+            .child(actBtn("st", "+", "Stage", (_e, cx) => this.runGit(["add", "--", f.path], null, cx)))
+            .when(f.status !== "?", (el2) => el2.child(actBtn("dis", "↩", "Discard changes", (_e, cx) => this.runGit(["checkout", "--", f.path], null, cx)))),
+        );
+    };
+
+    const renderGroup = (list, kind) => {
+      if (!cfg.scmTreeView) return list.map((f, i) => fileRow(f, kind, i));
+      const groups = new Map();
+      for (const f of list) {
+        const idx = f.path.lastIndexOf("/");
+        const dir = idx >= 0 ? f.path.slice(0, idx) : ".";
+        const name = idx >= 0 ? f.path.slice(idx + 1) : f.path;
+        if (!groups.has(dir)) groups.set(dir, []);
+        groups.get(dir).push({ ...f, name });
+      }
+      const out = [];
+      for (const [dir, items] of groups.entries()) {
+        out.push(div().px(6).pt(3).text_size(10.5).text_color(t.dim).truncate().child(dir));
+        items.forEach((it, idx) => out.push(fileRow(it, kind, `${dir}-${idx}`, `  ${it.name}`)));
+      }
+      return out;
+    };
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .child(
+        h_flex()
+          .h(34)
+          .px(10)
+          .gap(4)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .id("scm-br")
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .gap(5)
+              .items_center()
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_click(() => openOverlay({ mod: "git-branch", kind: "popup", at: "top", offset: 40, width: 540, height: 0.72 }))
+              .child(svg("mods/workspace-chrome/branch.svg").size(12).text_color(t.accent))
+              .child(div().max_w(100).truncate().text_size(12).font_semibold().child(this.branch || "git")),
+          )
+          .when(this.behind > 0, (el) =>
+            el.child(
+              div()
+                .id("scm-behind-badge")
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.blocked + "28")
+                .text_size(11)
+                .text_color(t.blocked)
+                .cursor_pointer()
+                .tooltip(`${this.behind} commit(s) behind upstream — click to Pull`)
+                .on_click((_e, cx) => this.runGit(["pull"], "Git Pull", cx))
+                .child(`↓${this.behind}`),
+            ),
+          )
+          .when(this.ahead > 0, (el) =>
+            el.child(
+              div()
+                .id("scm-ahead-badge")
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.ansi2 + "28")
+                .text_size(11)
+                .text_color(t.ansi2)
+                .cursor_pointer()
+                .tooltip(`${this.ahead} commit(s) ahead — click to Push`)
+                .on_click((_e, cx) => this.runGit(["push"], "Git Push", cx))
+                .child(`↑${this.ahead}`),
+            ),
+          )
+          .child(div().flex_1())
+          .child(miniBtn("scm-tree", cfg.scmTreeView ? "Tree" : "List", "Toggle List/Tree view", (_e, cx) => { updateIdeSettings({ scmTreeView: !cfg.scmTreeView }); cx.notify(); }))
+          .child(miniBtn("scm-pull", this.behind > 0 ? `↓${this.behind}` : "↓", "Pull (Ctrl+Alt+P)", (_e, cx) => this.runGit(["pull"], "Git Pull", cx)))
+          .child(miniBtn("scm-push", this.ahead > 0 ? `↑${this.ahead}` : "↑", "Push (Ctrl+Alt+K)", (_e, cx) => this.runGit(["push"], "Git Push", cx)))
+          .child(miniBtn("scm-undo", "↶", "Undo last commit (Ctrl+Alt+Z)", (_e, cx) => this.runGit(["reset", "--soft", "HEAD~1"], "Undo Commit", cx)))
+          .child(miniBtn("scm-ref", "↻", "Refresh", (_e, cx) => this.refresh(cx))),
+      )
+      .when(!this.root, (el) => el.child(div().p(12).text_color(t.dim).child("Not a git repository")))
+      .when(Boolean(this.root), (el) =>
+        el
+          .child(
+            div().flex_1().min_h(0).relative().child(
+              v_flex().id("scm-scroll").absolute().inset_0().overflow_y_scroll().p(6).gap(6)
+                .when(this.conflicts.length > 0, (el2) =>
+                  el2
+                    .child(div().px(4).text_size(11).font_semibold().text_color(t.blocked).child(`MERGE CONFLICTS (${this.conflicts.length})`))
+                    .children(this.conflicts.map((f, i) => fileRow(f, "conflict", i))),
+                )
+                .child(
+                  h_flex().px(4).items_center()
+                    .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`STAGED (${this.staged.length})`))
+                    .when(this.staged.length > 0, (el2) => el2.child(miniBtn("scm-unstage-all", "− All", "Unstage all", (_e, cx) => this.runGit(["reset", "HEAD"], null, cx)))),
+                )
+                .children(renderGroup(this.staged, "staged"))
+                .child(
+                  h_flex().px(4).pt(4).gap(4).items_center()
+                    .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`CHANGES (${this.unstaged.length})`))
+                    .when(this.unstaged.length > 0, (el2) =>
+                      el2
+                        .child(miniBtn("scm-discard-all", "↩ All", "Discard all tracked unstaged changes", (_e, cx) => {
+                          this.confirmGit = { prompt: "Discard all unstaged tracked changes?", args: ["checkout", "--", "."], title: "Discarded Changes" };
+                          cx.notify();
+                        }))
+                        .child(miniBtn("scm-stash-all", "Stash", "Stash all changes (git stash push -u)", (_e, cx) => this.runGit(["stash", "push", "-u"], "Stashed All", cx)))
+                        .child(miniBtn("scm-stage-all", "+ All", "Stage all (git add -A)", (_e, cx) => this.runGit(["add", "-A"], null, cx))),
+                    ),
+                )
+                .when(Boolean(this.confirmGit), (el2) =>
+                  el2.child(
+                    h_flex().p(8).gap(6).items_center().rounded(6).bg(t.raised).border_1().border_color(t.blocked)
+                      .child(div().flex_1().truncate().text_size(11.5).child(this.confirmGit.prompt))
+                      .child(miniBtn("scm-git-yes", "Confirm", "Run git action", (_e, cx) => {
+                        const g = this.confirmGit;
+                        this.confirmGit = null;
+                        this.runGit(g.args, g.title, cx);
+                      }))
+                      .child(miniBtn("scm-git-no", "Cancel", "Cancel", (_e, cx) => { this.confirmGit = null; cx.notify(); })),
+                  ),
+                )
+                .children(renderGroup(this.unstaged, "unstaged"))
+                .child(
+                  h_flex().id("scm-commits-hdr").pt(6).px(4).items_center().cursor_pointer().on_click((_e, cx) => { this.showCommits = !this.showCommits; cx.notify(); })
+                    .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`${this.showCommits ? "▾" : "▸"} COMMITS (${this.commits.length})`)),
+                )
+                .when(this.showCommits, (el2) =>
+                  el2.children(
+                    this.commits.map((c, i) =>
+                      h_flex()
+                        .id(`scm-c-${i}`)
+                        .px(6)
+                        .py(3)
+                        .gap(6)
+                        .rounded(5)
+                        .text_size(11.5)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover))
+                        .on_mouse_down("right", () => this.openCommitMenu(c))
+                        .on_click((_e, cx) => this.showRefDiff(c.hash, false, cx))
+                        .child(div().text_color(t.accent).child(c.hash))
+                        .child(div().flex_1().truncate().text_color(t.foreground).child(c.subject))
+                        .child(div().text_size(10.5).text_color(t.dim).child(c.rel)),
+                    ),
+                  ),
+                )
+                .child(
+                  h_flex().id("scm-stash-hdr").pt(4).px(4).items_center().cursor_pointer().on_click((_e, cx) => { this.showStashes = !this.showStashes; cx.notify(); })
+                    .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`${this.showStashes ? "▾" : "▸"} STASHES (${this.stashes.length})`))
+                    .child(miniBtn("scm-stash-push", "+ Stash", "git stash push", (_e, cx) => this.runGit(["stash", "push"], "Stashed", cx))),
+                )
+                .when(this.showStashes, (el2) =>
+                  el2.children(
+                    this.stashes.map((s, i) =>
+                      h_flex()
+                        .id(`scm-st-${i}`)
+                        .px(6)
+                        .py(3)
+                        .gap(6)
+                        .rounded(5)
+                        .text_size(11.5)
+                        .items_center()
+                        .cursor_pointer()
+                        .hover((s2) => s2.bg(t.hover))
+                        .on_mouse_down("right", () => this.openStashMenu(s))
+                        .on_click((_e, cx) => this.showRefDiff(s.ref, true, cx))
+                        .child(div().flex_1().truncate().text_color(t.foreground).child(`${s.ref}: ${s.msg}`))
+                        .child(miniBtn(`scm-st-pop-${i}`, "Pop", "git stash pop", (_e, cx) => this.runGit(["stash", "pop", s.ref], "Stash Popped", cx))),
+                    ),
+                  ),
+                ),
+            ).child(Scrollbar.vertical("scm-scroll").absolute().inset_0()),
+          )
+          .when(Boolean(this.note), (el) => el.child(div().px(10).py(4).text_size(11).text_color(t.ansi1).child(this.note)))
+          .child(
+            h_flex().flex_none().p(8).gap(6).border_t(1).border_color(t.border)
+              .child(div().flex_1().h(30).px(8).rounded(7).border_1().border_color(t.border).child(Input.new(this.commitInput).h_full().text_size(12)))
+              .child(miniBtn("scm-ai", "✧", "AI Draft Message", (_e, cx) => this.draftAi(cx)))
+              .child(
+                div().id("scm-commit-btn").h(30).px(10).flex().items_center().rounded(7).bg(this.message.trim() ? t.accent : t.raised).text_color(this.message.trim() ? "#ffffff" : t.dim).text_size(12).cursor_pointer()
+                  .on_click((_e, cx) => this.commit(cx))
+                  .child(this.busy ? "…" : "Commit"),
+              ),
+          ),
+      );
+  }
+
+  renderSettings(t, cx) {
+    const cfg = getIdeSettings();
+    const { space } = getContext();
+    const snap = space ? shared("ide.ws.history")?.[wsHistoryKey(space, this.root)] : null;
+
+    const section = (title) => div().pt(6).pb(2).text_size(11).font_semibold().text_color(t.accent).child(title);
+    const row = (id, label, valueText, onClick) =>
+      h_flex()
+        .id(id)
+        .px(8)
+        .py(5)
+        .rounded(6)
+        .items_center()
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover))
+        .on_click(onClick)
+        .child(div().flex_1().text_size(12).text_color(t.foreground).child(label))
+        .child(div().px(7).py(2).rounded(4).bg(t.raised).text_size(11).text_color(t.accent).child(valueText));
+
+    const field = (label, state) =>
+      v_flex().gap(3)
+        .child(div().text_size(11).text_color(t.muted).child(label))
+        .child(div().h(28).px(8).rounded(6).border_1().border_color(t.border).bg(t.surface).child(Input.new(state).h_full().text_size(12).text_color(t.foreground)));
+
+    const cycle = (val, arr) => arr[(arr.indexOf(val) + 1) % arr.length];
+
+    return div().flex_1().min_h(0).relative()
+      .child(
+        v_flex()
+          .id("ide-settings-scroll")
+          .absolute()
+          .inset_0()
+          .overflow_y_scroll()
+          .p(10)
+          .gap(4)
+          .child(section("WORKSPACE & AGENT MEMORY"))
+          .when(Boolean(snap?.agentName), (el) =>
+            el.child(row("set-res-now", `Resume ${snap.agentName}`, "Launch", (_e, cx) => resumeWorkspaceAgent(snap, cx))),
+          )
+          .child(row("set-auto-res", "Auto-resume last agent", cfg.autoResumeAgent ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoResumeAgent: !cfg.autoResumeAgent }); cx.notify(); }))
+          .child(row("set-auto-files", "Auto-restore open files", cfg.autoRestoreFiles ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoRestoreFiles: !cfg.autoRestoreFiles }); cx.notify(); }))
+          .child(row("set-def-agent", "Default Agent", cfg.defaultAgent, (_e, cx) => { updateIdeSettings({ defaultAgent: cycle(cfg.defaultAgent, ["auto", "codex", "pi", "omp", "claude", "opencode"]) }); cx.notify(); }))
+
+          .child(section("EDITOR & LAYOUT"))
+          .child(row("set-ed-eng", "Editor Engine", {
+            fresh: "Fresh (LSP)",
+            nvim: "Neovim (LSP)",
+            builtin: "Built-in (GPUI)",
+            zed: "Zed (External)",
+            vscode: "VS Code (External)",
+          }[cfg.editorEngine] ?? cfg.editorEngine, (_e, cx) => {
+            updateIdeSettings({ editorEngine: cycle(cfg.editorEngine, ["fresh", "nvim", "builtin", "zed", "vscode"]) });
+            cx.notify();
+          }))
+          .child(row("set-ed-pos", "Editor Placement", cfg.editorPlacement, (_e, cx) => { updateIdeSettings({ editorPlacement: cycle(cfg.editorPlacement, ["center-left", "center-top", "right"]) }); cx.notify(); }))
+          .child(row("set-cool-fresh", "Cool Inactive Fresh/LSP", cfg.coolInactiveFresh ? "On" : "Off", (_e, cx) => {
+            const nextCool = !cfg.coolInactiveFresh;
+            updateIdeSettings({ coolInactiveFresh: nextCool });
+            this.lastCoolKey = null;
+            if (!nextCool && (this.on !== null || win()?.platform !== "windows")) {
+              cx.spawn(async () => syncFreshCooling("", false, this.on));
+            }
+            cx.notify();
+          }))
+          .child(row("set-sb-w", "Sidebar Width", `${cfg.sidebarWidth}px`, (_e, cx) => {
+            const w = cycle(cfg.sidebarWidth, [260, 300, 360, 420]);
+            updateIdeSettings({ sidebarWidth: w });
+            run("layout.resize", { id: "sidebar", px: w });
+            cx.notify();
+          }))
+          .child(row("set-sp-w", "Spaces Rail Width", `${cfg.spacesWidth}px`, (_e, cx) => {
+            const w = cycle(cfg.spacesWidth, [180, 210, 250]);
+            updateIdeSettings({ spacesWidth: w });
+            run("layout.resize", { id: "spaces-rail", px: w });
+            cx.notify();
+          }))
+
+          .child(section("EXPLORER"))
+          .child(row("set-icons", "File Icon Theme", { material: "Material", emoji: "Emoji", minimal: "Minimal" }[cfg.iconTheme] ?? cfg.iconTheme, (_e, cx) => { updateIdeSettings({ iconTheme: cycle(cfg.iconTheme, ["material", "emoji", "minimal"]) }); cx.notify(); }))
+          .child(row("set-hidden", "Show Hidden Files (.)", cfg.showHidden ? "On" : "Off", (_e, cx) => { updateIdeSettings({ showHidden: !cfg.showHidden }); this.refresh(cx); }))
+          .child(row("set-gitdec", "Git Decorations", cfg.gitDecorations ? "On" : "Off", (_e, cx) => { updateIdeSettings({ gitDecorations: !cfg.gitDecorations }); cx.notify(); }))
+          .child(row("set-delconf", "Confirm Delete", cfg.confirmDelete ? "On" : "Off", (_e, cx) => { updateIdeSettings({ confirmDelete: !cfg.confirmDelete }); cx.notify(); }))
+
+          .child(section("SOURCE CONTROL"))
+          .child(row("set-scm-view", "SCM View Mode", cfg.scmTreeView ? "Tree" : "List", (_e, cx) => { updateIdeSettings({ scmTreeView: !cfg.scmTreeView }); cx.notify(); }))
+          .child(row("set-ref", "Auto Refresh", `${cfg.refreshSec}s`, (_e, cx) => { updateIdeSettings({ refreshSec: cycle(cfg.refreshSec, [5, 10, 30]) }); cx.notify(); }))
+          .child(row("set-fetch", "Remote Fetch (Sync)", cfg.fetchSec > 0 ? `${cfg.fetchSec}s` : "Off", (_e, cx) => { updateIdeSettings({ fetchSec: cycle(cfg.fetchSec, [60, 120, 300, 0]) }); cx.notify(); }))
+
+          .child(section("AI COMMIT"))
+          .child(field("OpenAI-compatible Base URL", this.aiUrlInput))
+          .child(field("API Key", this.aiKeyInput))
+          .child(field("Model", this.aiModelInput))
+          .child(row("set-think", "Thinking", this.thinking, (_e, cx) => { this.thinking = cycle(this.thinking, ["off", "low", "medium", "high"]); cx.notify(); }))
+          .child(
+            h_flex().pt(4).justify_end()
+              .child(
+                div().id("ide-ai-save").px(10).py(5).rounded(6).bg(t.accent).text_color("#ffffff").text_size(11.5).font_semibold().cursor_pointer()
+                  .on_click((_e, cx) => this.saveAiSettings(cx))
+                  .child("Save AI Settings"),
+              ),
+          )
+
+          .child(section("CONFIG FILES"))
+          .child(row("set-cfg-keys", "Edit keys.json", "Open", (_e, cx) => openInCenterEditor({ file: "keys.json", root: appHome(), on: null, line: 1 }, cx)))
+          .child(row("set-cfg-lay", "Edit terminals-git.json", "Open", (_e, cx) => openInCenterEditor({ file: "layouts/terminals-git.json", root: appHome(), on: null, line: 1 }, cx)))
+          .child(row("set-cfg-app", "App Settings", "Open", () => run("app.settings"))),
+      )
+      .child(Scrollbar.vertical("ide-settings-scroll").absolute().inset_0());
+  }
+
+  render(cx) {
+    if (locationKey() !== this.context) this.refresh(cx);
+    const t = theme();
+    const tabBtn = (id, label) => {
+      const active = this.view === id;
+      return div()
+        .id(`ide-tab-${id}`)
+        .px(9)
+        .py(4)
+        .rounded(6)
+        .text_size(11.5)
+        .cursor_pointer()
+        .when(active, (el) => el.bg(t.accent).text_color("#ffffff").font_semibold())
+        .when(!active, (el) => el.text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)))
+        .on_click((_e, cx) => {
+          this.view = id;
+          this.refresh(cx);
+          cx.notify();
+        })
+        .child(label);
+    };
+
+    const resumeBanner = this.renderResumeBanner(t, cx);
+
+    return v_flex()
+      .id("ide-sidebar")
+      .track_focus(this.handle)
+      .size_full()
+      .min_h(0)
+      .rounded(10)
+      .overflow_hidden()
+      .bg(t.background)
+      .border_1()
+      .border_color(t.border)
+      .text_color(t.foreground)
+      .text_size(12.5)
+      .child(
+        h_flex()
+          .h(38)
+          .flex_none()
+          .px(8)
+          .gap(4)
+          .items_center()
+          .bg(t.chrome)
+          .border_b(1)
+          .border_color(t.border)
+          .child(tabBtn("explorer", "Files"))
+          .child(tabBtn("search", "Search"))
+          .child(tabBtn("scm", `Git${this.staged.length + this.unstaged.length ? ` (${this.staged.length + this.unstaged.length})` : ""}`))
+          .child(div().flex_1())
+          .child(tabBtn("settings", "⚙")),
+      )
+      .when(Boolean(resumeBanner), (el) => el.child(resumeBanner))
+      .when(this.view === "explorer", (el) => el.child(this.renderExplorer(t, cx)))
+      .when(this.view === "search", (el) => el.child(this.renderSearch(t, cx)))
+      .when(this.view === "scm", (el) => el.child(this.renderScm(t, cx)))
+      .when(this.view === "settings", (el) => el.child(this.renderSettings(t, cx)));
+  }
+}

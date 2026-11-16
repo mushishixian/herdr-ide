@@ -1,0 +1,16 @@
+{
+  "editorEngine": "fresh",
+  "editorPlacement": "center-left",
+  "iconTheme": "material",
+  "sidebarWidth": 300,
+  "spacesWidth": 210,
+  "showHidden": true,
+  "gitDecorations": true,
+  "confirmDelete": true,
+  "scmTreeView": false,
+  "autoStashSwitch": false,
+  "refreshSec": 10,
+  "autoResumeAgent": true,
+  "autoRestoreFiles": true,
+  "defaultAgent": "auto"
+}

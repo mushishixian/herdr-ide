@@ -1,0 +1,13 @@
+{
+  "programs": {
+    "cmdc": {
+      "name": "Command Code",
+      "icon": "icons/command-code.svg",
+      "tint": true,
+      "tile": "#2563eb",
+      "color": "#ffffff",
+      "match": ["command-code"],
+      "run": ["cmdc"]
+    }
+  }
+}

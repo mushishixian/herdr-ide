@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# herdr-ide-term — VS Code's Ctrl+` for the IDE layout.
+#
+# The Terminal normally sits under Fresh. Ctrl+` collapses it into a background
+# tab of its own (the "parked" terminal: it keeps running, with its history and
+# cwd) and brings it back:
+#
+#   terminal in the IDE tab, focused -> park it in its background tab, focus Fresh
+#   terminal in the IDE tab, unfocused -> focus it
+#   terminal parked                  -> move it back under Fresh and focus it
+#   no terminal anywhere             -> open a new one under Fresh and focus it
+#
+# Parking and unparking move the Terminal pane; the sidebar and the agent column
+# stay where they are (zoom would hide them too).
+# No IDE in this tab yet -> build one with herdr-ide.
+set -euo pipefail
+here=$(dirname "$(readlink -f "$0")")
+. "$here/lib.sh"
+
+OPEN_RATIO=0.7
+
+in_herdr || die "herdr-ide-term must run inside herdr"
+[ -z "${HERDR_PLUGIN_ACTION_ID:-}" ] || tip "Toggle terminal" dotfiles-ide.toggle-terminal
+
+editor=$(pane_with_label "$cur_tab" "$FRESH_LABEL")
+if [ -z "$editor" ]; then
+  # The action id above is for this toast only; herdr-ide shows its own.
+  exec env -u HERDR_PLUGIN_ACTION_ID "$here/herdr-ide"
+fi
+[ "$(tab_zoomed "$editor")" = true ] && "$HERDR" pane zoom "$editor" --off >/dev/null
+
+term=$(pane_with_label "$cur_tab" "$TERM_LABEL")
+if [ -n "$term" ]; then
+  if [ "$cur_pane" = "$term" ]; then
+    park_terminal "$cur_tab" "$term" || die "could not park the terminal pane $term"
+    focus_pane "$editor"
+  else
+    focus_pane "$term"
+  fi
+  exit 0
+fi
+
+parked=$(parked_terminal "$cur_tab" "$cur_ws")
+if [ -n "$parked" ]; then
+  unpark_terminal "$cur_tab" "$editor" "$parked" || die "could not bring the terminal back under Fresh"
+  focus_pane "$parked"
+  exit 0
+fi
+
+# Neither in the tab nor parked: open a new terminal under the editor.
+open_ratio=$(saved_editor_ratio "$editor" "$OPEN_RATIO")
+term=$("$HERDR" pane split "$editor" --direction down --ratio "$open_ratio" \
+  | jq -r '.result.pane.pane_id // empty')
+[ -n "$term" ] || die "pane split failed"
+"$HERDR" pane rename "$term" "$TERM_LABEL" >/dev/null
+focus_pane "$term"

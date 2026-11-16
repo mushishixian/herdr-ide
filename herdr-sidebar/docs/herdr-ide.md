@@ -1,0 +1,1122 @@
+# herdr IDE on WSL: how it fits together
+
+A VS Code-shaped terminal IDE inside WSL (Ubuntu): **herdr** is the window
+manager, the patched **herdr-sidebar** (this repo) is the explorer / search /
+source control, **Fresh** is the editor, and a coding agent (Claude Code) sits
+on the right. Nothing in herdr or Fresh themselves is patched: everything is
+plugins, configuration, and this fork of herdr-sidebar.
+
+```
+ Windows:  Windows Terminal (or WezTerm) + a Nerd Font, opening straight into WSL
+ WSL:      zsh ─ herdr ─┬─ Sidebar   herdr-sidebar fork (this repo)
+                        ├─ Fresh     editor, one daemon per project per workspace
+                        ├─ Terminal  shell, under Fresh (Ctrl+` collapses it)
+                        └─ Agent     claude, pinned on the right
+
+   ┌─────────┬──────────────────────┬───────────┐
+   │ Sidebar │ Fresh                │ Agent     │
+   │ explorer│                      │ (claude)  │
+   │ search  ├──────────────────────┤           │
+   │ git     │ Terminal             │           │
+   └─────────┴──────────────────────┴───────────┘
+```
+
+Fresh owns the top of the middle column and the Terminal sits under it. **Ctrl+`** collapses the
+Terminal into a background tab labelled `terminal` (it keeps running, with its history and cwd) and
+brings it back under Fresh; the layout itself never parks it.
+
+## Where everything lives
+
+| Piece | Location | Kind |
+|---|---|---|
+| herdr-sidebar fork | `~/code/herdr-sidebar`, branch `main` (this repo) | Rust herdr plugin, linked with `herdr plugin link` |
+| Dotfiles | `dotfiles/` in this repo (branch `main`; pushed to the fork `mushishixian/herdr-siderbar`) | configs + scripts |
+| dotfiles installer | `dotfiles/install.sh` | apt, herdr, Fresh, symlinks, plugins |
+| Sidebar build helper | `dotfiles/herdr-sidebar/build.sh` | builds this checkout (`plugins/herdr-sidebar`) and points herdr's `herdr-sidebar` registration at it |
+| IDE plugin `dotfiles-ide` | `dotfiles/herdr-plugins/ide` | bash herdr plugin (layout, terminal toggle, Ctrl+click → Fresh) |
+| herdr config | `dotfiles/config/herdr/config.toml` → `~/.config/herdr/config.toml` | symlink |
+| Fresh config | `dotfiles/config/fresh/config.json` → `~/.config/fresh/config.json` | symlink |
+| Fresh plugins | `dotfiles/config/fresh/plugins/*.ts` → `~/.config/fresh/plugins/` | one symlink per file |
+| Sidebar settings | `~/.local/state/herdr/plugins/herdr-sidebar/settings.json` | seeded from `dotfiles/herdr-sidebar/settings.json` (existing values win; an invalid file is left alone) |
+| AI commit provider | `~/.local/state/herdr/plugins/herdr-sidebar/ai.json` (0600) | set in the sidebar: ⚙ Settings → AI commit… |
+| One-shot installer | `docs/install-herdr-ide.sh` (this folder) | wraps all of the above |
+
+### Repository layout
+
+```
+herdr-sidebar/                 this repo (branch main)
+├── plugins/herdr-sidebar/     Rust plugin: explorer, search, source control (upstream-shaped, builds standalone)
+├── dotfiles/                  IDE layer: install.sh, herdr/Fresh/lazygit/shell configs, dotfiles-ide plugin, build.sh
+└── docs/                      this document and install-herdr-ide.sh
+```
+
+`plugins/herdr-sidebar` never references `dotfiles/`, so upstream merges stay clean.
+
+## Install
+
+**Requirements.** Windows with WSL and an Ubuntu distro, plus Windows Terminal (or WezTerm) with a
+Nerd Font selected as the terminal font, so the sidebar and Fresh icons render. Ubuntu 25.10 or newer
+(26.04 LTS recommended) gets every package from apt. On Ubuntu 24.04 the installer still works but
+skips `lazygit` and `starship` (apt does not have them there): `starship` is only the optional shell
+prompt, and `lazygit` is the `ctrl+b alt+g` popup. The sidebar is built with a rustup toolchain,
+because 24.04's apt `rustc` is too old for the crate (`rust-version` 1.89).
+
+Clone `main` of the fork, `https://github.com/mushishixian/herdr-siderbar.git` (the GitHub
+repo is spelled `siderbar`; the checkout directory is still `~/code/herdr-sidebar`). HTTPS works
+without an SSH key because the repo is public. The upstream `alexarthurs/herdr-sidebar` does NOT
+contain these commits. The dotfiles live in the fork's `dotfiles/` directory, so there is no second
+repo to fetch.
+
+```bash
+git clone https://github.com/mushishixian/herdr-siderbar.git ~/code/herdr-sidebar
+cd ~/code/herdr-sidebar
+docs/install-herdr-ide.sh            # --help for options (--no-lsp, --no-packages, --no-claude, --dry-run)
+```
+
+`--dry-run` prints the whole plan (links, tools, plugins, integrations) and stops; the installer
+then ends with `dotfiles/verify.sh`, which fails the run if the machine does not match the repo
+afterwards. See *Syncing a machine with the repo* below.
+
+**Two community plugins the keymap binds are NOT in this repo (install per machine).** The
+keymap points at two plugins the installer cannot manage, so neither `install.sh` nor
+`verify.sh` touches them — a fresh machine has to install them once, or those two keys are
+silent no-ops:
+
+```bash
+herdr plugin install tareqmlx/herdr-lazygit-viewer --yes   # ctrl+alt+g  lazygit branch panel (popup)
+herdr plugin install smarzban/herdr-file-viewer   --yes   # ctrl+alt+v  git-aware file viewer beside the pane
+```
+
+- The **GitHub repo name is not the plugin id**: the bound action is
+  `tareqmlx.lazygit-viewer.branch-popup`, but the repo is `tareqmlx/herdr-lazygit-viewer`
+  (`herdr plugin install tareqmlx/lazygit-viewer` answers 404). `herdr-file-viewer` happens to
+  match on both sides.
+- Installation clones into `~/.config/herdr/plugins/github-installations/…` and BUILDS the plugin
+  (Rust, a few minutes the first time; the launcher downloads a prebuilt asset when one exists
+  for the target). Update with `herdr plugin update`.
+- They are machine-level, so `verify.sh` deliberately does not fail on them: it gates only what
+  the repo manages (`herdr-sidebar`, `dotfiles-ide`). When one of those keys seems dead,
+  `herdr plugin action list | grep -E 'lazygit-viewer|herdr-file-viewer'` tells you whether the
+  action exists at all, and `herdr plugin list` whether the plugin is enabled.
+- `lazygit` itself is the apt package (`lazygit`, in the install list) and must be on `PATH` for
+  `ctrl+alt+g`, `alt+w` and `ctrl+alt+h`.
+
+**Python tools come from `uv`, pinned.** `dotfiles/packages.lock` is the only place a Python
+version lives; `docs/install-herdr-ide.sh` (or `dotfiles/install.sh`) runs `uv tool install` for each
+entry, so nothing touches the system Python and no virtualenv exists. `uv-with` lines add a
+requirement that provides no executables of its own (an adapter/plugin for another tool) to that
+tool's environment; `verify.sh` asserts the version, its extras and every `--with` requirement from
+`uv tool list --show-extras --show-with`. **No Python tool is pinned right now** — the file exists so
+the next one has a home instead of a version in a script.
+
+**Windows host.** The workbench lives in WSL, so on Windows the entry point is
+`docs/install-herdr-ide.ps1` (run it from the checkout, PowerShell 5.1 or 7). It provisions only
+the HOST — checks for a WSL distro, `winget`-installs Windows Terminal and the Nerd Font, writes
+`%LOCALAPPDATA%\Programs\herdr-ide\herdr.cmd`, and unbinds the two Windows Terminal chords that
+never reach herdr (`Ctrl+Shift+A` select-all, `Ctrl+Tab` next-tab) — then runs
+`docs/install-herdr-ide.sh` inside the distro. `-DryRun` prints every action and touches nothing;
+`-NoTerminalSettings` leaves its `settings.json` alone; `-RepoPath '~/code/herdr-sidebar'` names
+the checkout when it lives only inside WSL. It is NOT a native-Windows port: apt, the symlinks and
+the bash keymap scripts stay in Ubuntu. The `settings.json` edit backs the file up first
+(`settings.json.herdr-ide.bak-<ts>`) and rewrites it as plain JSON, so any comments in it are lost.
+
+**One machine, one shell setup.** Every managed config is a whole-file symlink, `~/.zshrc`
+included: a machine's existing rc is backed up to `~/.dotfiles-backup/<ts>/` and replaced, so all
+machines behave identically. Anything that cannot be identical everywhere — SDK paths, work-only
+aliases, a different prompt — goes in `~/.zshrc.local`, which the managed rc sources (above the
+highlight plugins, which must stay last) and the installer never touches. `--no-zshrc` skips the
+shell step entirely; `~/.gitconfig` is the one exception, only ever getting an `include.path` added.
+
+**The prompt follows branch switches made elsewhere.** A prompt already on screen used to keep the
+old branch after a switch from the sidebar, a popup, lazygit or an agent, until you pressed Enter.
+The managed `zshrc` resolves the repository's `HEAD` file on `cd` (linked worktrees included) and a
+`sched` tick compares it once a second while the shell idles at the prompt; on a change
+`zle reset-prompt` redraws starship's prompt and keeps a half-typed line. The tick only reads a file
+and starts no process. Shells started before the managed rc was linked need `exec zsh` once.
+
+**The prompt starts flush with the pane's top border.** starship inserts a blank row before the
+prompt by default; in the IDE's Terminal pane — ten content rows, one border row above the first
+line — that row was a tenth of the pane (user-reported). `dotfiles/config/starship.toml` (symlinked
+to `~/.config/starship.toml`) sets `add_newline = false` and otherwise leaves starship's defaults
+alone. The setting applies to every shell, not just the IDE's Terminal, because one starship config
+per user is the only thing starship reads; a prompt already on screen keeps its blank row until the
+next one is drawn.
+
+**The sidebar updates as files change.** The Explorer tree, its git markers and the Source Control
+lists follow file-system events within about half a second, also while the sidebar is not focused
+(details in `AGENTS.md`). Filesystems that report no events (WSL `/mnt/c`, network shares) still get
+the old 2 s refresh while the sidebar is focused.
+
+Language servers are installed by default (`dotfiles/install-lsp.sh`, see
+*Language servers (LSP)*). `--no-lsp` skips them; `--no-packages` also skips their apt step.
+
+What it does, in order:
+
+1. Drift check: warns if Fresh or herdr replaced their config symlink with a plain
+   copy (see *Gotchas*) and shows the diff so you can merge it into `dotfiles/config/` first.
+2. Runs `dotfiles/install.sh`: apt packages (incl. `rustc cargo build-essential jq`; any package this
+   Ubuntu's apt does not have is skipped with a note, never aborting the install), herdr + Fresh
+   official installers, all symlinks, `dotfiles/herdr-sidebar/build.sh` (builds
+   `plugins/herdr-sidebar` from this checkout and points herdr's `herdr-sidebar`
+   registration at it, replacing any other registration), links `dotfiles-ide`,
+   seeds the sidebar settings, installs herdr's Claude Code and pi agent-state hooks.
+   `build.sh` uses the first Rust toolchain at least as new as the crate's `rust-version`: the
+   `rustc` on PATH, else an existing `~/.cargo/bin` (rustup), else it installs rustup into your
+   home directory, non-interactively.
+3. Verifies the actions, Fresh plugins and keys are visible, that the `herdr-sidebar`
+   and `dotfiles-ide` registrations both point into this repo, then reloads herdr.
+
+Afterwards, once:
+
+- AI commit: in a sidebar press `s` → **AI commit…** and enter an OpenAI-compatible API URL
+  (e.g. `https://api.deepseek.com/v1`), the API key and the model, then **Test connection**.
+- Restart running Fresh so new plugins/keys load: `dotfiles/herdr-plugins/ide/bin/fresh-restart --all`
+  from the repo root (see *Updating*).
+- Windows Terminal (and Pebrel): remove its default **Ctrl+Shift+A → Select all** and **Ctrl+Tab → next tab**
+  bindings (Settings → Actions), or the AI-commit and recent-tab chords never reach herdr and Fresh.
+- Start `herdr`, open a project pane, press `ctrl+b i` for the IDE layout.
+
+### Migrating from the old `~/code/dotfiles`
+
+Machines set up before the merge still have the old checkout, and their symlinks
+point into `~/code/dotfiles`. Pull this branch into `~/code/herdr-sidebar` and rerun
+`docs/install-herdr-ide.sh`. Its `link()` re-points any symlink that points elsewhere
+(the replaced files go to `~/.dotfiles-backup/<timestamp>/`), re-links the
+`dotfiles-ide` plugin when its registration points at an old root, and rewrites
+`editor-command.txt` on every run. After that the old `~/code/dotfiles` checkout is
+unused and can be archived. If Fresh's settings screen had left
+`~/.config/fresh/config.json` as a plain copy, the drift check shows its diff: merge
+that into `dotfiles/config/fresh/config.json` before rerunning, because the re-link
+moves the copy aside.
+
+## Keys
+
+### herdr, global (`dotfiles/config/herdr/config.toml`)
+
+| Key | Does |
+|---|---|
+| `ctrl+b i` | IDE layout for the current pane's project (focuses Fresh if already built, bringing a parked terminal back) |
+| ``ctrl+b ` `` | Toggle the terminal: focus it under Fresh, park it in its background tab, or bring it back (`dotfiles-ide.toggle-terminal`) |
+| `alt+f12` | Same terminal toggle as ``ctrl+b ` `` (Zed's `ToggleBottomDock` chord) |
+| `ctrl+b a`, `ctrl+alt+b` | Toggle the sidebar |
+| `ctrl+b f` | Quick Open in the sidebar |
+| `ctrl+b /` | Search in files |
+| `ctrl+b d` | Source Control view |
+| `ctrl+q` | File-search popup (fuzzy find, opens in Fresh/preview) |
+| `ctrl+alt+s`, `ctrl+alt+f` | Search in files popup (file contents, live preview; opens at the matching line; opens with the Replace row showing; ▾ folds it) |
+| `ctrl+alt+e` | Replace in files popup (the same search popup, which opens with the Replace row showing: Ctrl+R replaces the selected item, Alt+Enter replaces all, after a y/N prompt) |
+| `ctrl+alt+q` | Go to symbol popup: fuzzy list of the project's definitions, Enter opens one at its line (heuristic index — see below) |
+| `ctrl+alt+u` | Resolve merge conflicts: the 3-way merge editor popup (Incoming / Current / Result) for the focused repository's conflicted files (see *Merge editor* below) |
+| `ctrl+w` | The older fzf "jump to symbol" script (`scripts/jump-symbol.sh`, rg + PHP-focused) beside the plugin popup |
+| `ctrl+alt+c` | Git: switch branch (popup; type a new name to create) |
+| `ctrl+alt+n` | Git: new branch — name prompt (popup), branched from HEAD and switched to |
+| `ctrl+alt+r` | Git: rename current branch (popup) |
+| `ctrl+alt+x` | Git: merge a branch into the current one (popup; local branches first, current one filtered out) |
+| `ctrl+alt+g` | lazygit branch panel (switch / merge / rename / new / delete; needs the `lazygit-viewer` plugin) |
+| `ctrl+alt+p` | Git: pull (background, progress toasts) |
+| `ctrl+alt+k` | Git: push (background, progress toasts) |
+| `ctrl+alt+z` | Git: undo last commit (`reset --soft HEAD~1`, changes stay staged; no confirm, the toast names the hash to redo it) |
+| `ctrl+shift+a` | Git: stage all + AI message (⚙ Settings → AI commit) into Source Control, then commit |
+| `ctrl+alt+shift+f` | Git: force reset + clean (`scripts/force-reset.sh`, extra y/N prompt) |
+| `alt+w`, `ctrl+alt+h` | lazygit (whole UI / the log panel) as popups |
+| `ctrl+alt+v` | File viewer pane (`herdr-file-viewer`; `e` opens the file in Fresh) |
+| `ctrl+b alt+g` | lazygit popup |
+| `ctrl+b t` | Scratch terminal popup |
+| `ctrl+b ?` | Every herdr binding |
+
+The prefix-mode extras come from the same `[keys]` table: `ctrl+f12` (session outline /
+goto), `ctrl+alt+t` (next agent), `ctrl+shift+q` / `ctrl+alt+shift+q` (detach),
+`ctrl+alt+shift+d` (close pane — deliberately three modifiers, it kills a running agent).
+
+`keymap.json` (see the root `AGENTS.md`) adds global chords too: its `"global": true` entries are
+generated into ONE block at the END of `config.toml`, between the markers `# >>> herdr-sidebar
+keymap.json (generated; edit keymap.json, not this block) >>>` and `# <<< herdr-sidebar keymap.json
+<<<`. Edit `keymap.json` (`<state dir>/keymap.json`, or ⚙ Settings → Edit keymap.json…), never that
+block: the sidebar rewrites it, and a hand edit is replaced on the next apply. The apply writes the
+symlink TARGET (the repo file, so the block shows in git), runs `herdr config check` on the candidate
+first, and refuses a candidate that adds a diagnostic (the toast names the `keymap.json[i]` entry).
+
+`dotfiles/config/herdr/config.toml` and `dotfiles/config/herdr/scripts/` are both symlinked
+into `~/.config/herdr/` by the installer, so a keymap or script edit belongs in this repo:
+`git pull` + `./install.sh`, then `herdr server reload-config` for a config change (scripts
+need no reload). The scripts the plugin actions replaced — `jump-file.sh`,
+`branch-switch.sh`, `branch-merge.sh`, `rename-branch.sh`, `run-hold.sh`, `ai-commit.sh`,
+`ide-open.sh` — still ship in that directory but are **not bound**; rebind one if its fzf /
+popup behaviour is wanted back.
+
+Git keys act on the repository of the **focused pane's** current directory.
+
+Two popups search from the focused pane's project. **Ctrl+Q** is quick open: a
+fuzzy file list, and Enter opens the pick in Fresh or the preview. **Ctrl+Alt+F**
+searches file contents: a query box with Match Case, Whole Word and Regex toggles
+(Alt+C / Alt+W / Alt+R) on the left, grouped results, and a syntax-highlighted
+preview of the selected match on the right. Enter opens the match at its line in
+Fresh. Narrow terminals drop the preview and keep the list.
+The popup opens with the Replace row showing; the ▾ chevron left of the query folds it, and
+Tab or Ctrl+R re-opens it (Ctrl+R focuses the Replace input). Tab moves between the two
+inputs. Ctrl+R replaces the selected match (or, on a file header, every match in that file
+after a `y` confirmation); Alt+Enter replaces every match in the project after a `y`. Open
+editor buffers see the change on disk as an external change. **Ctrl+Alt+E** opens the same
+popup (the Replace row is showing from the start, as with Ctrl+Alt+F).
+**Ctrl+Alt+Q** is "Go to symbol": one flat list of the project's definitions,
+filtered as you type, with the matched characters highlighted and the file's
+line number on the right. Enter opens the pick at that line in Fresh (or the
+preview when no editor is configured). It is a **name** index, not an LSP one:
+Fresh owns the language servers and herdr-sidebar has no LSP client, so each
+language's definition lines are matched with a regex table
+(`plugins/herdr-sidebar/src/symbol_search.rs`). Consequences: a symbol produced by
+a macro, re-exported under another name, or a method whose owning type is only
+visible from an `impl` block can be missing or land on a slightly different line.
+Use Fresh's `alt+shift+q` (LSP definition under the cursor) or `alt+shift+w`
+(references) when accuracy matters, and this popup when you only remember the
+name and the file.
+
+**Ctrl+Alt+U** is the merge editor: a VS Code-style 3-way view of the repository's
+conflicted files, in a popup (`--merge-popup`, 98%×96%). Incoming is on the left and
+Current on the right, one shared scroll, and Result sits below them. Each conflict has a
+header row: the top panes carry `[x] Accept Incoming` / `[x] Accept Current` checkboxes,
+Result carries the buttons (Accept Current, Accept Incoming, Accept Both, then Reset once a
+side is chosen). Clicks and keys do the same things. Keys: `c` current, `i` incoming, `b`
+both (current then incoming), `B` both the other way, `a` base, `x` reset, `C` / `I` every
+conflict current / incoming, `n` / `p` next / previous conflict, `u` undo, `s` save, `r`
+reload from disk, `⏎` complete, `Tab` next conflicted file, `k` / `d` keep / delete for a
+deleted side, `e` open the raw file in the editor, `?` more keys, `esc` close (unsaved
+choices ask first). **Enter completes**: it saves, `git add`s the file and moves to the next
+conflicted file, and it refuses while any conflict is unresolved. The save refuses to write
+if the file changed on disk since the popup read it, and writes atomically. **Ctrl+S** (or `s`) on a file
+with every conflict resolved saves, `git add`s it and closes the popup when it was the last conflicted file
+(otherwise it opens the next one); answering Yes to the close prompt does the same. Enter still shows the
+"All conflicts resolved" screen.
+
+It opens from a conflicted (`!`) row in Source Control (a click, `o`, the hover `↗`, or the
+row's menu "Resolve in Merge Editor"), from `ctrl+alt+u`, from the merge conflict screen of
+the branch merge popup (`r` there, which closes that popup and hands off), and from Fresh's
+**Git: Resolve in Merge Editor** command. Herdr runs one popup at a time, so the editor
+retries for a few seconds while the popup that opened it closes.
+
+**Shortcut toasts:** every custom shortcut (herdr and Fresh) shows a small
+toast with its name and key, e.g. "Switch branch / Ctrl+Alt+C", as a reminder.
+The key is looked up live from the config files, so rebinding needs no code
+change. herdr-sidebar toasts only when started as a plugin action
+(`HERDR_PLUGIN_ACTION_ID` set; `src/shortcut_tip.rs`), so hooks never toast;
+dotfiles-ide uses `tip` in `lib.sh`; the two `popup` keys run
+`herdr notification show` before their command.
+
+### Fresh (`dotfiles/config/fresh/config.json`)
+
+| Key | Does |
+|---|---|
+| `ctrl+alt+o` | Git history of the selected lines (herdr popup, `git log -L`) |
+| `ctrl+alt+y` | Copy the selected text (cursor line if nothing selected) |
+| `ctrl+alt+l` | Copy as reference: `path:12-20` + fenced code block |
+| `ctrl+alt+a` | Paste that reference into this tab's Agent pane (not submitted) and focus it |
+| `ctrl+tab` | Jump to the previously used open tab (again = back); never opens files |
+| `alt+c` | Merge conflict: accept **current** (the block at the cursor, or the next one) |
+| `alt+i` | Merge conflict: accept **incoming** |
+| `alt+m` | Merge conflict: accept **both** (current, then incoming) |
+| `alt+d` | Merge conflict: next conflict (past the last: next conflicted file) |
+| `alt+shift+d` | Merge conflict: previous conflict (wraps to the last) |
+| `alt+shift+q` | LSP: go to the definition under the cursor (same as `F12`) |
+| `alt+shift+w` | LSP: find references to the symbol under the cursor (same as `Shift+F12`) |
+| `alt+o` | LSP: list this file's class/method/function symbols and jump (`lsp_navigation`) |
+
+The LSP trio is `alt+shift+q` / `alt+shift+w` / `alt+o` rather than `alt+q` /
+`alt+w`: herdr binds `alt+w` to the lazygit popup and takes keys before the pane's
+program does, so any `alt+w` binding inside Fresh is unreachable. Fresh's own
+`F12` / `Shift+F12` / `Ctrl+F12` (definition / references / implementation) are
+untouched and still work. `Ctrl+Shift+<letter>` is not usable either: without the
+kitty keyboard protocol the terminal sends the same bytes as plain
+`Ctrl+<letter>` — `Ctrl+Shift+O` arrives as `Ctrl+O` and opens the file picker.
+Bare modifiers cannot be bound at all, so "double-tap Shift" is not expressible;
+`alt+o` is the document-symbol list instead. `goto_lsp_symbol` is a plugin action
+from the bundled `lsp_navigation` plugin: bind it by name in `keybindings`, and
+read *Gotchas* before wrapping it.
+
+The first four are also in Fresh's **Selection** menu, and all five in the
+command palette (`ctrl+p`). Ctrl+Tab is bound with `"when": "normal"` (editing
+only). Windows Terminal binds Ctrl+Tab to its own "next tab" by default:
+unbind it there (see *Gotchas*). Shift+Tab is Fresh's normal un-indent.
+
+The conflict keys are free in Fresh's default keymap: Alt+1/2/3 are bookmarks,
+Alt+N/P find-selection, and Alt+Shift+N/P sidebar sections, so they were not
+reused. In a file without conflicts the conflict keys only show "No merge
+conflicts in this file".
+
+**Resolving merge conflicts.** The main resolver is the merge editor popup (`ctrl+alt+u`,
+above). Fresh's own resolvers stay available inside the editor. The inline one (this
+config, `plugins/selection_share.ts`, "Inline merge conflicts") works in the
+normal buffer like VS Code: each block is tinted (current green, incoming blue,
+diff3 base grey), an action line sits above each `<<<<<<<`, and the keys above
+accept a side. Accepting moves to the next unresolved conflict. When the file
+is clean it is saved, and the next conflicted file from `git diff
+--diff-filter=U` opens at its first conflict. Stage files in Source Control
+and commit when none remain. Fresh's built-in **Merge: Start Resolution**
+(`merge_conflict.ts`) is the alternative: a three-panel view (ours, theirs,
+editable result). Both coexist; the inline resolver never clears the built-in
+one's decorations. **A conflicted (`!`) file clicked in Source Control — or opened
+with `o` — opens in the merge editor popup**, not its diff: the diff only says "this
+file conflicts". The row's menu still has "Open File in Editor", which opens the raw
+file in Fresh, where the inline resolver (Alt+C / Alt+I / Alt+M) works. (Every other
+changed file keeps the read-only diff preview.) A conflict that is a pure deletion has no
+file to open, so it falls back to the diff.
+
+**The Source Control row counts what is left.** A conflicted file's marker is
+`!N` — N conflict blocks still in the working tree — and turns into a green `✓`
+once the last one is gone, so a resolved-but-unstaged file no longer looks
+unresolved (git keeps reporting both as `UU` until `git add`). The count is
+re-read on the 2 s status refresh while the pane is focused, so saving in Fresh
+updates the row within a couple of seconds; `⏎` on the row then stages it and it
+leaves the conflicted list.
+
+### Sidebar
+
+`1` / `2` / `3` Explorer / Search / Source Control (`ctrl+1..3` from a text
+field), `ctrl+p` Quick Open, `ctrl+f` search, `m` or **right-click** context
+menu, `s` Settings, `b` hide, `c` change folder, `q` quit.
+
+Anything that asks you to type (new file/folder, rename, typed change folder,
+custom editor, pane rename) opens as a small bordered dialog over the tree;
+`⏎` accepts, `esc` cancels. Deleting from the Explorer asks first — turn that
+off with the ⚙ Settings row **Confirm delete** (`on`/`off`, remembered across
+sessions) when you would rather have no prompt at all.
+
+## How each piece works
+
+### Which space's agent is busy (herdr's spaces rail)
+
+herdr aggregates every pane's agent state into a per-workspace `agent_status`
+(`workspace list`), and the top-left rail draws it: row 1's `state_icon` is the
+workspace's status (symbols style: `◐` working, `×` blocked, `✓` done, `○` idle,
+`·` unknown — colours yellow / red / teal / green / grey). That glyph is a single
+cell, so `dotfiles/config/herdr/config.toml` keeps **two lines per space, no blank
+line between spaces** (`row_gap = 0`): row 1 is the bold project name with the
+space's agent names beside it, row 2 is the branch/git line. The busy/idle *word*
+is not drawn — the icon and its colour carry it; adding `state_text` back is one
+config line (`rows` is a plain list).
+
+**That block only reaches the rail when `~/.config/herdr/config.toml` is the installer's
+symlink** (it is on every machine this repo's installer set up; the repo file is the source
+of truth). Replace that file with a hand-written config — a personal keymap file used to be
+the common case — and herdr silently falls back to its defaults: `status_indicators =
+"dots"`, where working / blocked / done are all a `●` and only the colour differs, plus two
+rows (`["state_icon", "workspace"]`, `["branch", "git_status"]`) with no agents beside the
+name. The status data is still correct — `herdr workspace list` reports `agent_status =
+working` — it is just unreadable without colour. Re-link it (or merge
+`[ui] status_indicators` and the `[ui.sidebar.spaces] rows` table into your file), then
+`herdr server reload-config` (applies to a LIVE client, no restart).
+
+The shipped file sets `status_indicators = "dots"`, the machine's long-standing choice, so
+working vs idle is a colour, not a glyph. One line turns that into `"symbols"`
+(`◐` working, `×` blocked, `✓` done, `○` idle, `·` unknown), which reads without colour.
+
+**The agent list under the spaces cannot be hidden.** `[ui.sidebar.agents]` accepts only
+`row_gap`, `rows` and `rows_by_agent` — there is no enable/visibility switch — and the
+`agents … grouped` header is drawn unconditionally. `rows = []` does NOT remove the section: it
+degrades to **one line per agent holding just the state dot** (verified live: 9 agent panes →
+9 bare `○` lines), i.e. the same height as the one-line form but with no information. The floor
+is one row per detected agent pane, so the section is as tall as your agent count. Give those
+rows content (`rows = [["state_icon", "agent"]]`) instead of leaving them empty, and reclaim the
+space by collapsing the rail (`prefix+b`; `sidebar_collapsed_mode = "compact"` keeps a narrow
+status strip, `"hidden"` uses zero width, `sidebar_start_collapsed = true` starts collapsed).
+
+The agents are named beside the project name, because a bare `◐` does not say
+*what* is running. herdr has no built-in "agent name" token, but it renders any
+`$custom` token in those rows, so the sidebar reports one per space: `$agents`
+reads `pi` for a single-agent space and
+`pi · codex` for one running two agents, busy ones first. `plugins/herdr-sidebar`
+sends it every 5 s from each sidebar pane's heartbeat (`src/agent_tokens.rs`,
+source `herdr-sidebar`, `ttl_ms` 20 s), so it expires on its own when the last
+sidebar of a session goes away, and it clears a space that has no agent pane.
+Agents are read from `pane.list`, so this needs no extra configuration. Toggling
+herdr's own sidebar (`prefix+b`, "agent sidebar") shows or hides the whole rail,
+these per-space agent lines included.
+
+Two things that surprise people:
+
+- **The aggregation is a max, and working is not the top of it**: blocked > done
+  (finished, not looked at yet) > working > idle > unknown. A space whose agent
+  is working shows `◐` only while nothing louder is in it.
+- **The state has to be reported.** herdr gets it from per-agent hooks
+  (`herdr integration install <agent>`; the installer installs `pi` and Claude
+  Code). `pi`, `omp`, `mastracode`, `opencode`, `kilo` and `kimi` have *full hook
+  authority*, so herdr does not scan their screens at all: without the hook the
+  rail shows them idle forever, and a **hung** hook agent can stay `◐` until the
+  process exits (there is no staleness timeout). Other agents are detected from
+  the screen tail and go back to idle within about a second.
+- **Background subagents used to make the space look idle.** pi's own hook reports
+  `working` for the main agent's turn and `idle` the moment that turn settles, and
+  `@tintinweb/pi-subagents` (the setup here) launches agents in the **background by
+  default**: the dispatch returns immediately, so the space flipped to `○` while the
+  child agent kept working (measured: 48 s of `idle` during one background run).
+  Foreground (blocking) subagents were never affected — the turn stays open while they
+  run. The sidebar fixes this itself (`plugins/herdr-sidebar/src/pi_state.rs`, no extra
+  pi extension): it reads pi's persisted transcript for every pi pane in the session
+  and keeps the pane `◐` while a background agent is unfinished or a turn is open, so the
+  space stops looking idle. Expect the rail to catch up within ~5 s of a dispatch or a
+  completion (it rides the sidebar's heartbeat). A background agent only counts while its
+  own output file (`/tmp/pi-subagents-<uid>/…/<id>.output`) changed in the last 5 minutes:
+  pi `/reload` or quitting pi stops its agents without recording it, and without this rule
+  the space stayed `◐` forever. The cost is that an agent stuck in one tool call for more
+  than 5 minutes shows `○` until it writes again. Two caveats: the sidebar has to report
+  the pane's state itself (herdr only accepts it from pi's own identity), so pi panes
+  show the old behaviour while **no sidebar** runs anywhere in the session, and quitting
+  every sidebar freezes their indicator until pi restarts. Subagent
+  activity inside a *nested* child (a workflow's agents) is covered by the top-level
+  agent's run, which is what the transcript records.
+- **An agent herdr has no integration for reports its own state.** herdr ships
+  integrations for 18 agents and detects only those; CodeBuddy (`codebuddy`, npm
+  `@tencent-ai/codebuddy-code`) is none of them, so its panes stayed `·` unknown and the
+  rail could only ever name it through the agent-title hook. `dotfiles/config/codebuddy/hooks/herdr-agent-state.sh`
+  plugs into CodeBuddy's OWN hook system, which is Claude-Code compatible: `install.sh`
+  links the script to `~/.codebuddy/hooks/` and merges seven entries into
+  `~/.codebuddy/settings.json` — `SessionStart` → idle (with the session ref),
+  `UserPromptSubmit` / `PreToolUse` → working, `Stop` → idle, `PermissionRequest` and a
+  `Notification` matcher on `permission_prompt|agent_needs_input|elicitation_dialog` →
+  blocked (`idle_prompt` is idle, not blocked), `SessionEnd` → release. Only entries
+  whose command ends in that script's name are replaced, so the user's model,
+  permissions, own hooks and plugins survive a rerun, and the script prints nothing and
+  always exits 0 (stdout would be fed to the model, exit 2 would block the tool).
+  Three things make or break it, all verified live: `--source` must NOT start with
+  `herdr:` (that prefix belongs to herdr's own integrations — such a report is answered
+  `ok` and silently dropped), `pane report-agent` only lands on a pane that really hosts
+  an agent process (a hook always runs inside one; the same call on a bare shell is
+  dropped), and `--seq` must strictly increase forever, so the script keeps a per-pane
+  nanosecond counter under `~/.local/state/herdr-codebuddy/`. Because it reports
+  `--agent codebuddy`, the rail gets the name AND the state without the zsh
+  agent-title hook. CodeBuddy snapshots its settings at startup: a freshly installed
+  hook applies to the next `codebuddy`, not to a running one.
+- **An agent that needs you (or finishes) also toasts.** The rail is easy to miss, and
+  herdr has no agent-state notification of its own. The sidebar's 5 s heartbeat already fetches
+  `pane.list` for the `$agents` line, so it also diffs each pane's state and shows ONE
+  `notification.show` per beat: `blocked` becomes `codebuddy needs input` (sound: request),
+  and a finished turn becomes `codebuddy finished` (sound: done). "Finished" is the `done`
+  state, or `working`→`idle`: herdr can mark an unfocused pane `done` when it finishes (observed
+  live; the same pane can also stay `idle`), so both transitions count — and `done` right after
+  `idle` is suppressed, so one finish never toasts twice. The name is the same one the rail uses
+  (`display_agent` else `agent`), so agents herdr never detects — CodeBuddy,
+  `codebuddy-code`, … — are named correctly with no extra table. It stays quiet when the pane
+  is FOCUSED (the prompt is in front of you), on the first beat after a sidebar starts (a
+  restart would otherwise replay every state as a toast), and while a state does not change
+  (a blocked agent does not page you every 5 s). Several agents changing in one beat produce
+  one aggregated toast, blocked first. Like the `pi` background-agent fix below, this needs a
+  sidebar running somewhere in the session; only the elected one reports, so you never get the
+  same toast twice.
+
+### IDE layout: `dotfiles-ide` plugin
+
+- **Pane identity is by label**, so it survives herdr restarts: `Fresh`,
+  `Terminal`, `Agent`; `Sidebar` belongs to herdr-sidebar. The Fresh pane also
+  carries a `fresh_daemon=<name>` metadata token.
+- **But a label alone does not mean the editor is up.** A herdr server restart
+  (or a reboot) resumes every pane as a plain SHELL: the labels come back, the
+  metadata tokens do not, and no Fresh daemon runs. Such a pane is a *corpse*.
+  `lib.sh`'s `fresh_editor_ok` therefore asks for the `fresh_daemon` token AND a
+  live daemon. `herdr-ide` treats a tokenless `Fresh` pane as an editor to heal
+  IN PLACE — same pane, relabelled and started again with `fresh-ide`, no extra
+  splits — and prints the editor pane id on every path, which is what
+  `fresh-open` reads. Regression symptom (before this): the first file click
+  after a restart reported `custom editor failed: …/fresh-open exited with exit
+  status: 1` (its `die "could not start the IDE editor"`) while the pane showed
+  an empty prompt.
+- **After a restart the IDE comes back on its own.** `bin/ide-heal` is a hook on
+  `workspace.focused`, `tab.focused` and `pane.focused`. herdr emits no event when it
+  restores panes, so the first focus of a space is the trigger, and only the FOCUSED
+  workspace is touched. A `Fresh` pane with no `fresh_daemon` token gets its editor back in
+  place (`heal_fresh_pane` in `lib.sh`, the code `herdr-ide` also uses for corpses). An
+  `Agent` pane with no `ide_role=agent` token that herdr did not resume itself (no `agent` /
+  `agent_session` in `pane list`) runs its agent again (`heal_agent_pane`): `claude` and `pi`
+  with `--continue`, `codex` as `codex resume --last`, others unchanged. The continue form is
+  used only when no other pane runs that agent in the same directory. `ide_role=agent` is set
+  when the Agent column is built and lives for one server run, so an agent quit in that run is
+  left alone. An Agent pane herdr resumed only gets the token. `fresh_daemon` is reported
+  BEFORE the `Fresh` label, so a labelled pane without it means a dead editor. Fresh's own
+  restore can be stale, so `plugins/session_memory.ts` (see *Fresh plugins*) records the open
+  files and `bin/fresh-session-restore` reopens them. `bin/ide-heal --dry-run` prints the plan.
+- `bin/herdr-ide` (action `layout`) splits the current tab into the layout
+  above. Started from an agent pane, that agent becomes the right column; from
+  a shell, the shell becomes the Terminal and a new agent opens (agent command:
+  plugin config `agent` file, else `$IDE_AGENT`, else the first INSTALLED agent from a
+  preference list — **pi first**, then claude, codex, gemini, codebuddy, cursor-agent,
+  opencode, aider, qwen, kimi, grok, droid, since claude is not a given; `none` = no
+  column, which is also what you get when none of them is installed). An explicit
+  choice always wins.
+- **Change Folder rebuilds the space (`bin/ide-reroot`).** When the sidebar's
+  Change Folder crosses a project root (its y/N **Refresh space?** dialog), it
+  runs this script with `<dir> <workspace> <tab>`: EVERY pane of the space is
+  closed across all its tabs — IDE panes, parked terminals, unlabeled shells,
+  detected agents — and only the sidebar plugin's own panes are spared
+  (identity tokens `herdr-sidebar*`, preview `hs-preview-path`/`-control`,
+  editor `hs-editor-path`; `hs-preview-host` marks the FRESH pane and is NOT
+  spared). The sidebar's tab is focused again and, when nothing but the
+  sidebar is left in it, a fresh shell at the new root is split beside the
+  sidebar so `herdr-ide <dir>` has an anchor (the shell becomes the Terminal,
+  the editor/agent split off it all inherit the root). The spaces rail then
+  follows on its own: herdr derives a workspace's name, branch and git status
+  from its FIRST tab's root pane's live cwd, which the rebuild moves to the
+  new project. Agent conversations are lost (the dialog warns); the new
+  project starts with default split sizes until you drag them, and the old
+  project's Fresh daemon keeps running headless until `fresh-restart`/
+  `fresh-pause` handles it.
+- **Agent pane title.** The Agent pane's border shows the agent it runs: `◆ CLAUDE`,
+  `◆ CODEX`, and so on, taken from the command you type there (`claude -r`,
+  `codex resume xxxx`, `npx @openai/codex@latest`, `env X=1 claude`, `~/.local/bin/claude`
+  all work). `bin/ide-agent-title` parses the command without `eval` and reports it through
+  `pane report-metadata --title` **and `--display-agent`**. A metadata title is drawn in
+  preference to the manual label, so the pane stays labelled `Agent` for the scripts while the
+  border reads `◆ CLAUDE`. When the agent exits back to the shell prompt the title clears and
+  the border reads `Agent` again.
+- **That same `--display-agent` is what names the agent in herdr's spaces rail.** herdr only
+  detects the agents it ships an integration for (`herdr integration status`: pi, omp, claude,
+  codex, copilot, devin, droid, kimi, opencode, kilo, hermes, qodercli, qwen, cursor,
+  mastracode, antigravity-cli, grok, letta), and even then it reports its own id. For every
+  other CLI — CodeBuddy, Cline, Roo, Amp, Kiro, Trae, … — nothing is detected at all, so the
+  NAME can only come from this hook: herdr-sidebar's `$agents` token prefers the pane's
+  `display_agent` field (`src/agent_tokens.rs`). **The `AGENT_OF` table at the top of
+  `bin/ide-agent-title` is therefore the only place an agent becomes visible in the rail**;
+  it covers claude/codex/gemini/antigravity/jules, cursor/copilot/droid/devin/hermes/letta,
+  codebuddy/qwen/qoder/lingma/kimi/grok/vibe, opencode/aider/pi/omp/amp/crush/goose/kilo/
+  cline/roo/mastracode/openhands/continue/auggie/plandex/codebuff/octofriend/gptme/sweep/
+  smol/mods/iflow/kiro/trae (plus the `-cli` spellings and package names), and adding a line
+  there is all that a new CLI needs. Verified live: `pane report-metadata --display-agent
+  codebuddy` alone made that space's rail read `codebuddy` within one 5 s heartbeat, with no
+  herdr detection involved.
+- The title/clear cycle needs the zsh hook `shell/agent-title.zsh`, which `herdr-ide` sources
+  into the pane before starting the agent. An agent that was already running when the layout was
+  built gets its title once, with no hook, so that title stays after it exits (clear it with
+  `dotfiles/herdr-plugins/ide/bin/ide-agent-title --clear <pane>`). Panes created before
+  this change get the hook after `ctrl+b i` (or by running
+  `. ~/code/herdr-sidebar/dotfiles/herdr-plugins/ide/shell/agent-title.zsh` in the Agent
+  pane once). A command typed BEFORE a CLI was added to the table leaves no name until it runs
+  again (the hook fires per command, not per running process).
+- `bin/fresh-ide DIR` runs `fresh -a ide-<sha1(project root)[:10]>`: **one Fresh
+  daemon per project per herdr workspace**. The first workspace on a project
+  gets `ide-<hash>`, the next `ide-<hash>-s2`, `-s3`, and so on; a workspace
+  keeps the daemon its Fresh pane already has (`ide_daemon_for` in `lib.sh`).
+  The editor survives its pane closing and other tools can hand files to it.
+  Short names avoid the 108-byte socket-path limit. `fresh-ide` exports
+  `FRESH_IDE_DAEMON` so the editor plugin knows its own daemon.
+  It also labels the pane and sets `herdr pane input --right-click pane`, so a
+  plain right-click reaches Fresh (its tab and file-tree menus); right-click on
+  the pane **border** still opens herdr's pane menu.
+- `bin/herdr-ide-term` (action `toggle-terminal`, Ctrl+`) never zooms, so the side columns
+  never disappear. With a Terminal in the IDE tab it focuses that Terminal, or parks it when it
+  already has focus; with the Terminal parked it moves it back below Fresh at the remembered
+  editor share; with none at all it opens a new one. Parking is the one place a Terminal leaves
+  the middle column (see the next bullet).
+- **The Terminal no longer parks on its own.** `herdr-ide` leaves it under Fresh, and only
+  Ctrl+` (`lib.sh`'s `park_terminal`) moves it into a background tab labelled `terminal`;
+  running `herdr-ide` again brings a parked one back. While parked it keeps running, with its
+  history and cwd. The contract with herdr-sidebar: the Terminal carries the metadata token
+  `ide-parked-for=<IDE tab id>` (source `dotfiles-ide`), stamped BEFORE the move, because the move
+  fires `tab.created` and the sidebar's ensure hook skips a tab whose panes all carry it; the
+  token is removed with an explicit JSON null when the Terminal comes back (`unpark_terminal`).
+  Herdr drops metadata on a server restart, so `parked_terminal` falls back to the Terminal that
+  sits alone in a tab of the same workspace. `save_sizes` never records an editor share while no
+  Terminal is in the tab.
+- **Pane sizes are remembered per project**, shared by all of its workspace
+  daemons (the daemon name without its `-sN` suffix). herdr has no hookable resize
+  event, so `bin/ide-save-sizes` runs on `pane.focused` / `tab.focused` and
+  records, for every tab holding a Fresh pane, the Agent-column ratio and the
+  Fresh/Terminal ratio under that project's key in
+  `~/.local/state/herdr/plugins/dotfiles-ide/sizes.json` (a parked Terminal leaves no
+  Fresh/Terminal ratio to record, so the saved one stays). `herdr-ide` re-applies them after
+  building a layout and `herdr-ide-term` brings a parked Terminal back at the saved ratio
+  (`pane move --ratio`). Splits are found by geometry; a split id such as
+  `split_2_01` encodes its tree path (0 = first child). The sidebar's own
+  column is left to herdr-sidebar. A sidebar re-dock no longer resets these: the
+  sidebar restores a tab's split ratios around its own full-height repair, and
+  `ide-save-sizes` stays quiet for ~20 s afterwards (its `dock/restore.stamp`)
+  so the intermediate ratios are never recorded.
+- **Terminal height** (the `Terminal` "command line" under the editor) has a default in the
+  sidebar's ⚙ Settings: the row `Terminal height`, one below `Sidebar width`. It is measured in
+  ROWS (4–40, `←`/`→` in 2-row steps; `⏎` resets it to `auto`). Only the height is configurable —
+  the width is whatever the middle column is. `←`/`→` also resizes the terminal in the tab the
+  sidebar is in, right away; `⏎` does not touch the current layout. When a layout is BUILT
+  (`herdr-ide`, `fresh-restart`'s rebuilt editor, `herdr-ide-term` reopening a closed terminal)
+  the order is: the project's remembered ratio in `sizes.json` (your own drag) wins, then this
+  setting, then the historical 70% editor share. `lib.sh`'s `editor_split_ratio` computes it as
+  `1 - rows / column height`, clamped to herdr's 0.1..0.9, and reads the setting from
+  `~/.local/state/herdr/plugins/herdr-sidebar/settings.json` (`terminal_height`; `state.json` only
+  answers for a key `settings.json` lacks); it never writes there.
+- **Agent width** (the rightmost `Agent` column) has the same kind of default: the ⚙ Settings row
+  `Agent width`, one below `Terminal height`. It is measured in COLUMNS (24–320, `←`/`→` in 4-column
+  steps; `⏎` resets it to `auto`). Only the width is configurable — the height is whatever the tab
+  is. `←`/`→` also resizes the Agent column in the tab the sidebar is in, right away; `⏎` does not
+  touch the current layout. Build order (`herdr-ide`'s two sites) is: `sizes.json`'s remembered
+  `agent` ratio (your own drag) wins, then this setting, then the historical 0.6 middle / 0.4 agent
+  share. `lib.sh`'s `agent_split_ratio` computes `1 - cols / column width` (the split ratio is the
+  middle column's share), clamped to herdr's 0.1..0.9, and reads `agent_width` from the same sidebar
+  state file; it never writes there.
+- `bin/fresh-open FILE[:LINE[:COL]] | file://URL | --link` sends a file to the
+  nearest `Fresh` pane (this tab, then this workspace — never another
+  workspace's, even on the same project: that workspace has its own daemon).
+  A `HERDR_SIDEBAR_OPEN_DIFF=1` launch writes a live-diff request per daemon, as
+  `live-diff-request-<daemon>` in `$XDG_STATE_HOME/fresh-ide`, so only the
+  editor the file went to consumes it. The sidebar no longer sends it: SCM diffs
+  and git shows are read-only viewing and stay in the built-in preview (see the
+  changelog), so the request path is only reachable if something else sets the
+  env. It is the sidebar's custom editor (`editor-command.txt`) and
+  the target of the `file-link` link handler, so **Ctrl+click on `file://`
+  links** (rg, delta, eza, fd) opens Fresh
+  at that line.
+- `bin/fresh-to-agent TEXT` pastes text into the `Agent` pane **of the Fresh
+  pane's tab only** (never another tab's agent session) via the socket method
+  `pane.send_input`, which uses bracketed paste so newlines don't submit.
+- `bin/herdr-rpc METHOD JSON` is a tiny Python client for socket methods the
+  CLI does not wrap (`pane.focus` by id, `pane.send_input`).
+
+### Editors of other workspaces are paused
+
+- `bin/fresh-pause` runs on `workspace.focused` / `tab.focused`. Every Fresh daemon
+  whose `Fresh` panes are all in OTHER workspaces is SIGSTOPped: its client
+  (`fresh -a NAME`) and the server's whole process group, which holds its language
+  servers too, so a paused editor uses exactly 0% CPU. Focusing its workspace again
+  wakes it (≈0.25 s, the hook's own run time). Verified live: four editors, the three
+  in other workspaces at 0 ticks, rust-analyzer/tsserver included.
+- Nothing is recorded. Each run decides from the current focus, and a stopped
+  `ide-*` daemon with no `Fresh` pane anywhere (pane closed, herdr restarted) is
+  woken, so a daemon can never stay paused by mistake. A run that finds no focused
+  pane changes nothing.
+- `fresh-ide`, `fresh-open` and `fresh-restart` wake a daemon themselves before they
+  talk to it (`fresh_resume` in `lib.sh`): attach, `open-file` and `daemon kill`
+  would otherwise wait on a stopped server. `fresh --cmd daemon list` does not hang
+  on one.
+- Verified on a scratch daemon: after a 60–90 s pause the client, the language
+  servers (same pids, still answering) and typing all work, and a file changed on
+  disk while paused is auto-reverted the moment it wakes. A language-server reply
+  to a request Fresh had given up on is logged once as `unknown request id`, which
+  is harmless.
+- Only the client is stopped inside the pane, never `fresh-ide` itself: the pane's
+  interactive zsh would see a stopped job and take the terminal back.
+- Off switch: `touch ~/.local/state/herdr/plugins/dotfiles-ide/fresh-pause-off`
+  wakes every editor at the next focus change and pauses nothing; delete the file to
+  turn pausing back on. `bin/fresh-pause --dry-run` prints what it would do.
+
+### Previews cover the Fresh pane
+
+With the IDE layout, a sidebar preview opens **inside the Fresh pane** instead of
+splitting a new pane. That covers pictures, Source Control commits, stashes and
+branches, diffs (including deleted and binary files), and Enter on a file. `q` or Esc
+(or Esc in the sidebar) closes the preview and brings Fresh back with all of its
+buffers. Clicking a text file in the sidebar also closes the cover and opens the file
+in Fresh.
+
+How it works: `fresh-ide` runs a small host loop in the Fresh pane and stamps the pane
+with the `hs-preview-host` token. When the sidebar wants a preview there, it writes a
+request file under its state directory (`preview-host/<pane>.req`: the viewer, its
+directory and its environment). The host claims the request by renaming it, then
+suspends the Fresh client. The daemon keeps every buffer, so nothing is lost. The
+viewer runs in the same pane, and when it exits the host clears the preview's pane
+tokens and attaches Fresh again.
+
+- Fresh panes started before this change have no host loop: run
+  `dotfiles/herdr-plugins/ide/bin/fresh-restart --all` once.
+- Tabs without a Fresh pane keep the old split or tab behaviour.
+- `fresh-restart` skips a pane that a preview covers and says so
+  (`a preview covers pane …; close it (q) and rerun`), because restarting it would type
+  `fresh-ide` into the viewer.
+
+### herdr-sidebar fork (this repo)
+
+Upstream: `alexarthurs/herdr-sidebar`, forked at `v0.15.1`. Commits on `main` (the fork):
+
+| Commit | Feature | Mechanism |
+|---|---|---|
+| *uncommitted* | **Change Folder rebuilds the space** | A manual folder change that crosses a project root (nearest `.git` walk, `src/reroot.rs`) now asks **Refresh space?** (y/N dialog) and, on Yes, hands over to `dotfiles-ide`'s new `bin/ide-reroot <dir> <ws> <tab>` (plugin root via `herdr plugin list --json`; worker thread; log at `<rundir>/ide-reroot/last.log`). The script closes EVERY pane of the space across ALL tabs — IDE panes, parked terminals, unlabeled shells, detected agents — except the sidebar plugin's own (`herdr-sidebar*` / `hs-preview-path`/`-control` / `hs-editor-path` tokens; `hs-preview-host` marks the FRESH pane and is not spared). A surviving unlabeled shell was the failure that broke both halves, user-reported: herdr-ide anchored on it, its shell path kept the OLD cwd as the Terminal, and as the tab's root pane it pinned herdr's rail identity to the old project. The script refocuses the sidebar's tab, pre-splits a shell at the new root when nothing else can anchor `herdr-ide`, and runs `herdr-ide <dir>`. The rail follows by itself — a workspace's identity cwd is its FIRST tab's root pane's live cwd (herdr `Workspace::resolved_identity_cwd_from`) — so name, branch and git status re-derive from the rebuilt panes; `workspace rename` is deliberately not used (a custom name freezes the auto label). Agent conversations are lost (the dialog says so); a change inside the same project only re-roots the sidebar. |
+| a8e9cd6 | **Editor opens: inline** | Settings row `custom_editor_inline`: a click runs the editor command (`fresh-open`) in the background instead of opening a new herdr tab, so the sidebar and agent columns never move. |
+| 22756b9 | **Branch switch / rename / merge popups** | Actions `git-switch-branch`, `git-rename-branch`, `git-merge-branch` → `--git-popup-open <op>` resolves the focused pane's cwd and opens `--git-popup <op>` via `plugin.pane.open` placement `popup`. Rename uses `git branch -m` (never `-M`); merge uses `--no-edit` and offers `a` to abort on conflicts. |
+| 2c0912a | **Plain right-click menu + Cut/Copy/Paste/Duplicate** | The sidebar calls `pane.input.set right_click=pane` for its own pane. The file clipboard is a file in the plugin state dir, so copy in one tab and paste in another. Copies never overwrite (`name copy`, `name copy 2`); cut refuses an existing name. |
+| 9712dd7 | **Popups close on focus loss** | `FocusLost` events plus, while a popup is open, polling `pane.list` every 200 ms; a failed poll never closes anything. Typed prompts, Quick Open and Search stay open. |
+| e437091 | **herdr's pane items in the sidebar menu** | Rename pane, Split right/down, Zoom, Use herdr right-click menu, Close pane, through the socket API, since the sidebar's plain right-click hides herdr's menu. |
+| 01dea4e | **Line-history popup** | Entrypoint `git-line-history` (`--git-popup history`), range from `HERDR_SIDEBAR_HISTORY_FILE` / `HERDR_SIDEBAR_HISTORY_LINES`; opened by the Fresh plugin below. |
+| 60dd2a3 | **File-search popup** | Action `file-search` (`--file-popup-open`) → popup `--file-popup`: fuzzy file list (skips `.git`, honours `.gitignore`), opens the pick in the caller's tab. |
+| ea18341 | **Git pull / push (+ first AI commit), shortcut toasts** | `src/git_action.rs`, `src/shortcut_tip.rs`; actions `git-pull`, `git-push`, `git-commit-ai` (`--git-pull/--git-push/--git-commit`). Pull/push take a per-repo OS file lock; results are herdr toasts (`notification.show`); toasts carry the bound key, and only for plugin actions (`HERDR_PLUGIN_ACTION_ID`). Git runs with `GIT_TERMINAL_PROMPT=0` and null stdin so a credential prompt fails instead of hanging. |
+| *uncommitted* | **Branches menu: no phantom delete, plus rename and undo** | `git branch -a` also lists remote-tracking refs, so the drawer offered `origin/main` a **Delete Branch…** that ran `git branch -d -- origin/main` and answered "branch not found" (user-reported). `branch_menu_entries` (pure, unit-tested) now decides from `Git::is_local_branch`: remote-tracking refs get neither delete nor rename, the current branch cannot be deleted, and the menu gained **Rename Branch…** (any local branch, prefilled input dialog → `git branch -m`) and **Undo Last Commit (soft)…** (`reset --soft HEAD~1`, current branch only). Ref-changing commands also call the new `refresh_refs()`, because `refresh()` skips the drawer reload when `git status` did not change — deleting a branch left it on screen. |
+| *uncommitted* | **AI commit no longer steals focus** | `ctrl+shift+a` used to leave you in the Source Control pane (activating a view focuses its pane, and docking a new one always does). `git_action::request_ai_commit` now snapshots the focused pane and `restore_focus` puts it back — only when the activation actually took it *and* the new focus is one of our own panes (`focus_to_restore`, pure + unit-tested), so a user who switched panes meanwhile is never overridden. The request is a file and `take_ai_request` has no focus gate, so the unfocused sidebar still stages, generates and commits. |
+| *uncommitted* | **AI commit commits again** | 9eef928 made ✧ AI Commit stop after filling the Message box, so every AI commit needed a manual ✓ Commit (user-reported regression). The review window is back: when the message lands, the ✓ button switches to "Committing…" and the commit fires `AI_COMMIT_REVIEW` (900 ms) later through `commit_repo` — the ordinary ✓ path — and the outcome is toasted. 900 ms is enough to start editing the message, and `Edit Commit Message…` still rewrites it afterwards. |
+| 2a64708 | **AI commit through Source Control** | `src/ai_commit.rs`: `ctrl+shift+a` writes a per-tab request; that tab's Source Control sidebar stages everything, gets the OpenCommit message (prepare-commit-msg hook mode), fills Message, and commits through the ✓ Commit path. |
+| aedfbd6 | **Popup → editor caller context; AI-commit button animation** | Popups belong to no tab, so the inline editor is started with the CALLER pane's `HERDR_PANE_ID` / `HERDR_TAB_ID` / `HERDR_WORKSPACE_ID`. The ✓ Commit button shows a braille spinner with "AI generating…" / "Committing…" and a sweeping highlight band while an AI commit runs, and blocks a second commit. |
+| 2c02d3e | **Search popup + line-aware open** | `src/search_popup.rs`; the engine moved to lib `src/content_search.rs` (shared with the sidebar Search view); preview highlighted with `syntax::highlight_lines`; `actions::open_in_editor_inline_at` (`{line}` placeholder, or `file:line` for `fresh` / `fresh-open`). |
+| c5661c3 | **Replace popup + conflict routing** | Replace mode of the search popup (`HERDR_SIDEBAR_SEARCH_MODE=replace`, action `replace-popup`; `content_search::replace_in_text` / `apply_replacements`: engine-identical matching, `$1` expansion in regex mode, line endings / BOM / permissions kept, atomic write, root-confined). Conflicted (`!`) files open in the editor without Live Diff (`editor_live_diff`). |
+| 261bccb | **Dotfiles folded into this repo** | The standalone `~/code/dotfiles` now lives in `dotfiles/`; the upstream patch set was dropped. `dotfiles/herdr-sidebar/build.sh` builds this checkout and points herdr's `herdr-sidebar` registration at it. |
+| *uncommitted* | **"Git init" footer button** | When the root has no repository above it, the Explorer footer shows a clickable `Git init` chip (`Git::is_initialized`, a `.git` walk with no git process, refreshed on tick). It runs `git init` on a worker, then rediscovers repos/decorations: branch strip and `U` markers appear immediately. Mouse-only, the zone is reset every frame. |
+| *uncommitted* | **Focus-only working-tree refresh** | Only the FOCUSED Source Control pane reads `git status`: at once when it gains focus, then every 2 s; it skips the rebuild when nothing changed (one git process, no UI churn). An unfocused pane reads nothing, and a uniform 400 ms focus probe (herdr sends no per-pane focus events) makes the catch-up ~0.4 s after clicking it — previously it waited out the whole interval (~1.9 s). The Explorer's decorations keep their 2 s cadence and still skip while unfocused; branch switches stay instant via the 300 ms HEAD probe. |
+| *uncommitted* | **Diffs and git shows stay in the preview** | SCM changed-file rows used to route to the custom editor when one was configured (`HERDR_SIDEBAR_OPEN_DIFF=1`, live diff vs HEAD), which handed "look at this diff" to Fresh where nothing appeared, and the preview it displaced had to be closed again. `open_diff` now always uses `open_diff_viewer` (the file itself goes to the editor — see the "Open in Editor" row); drawer refs (commits, stashes, branches) already did. Opening a FILE still goes to the editor, and that launch closes the tab's inline preview so the two never stack. Measured: clicking a changed row opens `base.txt · preview`, and clicking a commit replaces it with `4c0abe0 · preview` in the same pane. |
+| *uncommitted* | **A conflicted file opens in the editor, not its diff** | A click / hover-open / `o` on a conflicted (`!`) SCM row now goes through `open_entry` → `file_popup::open_file_in_workspace` (the custom editor when one is configured), so Fresh's inline resolver is the first thing you see (Alt+C / Alt+I / Alt+M, Alt+D next) instead of `diff --cc` output. Every other changed row kept the read-only diff preview (changed later: see the "Open in Editor" row), a pure-deletion conflict has no file to open and keeps the diff, and the context menu's explicit "Open Diff" still means diff. |
+| *uncommitted* | **A changed row now opens in the editor; no more silent no-ops** | `o`, a click and the hover `↗` ("↗ Open in Editor") on any changed row hand the FILE to the configured editor (`opens_in_editor`: every status except `D`), through the same `file_popup::open_file_in_workspace` the conflicted rows already used — so "go to the change" lands in Fresh instead of showing a diff you cannot edit. A deleted entry has nothing on disk and keeps its diff; the menu's **Open Diff** / **Open Diff Preview** still mean diff, and drawer refs are unaffected. Second half: `o`/`m` with a *section* row selected (Staged Changes, Changes, a repository header, the commit box) used to do nothing at all, which reads as a broken key — `section_row_hint` now flashes what to do instead. |
+| *uncommitted* | **A `±` hover button previews the diff** | Since a click and `↗` hand the file to the editor, "just show me the change" had no one-click path in the Changes list — only the context menu's **Open Diff Preview**. Every changed file row now also carries `±` immediately right of `↗` (`FileHoverAction::Diff`), which calls `open_diff_viewer` directly and therefore ignores the editor routing: staged rows show the staged diff, untracked ones a single addition. Staged rows lay out `↗ ± −`, unstaged rows `↗ ± ↶ +`; `file_hover_action_start` reserves 3 cells per button, so a pane narrower than ~22 columns still hides the whole row rather than clipping it, and the footer hint reads "± Diff Preview". |
+| *uncommitted* | **Conflicted rows count what is left** | The marker of a conflicted (`!`) file is `!N` (`count_conflict_blocks` in `git.rs`: `<<<<<<<` lines, 4 MiB cap) and becomes a green `✓` when the last block is gone — git keeps reporting `UU` until the file is staged, so this is the only way the list can show "resolved". Counts are re-read on the focused 2 s refresh (`refresh_conflict_counts`) and the list rebuilds only when one changed; an unreadable file keeps the plain `!`. The marker's width feeds `file_hover_action_start`, so the hover buttons stay aligned under `!12`. |
+| *uncommitted* | **The editor replaces the preview instead of stacking** | Opening a file with an editor configured used to leave the tab's inline preview pane beside the fresh editor, so a diff then a file click ended with two content panes. `actions::spawn_inline_editor` now closes that preview through the viewer's own close request (`viewer::close_in_tab`) before launching the editor: an unsaved preview buffer still prompts, and the tab keeps ONE content pane. |
+| *uncommitted* | **Search results open in the editor** | The Search view and Quick Open forced the built-in preview (`open_preview_at`) even with a custom editor configured; they now go through `explorer_app::open_file` → `file_popup::open_file_in_workspace`, i.e. the same routing a tree click uses (Fresh at the hit's line, else the preview). Media goes to the editor too (the media exception was dropped later), and the preview path keeps the double-click pin bookkeeping. |
+| *uncommitted* | **Merge editor popup (Ctrl+Alt+U)** | `--merge-popup-open` (action `merge-editor`, `ctrl+alt+u`; Windows twin `merge-editor-windows`) opens the pane `--merge-popup` (98%×96%, `src/merge_popup.rs`) over the model in `src/merge_conflict.rs`: a lossless parse of the conflict markers, Incoming / Current / Result views aligned by conflict, and a save that refuses changed bytes and writes atomically (`content_search::write_atomically`). Source Control's `!` rows open it through `merge_popup::open_file`; the branch merge popup's conflict screen hands off with `r` (a detached child, unix only); Fresh's `git_merge_editor.ts` runs the same entrypoint with `HERDR_SIDEBAR_MERGE_FILE`. |
+| *uncommitted* | **Merge popup merges on one key** | The `--git-popup merge` branch list used to ask "Merge X into Y?" on a second screen (`Screen::ConfirmMerge`); picking a branch now merges immediately, and the result/conflict message screen (with `a` for `merge --abort`) is unchanged. `Git::merge_branch` still passes `--no-edit` and never forces. |
+| *uncommitted* | **Commit button offers a pull; both oco token ceilings pinned** | When the branch is behind its upstream AND something is staged, ✓ Commit reads `✓ Commit · N↓` and asks "Pull first?" (`y` = `git pull`, then commit; anything else commits at once); a failed pull never commits. The AI-commit path never asks. **Pulls always merge** (`PULL_ARGS` is `["pull", "--no-edit", "--no-rebase"]`, the `git-pull` action adds the same flag, and the dotfiles gitconfig now ships `pull.rebase = false`): an earlier version obeyed the config, so this machine's `pull.rebase=true` made a staged pull fail with `cannot pull with rebase: Your index contains uncommitted changes.` — defaulting to merge removes that trap (user-requested); a rebase is opt-in per pull. Sync Changes (`S`/⇅) is the same plain `pull` then `push`. `OCO_TOKENS_MAX_OUTPUT=500` is now pinned next to `OCO_TOKENS_MAX_INPUT=24000`, since oco subtracts it from the input budget. |
+| *uncommitted* | **New branch popup** | `--git-popup[-open] new` (`Op::New`, `ctrl+alt+n`): an input-only popup that creates the branch from HEAD and switches to it (`git switch -c`, name judged by `git check-ref-format --branch`, no stash/force), with the error in the footer instead of a toast. Manifest pane `git-new-branch`, action `git-new-branch`. |
+| *uncommitted* | **Instant branch reaction** | `Git::head_signature` (the git dir's `HEAD`; resolves a worktree's `.git` FILE) is compared a few times a second by both views, so a checkout / create / rename from a popup or a terminal refreshes the SCM header and the Explorer's footer/decorations at once instead of waiting for the 1.5 s status poll or `DECO_REFRESH`. Measured: ~65 ms (SCM), ~0.5 s (Explorer), both were 2-3 s. |
+| *uncommitted* | **Branch lists: locals first, newest created first** | The switch/merge popups and the drawer order branches by **creation time**, newest first: git has no creation date, so `ref_created_at` reads every reflog once (`reflog show --all --date=unix --format=%gd`) and keeps each ref's oldest entry; a ref with no reflog falls back to its tip commit's date (`sort_stamp`) instead of sinking to the bottom. **The current branch is no longer hoisted to row 0** — that is what made a just-created branch sit second whenever an older branch was checked out. Locals still sit above remotes. |
+| *uncommitted* | **Locals first; every merge shows up at once** | `parse_branch_choices` now stably partitions locals before remotes (after the current branch), so the switch/merge popups and the branch picker open on a local branch — git's `--sort=-committerdate` interleaved `origin/*` with them. And `Git::head_signature` grew from `HEAD`'s text to `HEAD` + the branch ref's tip (loose file, `packed-refs` fallback) + `MERGE_HEAD`: a commit, merge or pull moves the tip, a conflicted merge writes `MERGE_HEAD`, and `merge --abort` removes it — so `poll_branch` (not focus-gated) refreshes Source Control within ~300 ms, showing the new push/ahead state or the `!N` rows without touching the pane. |
+| *uncommitted* | **Inline editor failures are reported** | A click only reports the SPAWN, and the editor runs with null stdio, so a command that died on the spot looked like a successful open. `spawn_inline_editor` now reaps the child on a thread and `actions::take_editor_failures` hands a non-zero exit within 30 s to Explorer's notice / Source Control's flash (`custom editor failed: <program> exited with <status>`). |
+| *uncommitted* | **CodeBuddy reports its own agent state** | herdr has no `codebuddy` integration (its list stops at 18 agents) and never detects the process, so the space stayed `·`. `dotfiles/config/codebuddy/hooks/herdr-agent-state.sh` plus `install.sh`'s `codebuddy_hooks` merge seven Claude-Code-compatible hook entries into `~/.codebuddy/settings.json` (SessionStart→idle, UserPromptSubmit/PreToolUse→working, Stop→idle, PermissionRequest/Notification→blocked, SessionEnd→release); only entries naming our script are replaced. herdr rules found live: a `herdr:` source is reserved and silently dropped, `pane report-agent` needs a real agent process in the pane, and `--seq` must increase forever (per-pane nanosecond counter). |
+| *uncommitted* | **Agent notifications** | The rail only changes a glyph, so an agent that blocked or finished in another space went unnoticed, and herdr has no agent-state notification of its own. `src/agent_notify.rs` rides the `$agents` heartbeat's existing `pane.list` reply (no extra round trip) and shows at most one `notification.show` per beat: blocked → `<agent> needs input` with sound `request`; `done`, or `working`→`idle` → `<agent> finished` with sound `done` (herdr can report an unfocused pane as `done` on a finish — observed live — or leave it `idle`; `done` right after `idle` is suppressed so one finish toasts once). Names are `display_agent` else `agent`, so `codebuddy`/`codebuddy-code` panes herdr never detects are named by their hook. The first beat only primes (no restart storm), the focused pane is skipped, unchanged states never repeat, and several transitions in one beat aggregate into one toast, blocked first. Only the elected session reporter runs it. |
+| *uncommitted* | **IDE layer: every market CLI is named in the rail** | herdr only detects the agents it ships an integration for (`herdr integration status`), so a pane running CodeBuddy or any other newer CLI had `agent: null` and herdr-sidebar's `$agents` fell back to `-` while the agent was clearly working (user-reported with `codebuddy`). `bin/ide-agent-title` already reported `--display-agent`, which `src/agent_tokens.rs` prefers — the only gap was its name table. `AGENT_OF` now covers the herdr ids (pi, omp, claude, codex, copilot, devin, droid, kimi, opencode, kilo, hermes, qodercli, qwen, cursor, mastracode, antigravity-cli, grok, letta) plus codebuddy, cline, roo, amp, auggie, crush, goose, pi, plandex, codebuff, octofriend, gptme, sweep, smol, mods, openhands, continue, iflow, kiro, trae, vibe, jules, lingma, aider and their `-cli`/package spellings. Neither `pane.report_agent` nor an agent-state hook is involved: the name needs only the metadata field (verified live — the running CodeBuddy pane's space reads `codebuddy`). |
+| *uncommitted* | **IDE layer: a label-only Fresh pane is healed in place** | A herdr server restart resumes panes as plain shells, keeping labels but dropping metadata tokens, so `herdr-ide`'s label-only check treated a dead `Fresh` pane as a working editor: it focused it, printed nothing, and `fresh-open` died with "could not start the IDE editor" (exit 1, surfaced by the sidebar as `custom editor failed: …/fresh-open exited with exit status: 1`). `lib.sh` adds `pane_fresh_daemon` and `fresh_editor_ok` (token AND live daemon); `herdr-ide` reuses a corpse pane as the editor (relabel + `fresh-ide` in place, no new splits) and prints the editor pane id on the already-built path, which is how `fresh-open` gets it. |
+| *uncommitted* | **IDE layer: jq ≥ 1.6 keyword fix** | `lib.sh`, `ide-save-sizes` and `fresh-to-agent` named a jq variable `label`, which jq 1.6+ parses as its `label` keyword (`$label` → "syntax error, unexpected label"), so EVERY pane lookup failed on Linux/WSL and a file click built no editor. Variables are `$lbl` now; `fresh-open` also reports a failed `herdr-ide` instead of exiting 3 silently. |
+| *uncommitted* | **Media opens in the preview; previews cover Fresh; Agent pane title** | `viewer::is_media_file` keeps pictures and videos out of the custom editor (Explorer click, Ctrl+Q popup; Source Control's `diff_opens_in_editor` media flag). Preview host: `fresh-ide` runs a host loop in the Fresh pane (token `hs-preview-host`); the sidebar writes `<sidebar state dir>/preview-host/<pane>.req`, the host claims it by rename, and the viewer runs there with `HERDR_SIDEBAR_PREVIEW_HOSTED=1`; `viewer::uncover_host` runs before the editor launches. Agent pane title: `ide-agent-title` + `shell/agent-title.zsh` (zsh preexec/precmd) → `pane report-metadata --title "◆ CLAUDE"`; language servers: `dotfiles/install-lsp.sh` (default in the installer) + Fresh `lsp` auto_start. |
+| *uncommitted* | **Terminal parks out of the middle column** | The IDE tab shows Fresh alone: `herdr-ide` moves the Terminal into a background tab labelled `terminal` (token `ide-parked-for=<IDE tab id>`, stamped before the move and nulled on return), and Ctrl+` (`herdr-ide-term`) brings it back under Fresh or parks it again. The Terminal keeps running; the old collapse-to-a-strip path is gone. Scripts: `bin/lib.sh` (`parked_terminal`, `park_terminal`, `unpark_terminal`), `bin/herdr-ide-term`, `bin/herdr-ide`, `bin/fresh-restart`. |
+| *uncommitted* | **Go to symbol popup** | `--symbol-popup-open` (action `symbol-popup`, `ctrl+alt+q`) opens the popup pane `--symbol-popup` (80%×70%), `src/symbol_search.rs` indexes definitions with a per-language regex table over the Quick Open walk (gitignore-aware, `.git` skipped, files ≤1 MiB, 5000-symbol cap) and `src/symbol_popup.rs` fuzzy-filters it in memory and opens the pick at its line through `file_popup::open_file_in_workspace`. Deliberately NOT an LSP client: Fresh already runs the language servers and a second rust-analyzer per project is not worth it, so the result is a name index, not `workspace/symbol`. |
+| *uncommitted* | **First tab wears the branch** | herdr's generated first tab is renamed to the checked-out branch instead of a fixed `main`: `Git::branch_label_at` reads the git dir's `HEAD` (worktree `.git` FILE resolved, no git process; detached HEAD → short hash), and `src/tab_title.rs` re-checks it on the existing 5 s heartbeat, elected once per session, so a checkout / branch rename / `git switch` in a terminal lands in the tab bar within one beat. It only replaces its own labels (generated number, `main`, the branch it applied before); a tab a human named is never touched. Creation (`ensure::label_first_tab`) labels immediately from the new tab's pane cwd; non-repositories keep `main`. |
+| *uncommitted* | **Nothing staged → the button pulls** | With an empty index, Sync Changes (`S`/⇅) was the only way to pull and ✓ Commit could only answer "no staged changes", so a behind branch stayed unpulled unless you found the secondary row. `sync_is_primary` now requires only an empty index — unstaged edits do not change what a commit would contain — so the button becomes `⟳ Sync Changes N↓` (pull then push), the Sync row below it hides, and the footer's `⟳` count turns accent-colored while behind > 0 (both the sidebar and the Explorer footer). `git status` only knows the LAST fetched upstream tip, so a focused Source Control pane now also runs a quiet `Git::fetch` (`fetch --quiet`, `GIT_TERMINAL_PROMPT=0`, null stdin) on a worker every 60 s (`FETCH_EVERY`) for the repos that track an upstream; `poll_fetch` makes the next tick re-read status. A failed fetch is silent and is not retried until the next window. |
+| *uncommitted* | **Hover a row to see its path** | A file/change row is only as wide as the pane, so a truncated name (or one of several `mod.rs`) had no way to be identified. Hovering now draws a one-line tooltip beside the cursor with the path — Explorer relative to the tree root, SCM repo-relative (repository-prefixed when several repos are shown) — flipped above the cursor on the pane's last row and slid left at the right edge; a long path keeps its tail. Only file rows answer: SCM headers, message/commit widgets and drawers do not. |
+| *uncommitted* | **A rule separates Find from Replace** | The two inputs sat directly on top of each other and read as one block; a full blank line then looked as tall as a whole field, and a half-block `▀` bar looked like a rendering glitch (all user-reported). The spacer row now draws a dim solid `─` rule at the width of the inputs, so there is a visible separator without blank space; the Replace row, status, divider and list keep their one-row offset, and the rule row is not a click target. |
+| *uncommitted* | **AI commit without OpenCommit** | `ctrl+shift+a` and the ✧ button now call an OpenAI-compatible chat-completions API directly (`src/ai_client.rs`, through `curl` with the key on stdin, never in argv). The provider is entered in the sidebar itself: `s` → **AI commit…** opens a page with API URL, API key (shown masked), Model and Test connection (`src/ai_settings.rs`, in both views' Settings), saved to `<state dir>/ai.json` with mode 0600. The curated diff is unchanged; lock files and images are left out, and a lockfile-only change sends the `--stat` summary. The installer no longer installs `oco`/Node for this, and `verify.sh` no longer checks `~/.opencommit`. |
+| *uncommitted* | **The IDE comes back after a herdr restart** | `bin/ide-heal` (hook on `workspace.focused`, `tab.focused`, `pane.focused`) restarts a restored space's Fresh editor (`heal_fresh_pane`) and Agent (`heal_agent_pane`: `claude`/`pi` with `--continue`, `codex resume --last`). `fresh_daemon` and `ide_role=agent` tokens separate a dead pane from one never set up. `session_memory.ts` records the open files and `fresh-session-restore` reopens them, since Fresh saves its workspace only on a clean quit. |
+
+**AI commit** (`ctrl+shift+a`): the action does not commit. It writes a per-tab
+request (`src/ai_commit.rs`, under the sidebar's private runtime dir) for the focused
+pane's repo and activates that tab's Source Control view — **without moving your focus**: the pane
+that had it gets it back right after the activation (unless you switched panes in the meantime), so
+the AI commit runs while you keep typing in the editor or the agent pane. The Source Control sidebar
+then stages everything (`stage_under`, nested-repo safe), asks the configured AI for a message
+and puts it in the Message box, then commits through the same path as the ✓ Commit
+button about 0.9 s later. Nothing staged → toast "Nothing to commit".
+
+The message comes straight from an **OpenAI-compatible chat-completions API** (`src/ai_client.rs`);
+there is no OpenCommit/Node dependency any more. Set it in any sidebar: `s` → **AI commit…** →
+API URL (a base URL such as `https://api.deepseek.com/v1`, or the full `…/chat/completions`
+endpoint; empty means OpenAI), API key, Model, and **Test connection**. They are stored in
+`<state dir>/ai.json`, owner-only (0600), never in `state.json`. A **Thinking** row (between Model and
+Test connection, default **off**) sets the reasoning level sent to the model: off, low, medium or high.
+The request goes through `curl`
+with the key fed on stdin (`-K -`), so it never shows in `ps`; a reply wrapped as
+`{"data":{"choices":…}}` (Cline-style gateways) and `<think>` blocks from reasoning models are
+handled. Timeout 120 s. Not configured, or the API fails → a toast says why, the changes stay
+staged and the message box is left alone. The ✧ button uses the same API when it is configured
+(and the local `claude` CLI otherwise).
+
+Big or generated files are shortened for the AI only: the first 40 lines of a new file, or the
+first hunks of a changed one, and generated/vendored paths (`*.min.js`, `*.map`, `dist/`, …) or
+anything over about 12 KB; lock files are left out. The commit still contains every change.
+When a file was shortened the flash says how many ("N large file(s)
+summarised for the AI").
+
+While it runs, the ✓ Commit button shows a braille spinner with "AI generating…" (then "Committing…")
+and a sweeping highlight band. Clicking ✓ Commit during that just says "AI commit in progress…".
+
+Sidebar defaults seeded by the installer (`dotfiles/herdr-sidebar/settings.json`):
+VS Code colours, git footer, auto-open, follow the neighbour pane's folder,
+preview in a pane (a git-change diff opens beside the sidebar inside the IDE tab, so the Agent column stays visible; Esc/q closes it), editor on click, editor inline.
+An inline editor launch is fire-and-forget (`fresh-open` runs with null stdio), so the sidebar
+reports the editor's own failure in its footer: a command that exits non-zero within 30 s of the
+click shows `custom editor failed: <program> exited with <status>` in Explorer and Source Control.
+Without that, a broken editor command — say `fresh-open` unable to find or start Fresh — looked
+exactly like a successful open.
+`Terminal height` is deliberately NOT seeded: unset ("auto") keeps the IDE layer's own
+precedence (remembered project ratio, else 70%). `Agent width` is not seeded either (else the
+historical 0.6, i.e. a 40% Agent column).
+
+Every open goes to Fresh once an editor is configured — pictures and videos included (the old
+"media always opens in the terminal preview" rule is gone; it made the same file open in different
+places depending on the gesture). The preview still DRAWS media whenever something sends it there:
+no editor configured, the diff viewer, `Open Diff Preview`, or the preview pane opened directly.
+Pictures: png, jpg/jpeg, gif, webp, bmp, ico, tif/tiff. Videos (avi, flv, m4v, mkv, mov, mp4, mpeg,
+mpg, webm, wmv) show their first frame and need `ffmpeg`. For the full-resolution file, use `m` →
+"Open with Default App" (runs `xdg-open`; on WSL, `dotfiles/bin/wsl-open <file>` hands it to Windows).
+A changed picture in Source Control opens in Fresh too (no media special case). The explicit "Open in Editor"
+menu item still sends a picture to Fresh.
+
+### Search / replace popups
+
+- Entry points: `--search-popup-open` (action `search-popup`, `ctrl+alt+f`) and `--replace-popup-open`
+  (action `replace-popup`, `ctrl+alt+e`). Both open the pane `--search-popup` (placement `popup`, 90%×85%,
+  `src/search_popup.rs`). The popup opens with the Replace row showing (▾ folds it; Tab or Ctrl+R
+  re-opens it). `ctrl+alt+e` opens the same popup; it still sends `HERDR_SIDEBAR_SEARCH_MODE=replace`,
+  which is now ignored, so old keymaps keep working. Windows twins go through `herdr-sidebar-ensure.exe`.
+- The query runs on a worker after a 300 ms debounce; each search has a generation counter and older
+  results are dropped. The engine cannot cancel, so a superseded scan runs to completion.
+- The preview window hits ±300 lines and is highlighted with `syntax::highlight_lines`, which returns one
+  line per input line. (The old join-and-check code dropped ALL colors whenever the window ended on a blank
+  line.)
+- Enter opens the match at its line in THIS workspace's Fresh (`fresh-open` with `file:line`),
+  and the sidebar's own Search view / Quick Open now do the same (`explorer_app::open_file` →
+  `file_popup::open_file_in_workspace`, the routing a tree click uses) instead of always
+  forcing the built-in preview.
+- Replace safety: Alt+Enter (replace all) and Ctrl+R on a file header ask `y/N` first. A single replace
+  re-verifies that its line still matches at that byte range. Writes are atomic (temp file, rename), keep
+  permissions, CRLF and BOM, and never leave the project root (symlinks are canonicalized).
+- The sidebar's own Search view still has an inert Replace field; replacement lives only in the popup.
+- Popup panes belong to no tab, so both popups (and Ctrl+Q, since `aedfbd6`) hand the editor
+  the caller pane's `HERDR_PANE_ID` / `HERDR_TAB_ID` / `HERDR_WORKSPACE_ID`.
+- **Ctrl+A** in the query and Replace fields selects the whole value; the next character or Backspace
+  replaces it (a second Esc closes the popup only after the selection is dropped). The same works in
+  every other text input of the plugin: Quick Open, Go to symbol, the git popups, the branch-name field,
+  the Explorer's New file / New folder / Rename / Change folder dialogs, the Search view's four fields,
+  and Source Control's commit message box and Rename-pane dialog.
+
+### Language servers (LSP)
+
+Fresh starts a language server for a file only when its `lsp` entry in
+`dotfiles/config/fresh/config.json` sets `auto_start` (the entry is merged over Fresh's
+built-in command, so the command itself is not repeated there).
+`dotfiles/install-lsp.sh` installs the servers; the installer runs it by default.
+
+| Language | Server (command) | Installed by / location |
+|---|---|---|
+| Markdown | `marksman` | GitHub release binary → `~/.local/bin/marksman` |
+| Go | `gopls` | `go install` (apt `golang-go`) → `~/.local/bin/gopls` |
+| Rust | `rust-analyzer` | `rustup component add rust-analyzer rust-src` when rustup exists, else the release binary → `~/.local/bin/rust-analyzer`; apt `rust-src` gives std completions. Releases since 2026-07-27 refuse toolchains older than 1.94, so with an older distro `rustc` (apt's is 1.93) the script pins release `2026-07-20` |
+| Dart | `dart language-server --protocol=lsp` | checksum-verified SDK zip → `~/.local/share/dart-sdk`, linked as `~/.local/bin/dart`. A `dart` already on PATH (e.g. Flutter's) is left alone |
+| PHP | `phpactor language-server` | phar → `~/.local/bin/phpactor`; needs apt `php-cli php-xml php-mbstring` |
+| JavaScript / TypeScript | `typescript-language-server --stdio` | npm into `~/.local` (with `typescript`; also the Bash, YAML and JSON servers) |
+| Python | `pylsp` | apt `python3-pylsp`; installed, but no `lsp.python` entry, so it does not auto-start |
+
+- **Update**: `dotfiles/install-lsp.sh --update` reinstalls and upgrades everything it manages.
+  Without flags it installs only what is missing. `--only markdown,go` limits the languages.
+- **Add a language**: (1) add an install step and a row in the `servers` table of
+  `dotfiles/install-lsp.sh`, plus its apt packages in the decision block; (2) add
+  `"<language>": { "auto_start": true }` under `lsp` in `dotfiles/config/fresh/config.json`;
+  (3) add its command to the verify list in `docs/install-herdr-ide.sh`; (4) add a row to this table.
+- **Workspace trust**: Fresh starts language servers only in a *Trusted* workspace (status bar
+  `Trusted`, stored in `~/.local/share/fresh/workspaces/<path>/trust.json`). A *Restricted* one shows
+  `LSP (off)`; trust it with the command palette (`Ctrl+P`, "Trust This Folder" / "Workspace Trust") or the trust dialog's "Trust folder & Allow Tooling (T)".
+- **Logs**: `~/.local/state/fresh/logs/lsp/` (one log per language and Fresh process).
+- **Apply config changes**: restart the Fresh daemons with `fresh-restart --all`. Fresh reads
+  `lsp` only at start.
+
+### Fresh plugins (`dotfiles/config/fresh/plugins`)
+
+- **`git_merge_editor.ts`**: `Git: Resolve in Merge Editor` (Selection menu and command palette; no key
+  here, the key is `ctrl+alt+u` in herdr). It runs `herdr plugin pane open --plugin herdr-sidebar
+  --entrypoint merge-editor --placement popup` with `HERDR_SIDEBAR_MERGE_FILE` set to the active
+  buffer's path. A modified buffer gets a status warning: the merge editor reads the SAVED file.
+- **`git_line_history.ts`**: takes the selection's line range (a selection ending
+  at column 0 of a later line excludes that line) and runs
+  `herdr plugin pane open --plugin herdr-sidebar --entrypoint git-line-history
+  --placement popup --env HERDR_SIDEBAR_HISTORY_FILE=… --env HERDR_SIDEBAR_HISTORY_LINES=start,end`.
+  History is from the saved file, so it warns on unsaved buffers.
+- **`selection_share.ts`**: the copy / reference / send-to-agent commands. The
+  path is relative to Fresh's cwd (the project root). Send-to-agent spawns
+  `$DOTFILES_IDE_BIN/fresh-to-agent` and caps text at 200 000 chars.
+  `fresh-ide` exports `DOTFILES_IDE_BIN` (its own bin dir) and the Fresh daemon
+  inherits it, so this finds the script wherever the repo is checked out. The
+  fallback is `~/code/herdr-sidebar/dotfiles/herdr-plugins/ide/bin`.
+- **`recent_tab`** (`ctrl+tab`, `when: normal`): switches to the previously used open file tab; again goes
+  back. It never opens files.
+- **Live diff on request**: checks `$XDG_STATE_HOME/fresh-ide/live-diff-request-<FRESH_IDE_DAEMON>` when
+  a buffer is opened or becomes active. A request at most 15 s old runs `live_diff_vs_head` on the file it
+  names. `fresh-open` writes these when launched with `HERDR_SIDEBAR_OPEN_DIFF=1` (the sidebar no longer
+  does). There is deliberately no timer: the old 400 ms poll made every idle editor run plugin JS and
+  re-render about 2.5 times a second.
+- **Inline merge conflicts** (namespace `inline-conflict`): scans on buffer activate, open, revert and
+  modify, debounced 150 ms. Accepting a side is a deleteRange + insertText, then the cursor auto-jumps to
+  the next unresolved block. When a file is clean it is saved, and the next file from
+  `git diff --diff-filter=U` opens at its first conflict.
+  The action line above each block ends with `Merge editor (Ctrl+Alt+U)`, the way to the 3-way popup.
+- **`session_memory.ts`**: records the real file buffers and the active one on `after_file_open`,
+  `buffer_activated`, `after_file_save` and `buffer_closed`, and writes only when the list changes
+  (no timers). Fresh writes its own workspace file only on a clean quit, so a killed daemon restores
+  a stale list (one project's was a week old). The record is `$FRESH_IDE_SESSION_FILE`, exported by
+  `fresh-ide` as `$STATE/fresh-session/<workspace id>-<daemon>.json` (herdr only). When the daemon is
+  down and the record is non-empty, `fresh-ide` starts `bin/fresh-session-restore NAME FILE` detached:
+  it waits up to 15 s for the daemon, reopens the files with `fresh --cmd daemon open-file`, and opens
+  the active one last. Cursor positions come from Fresh's own per-file state. It never writes an empty
+  list, because a starting daemon reports no files until they are reopened. An editor started before
+  this change has no `FRESH_IDE_SESSION_FILE` and records nothing until `dotfiles-ide.restart-fresh`.
+
+## Updating
+
+```bash
+# rebuild the sidebar after changing this repo, restart its panes
+(cd plugins/herdr-sidebar && cargo build --release) && herdr plugin action invoke herdr-sidebar.redeploy
+
+# herdr config edits
+herdr server reload-config
+
+# Fresh config or plugin edits: daemons load them only at start
+dotfiles/herdr-plugins/ide/bin/fresh-restart --all   # graceful; unsaved buffers come back (hot exit), run from the repo root
+# by hand, if fresh-restart is unavailable: fresh --cmd daemon list; fresh --cmd daemon kill <name>; then fresh-ide in that pane
+
+# pull main (or rerun docs/install-herdr-ide.sh), then rebuild and re-point herdr at this checkout
+git pull
+dotfiles/herdr-sidebar/build.sh
+
+# take upstream herdr-sidebar changes (origin is the fork, mushishixian/herdr-siderbar; upstream is alexarthurs/herdr-sidebar), then rebuild the same way
+git remote add upstream https://github.com/alexarthurs/herdr-sidebar.git   # once
+git fetch upstream && git merge upstream/main
+dotfiles/herdr-sidebar/build.sh
+```
+
+`fresh-restart` with no argument restarts only this tab's Fresh (it is also the dotfiles-ide action
+`restart-fresh`).
+
+There is no patch set to maintain: the fork and the dotfiles are one repo, so an upstream update is a
+normal git merge and `build.sh` builds whatever is checked out. A machine that gets this branch gets the
+full feature set, including the file-search popup, git pull / push / AI commit, the search and replace
+popups, and conflict routing.
+## Syncing a machine with the repo
+
+Every path this workbench uses is a **symlink into this repo** (configs, the herdr keymap
+`config/herdr/config.toml` + its `scripts/` directory, the Fresh plugins, `~/.local/bin`
+helpers), so `git pull` reaches a machine the moment the installer has run once. Two
+commands keep that honest:
+
+```bash
+dotfiles/install.sh --dry-run   # the plan: links, tools, plugins, integrations — changes nothing
+dotfiles/verify.sh              # is THIS machine really what the repo describes? exit 1 if not
+```
+
+`dotfiles/packages.lock` pins the Python side (see *Install*); everything else follows the distro's
+own release, so only versions where a skew would bite belong in it.
+
+`verify.sh` is read-only and builds its checklist from the `PLAN` lines that
+`install.sh --dry-run` prints, so there is no second manifest to keep in sync: adding a
+link, tool, plugin, integration or generated file to `install.sh` is what makes it
+verified. It checks, in order: every symlink (a plain copy counts as drift — a `git
+pull` would not reach it), tools on PATH (herdr/fresh/zsh/git/jq are failures, the rest
+warnings), plugin registrations, herdr agent-state integrations, the global gitconfig
+include, the seeded sidebar `settings.json` keys, and the keymap itself — binding count,
+`herdr config check`, and that **every script the keymap runs exists in
+`dotfiles/config/herdr/scripts/`**. `docs/install-herdr-ide.sh` ends with this same gate,
+so an install cannot report success on a half-configured machine.
+
+`verify.sh --quiet` prints only problems (handy as a `git pull` post-step); `--plan` dumps
+the checklist it checks against.
+
+**Your own changes are repo changes.** A managed path is a symlink, so `vim ~/.zshrc` (or editing
+`~/.config/herdr/config.toml` in place) edits `dotfiles/…` directly — commit and push as usual, and
+every other machine picks it up with `git pull`. Nothing needs exporting.
+
+Two things break that loop, both worth knowing:
+
+- **An atomic save replaces the symlink with a copy.** `sed -i`, `cp`, some editors (anything that
+  writes a temp file and renames it) and Fresh's settings UI all do it; from then on that file is
+  the machine's own and pulls stop reaching it. `verify.sh` reports `is a copy, not a symlink`.
+  Fix: `dotfiles/adopt.sh ~/.zshrc` shows the diff between your copy and the repo file, and
+  `--apply` writes your version into the repo (git is the backup) and restores the link — then
+  commit. `adopt.sh --list` shows every managed path as `linked` / `COPY` / `missing`.
+- **Machine-only settings belong nowhere near a managed file.** `~/.zshrc.local` (sourced by the
+  managed rc), a tool's own config dir under `~/.config` (its wizard/settings UI rewrites it),
+  `~/.local/state/…`, `.env` files: not managed, never in git.
+
+## Gotchas (verified)
+
+- **An adapter/plugin package is not a tool.** `uv tool install <adapter>` fails with "No
+  executables are provided by package" — such a package is a plugin *inside* another tool's
+  environment, so it has to be a `--with` requirement of that tool:
+  `uv tool install 'client[extra]==X' --with 'adapter==Y'`. A `--with` requirement is only visible in
+  `uv tool list --show-with`, which is why `install.sh` uses
+  `uv tool list --show-extras --show-with` as its "already pinned, leave it alone" test and why
+  `verify.sh` checks requirements separately from the version. Verified live (uv 0.12.8).
+
+- **`~/.zshrc` is replaced like every other config, so machine-only bits go to `~/.zshrc.local`.**
+  A machine whose own rc predates this IDE loses its aliases and `PATH`s from `~/.zshrc` (they are in
+  `~/.dotfiles-backup/<ts>/.zshrc`) unless they move them into `~/.zshrc.local`, which the managed rc
+  sources above the highlight plugins — on purpose, since zsh-syntax-highlighting has to be last.
+  `--no-zshrc` leaves both files alone, and `verify.sh` fails if `~/.zshrc.local` exists while
+  `dotfiles/zsh/zshrc` no longer sources it.
+
+- **Never wrap a Fresh command in a plugin that calls it by its own registered
+  name.** `plugins/goto_symbol.ts` (removed) bound `alt+o` to an action whose
+  handler did `editor.runCommand("Go to LSP Symbol")` — the name that same plugin
+  had registered, so `runCommand` → handler → `runCommand`, forever. It is async,
+  so it never overflows a stack: the daemon just spins at 20 %+ CPU around the
+  clock, focused or not. Signature in `~/.local/state/fresh/logs/fresh-server-<pid>.log`:
+  thousands of `start_action: <handler> is a function, invoking...` lines per
+  second plus `no registered command named ...` for the earlier candidates in the
+  lookup list. `goto_lsp_symbol` is bindable directly; a wrapper is never needed.
+- **`fresh --cmd config show` filters plugin actions out of its output.** An entry
+  whose `action` is a plugin action (e.g. `goto_lsp_symbol`, `git_line_history`)
+  is missing from the dump even though the binding works — do not read that as
+  "the entry was dropped". Verify plugin-action bindings by pressing the key, or
+  grep the config file, not `config show`.
+- **Idle Fresh daemons are not free.** Each daemon carries its own plugins, LSP
+  servers and timers, and herdr keeps one daemon per workspace alive even after
+  its pane is replaced. Baseline is ~2-3 % CPU per daemon; two things push one
+  daemon far above it: the recursion above, and orphaned daemons nobody is
+  attached to (they keep polling git and re-rendering). Audit with
+  `ps -eo pid,pcpu,args | grep 'fresh-editor/fresh --server'` (lifetime average;
+  `%CPU` from `/proc/<pid>/stat` sampled twice gives the live number), then
+  `fresh --cmd daemon list` and `fresh --cmd daemon kill <name>` for the ones no
+  pane reports a `fresh_daemon` token for. `fresh-restart --all` only covers the
+  `ide-*` panes herdr-ide knows about, not strays. Also worth knowing: the
+  per-daemon DEBUG logs in `~/.local/state/fresh/logs/` grow ~20 MB/hour while a
+  loop like that runs.
+- **Fresh replaces symlinked `config.json`** when its settings UI saves, turning
+  the dotfiles symlink into a plain copy; later dotfiles edits then silently do
+  nothing. Check `ls -la ~/.config/fresh`, merge the copy's changes into
+  `dotfiles/config/fresh/config.json`, rerun the installer (it backs up and re-links). New Fresh plugins
+  also need their own symlink: rerun the installer. It recurs every time the settings screen saves
+  (seen again: `smooth_scroll`, `highlight_current_column` and `rainbow_indentation` lived only in the
+  copy), so edit settings in `dotfiles/config/fresh/config.json` instead.
+- **herdr's right-click pane menu cannot be extended by plugins.** Its items are
+  hard-coded (`src/client/shell/context_menu.rs`); the manifest `contexts` field
+  is accepted but unused for menus. Hence the Fresh keys + Selection menu.
+- **Fresh 0.5.3 never reports right/middle clicks to plugins**, and has no
+  right-click menu in the text area (only tabs, `+`, file explorer).
+- **Fresh's daemon mode drops the kitty keyboard protocol.** Plain `fresh`
+  requests it (`keyboard_disambiguate_escape_codes`), but `fresh -a` (server/
+  client) never does (`terminal_setup_sequences`, Fresh 0.5.3), so herdr encodes
+  keys the legacy way and Ctrl+Tab arrives as Tab. `fresh-ide` writes the
+  request (`ESC [>1u`) to the pane itself shortly after Fresh enters its
+  alternate screen (the flags are per screen, so it must come after).
+- **Fresh's daemon draws one editor to every attached client**, so two panes
+  on one daemon mirror each other; that is why each herdr workspace gets its
+  own daemon.
+- **`pane.send_text` sends raw bytes** (a newline submits an agent prompt);
+  `pane.send_input {text}` bracket-pastes when the app enabled it.
+- **Windows Terminal swallows some chords**: Ctrl+Tab (next tab), Ctrl+Shift+A (select all),
+  Ctrl+Shift+C/V (copy/paste); that is why the git keys use Ctrl+Alt.
+  Terminals send Ctrl+H as Backspace, so line history is on `ctrl+alt+o`, not `ctrl+alt+h`.
+- **Ctrl+Alt+H is Alt+Backspace** in terminals without the kitty protocol, so replace is on Ctrl+Alt+E.
+- **herdr popup panes belong to no tab**: a process started from a popup has no usable `HERDR_TAB_ID` /
+  `HERDR_WORKSPACE_ID`, so it must be handed the caller pane's ids. Ctrl+Q once failed with "no current
+  herdr tab" until it was.
+- **`npm install -g` needs `--prefix ~/.local`**: the global prefix is root-owned.
+- **Running sidebars keep the old binary** until redeployed
+  (`herdr plugin action invoke herdr-sidebar.redeploy`).
+- Agent shells set `NO_COLOR=1`; a herdr server started from one renders
+  monochrome. Start herdr from a normal shell.
+- **Fresh saves its workspace only on a clean quit.** A daemon that gets SIGTERM or SIGKILL saves
+  nothing, and `restore_previous_session` then brings back whatever list was saved last, possibly
+  weeks old. `session_memory.ts` keeps its own record (*Fresh plugins*); do not rely on Fresh's
+  restore after a crash.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| An editor looks frozen after switching to its workspace | it is still paused (`ps -o stat= -p <server pid>` shows `T`). Focus another tab and back, or run `dotfiles/herdr-plugins/ide/bin/fresh-pause` by hand; `--dry-run` shows the plan. `touch ~/.local/state/herdr/plugins/dotfiles-ide/fresh-pause-off` disables pausing |
+| Preview still splits a new pane in the IDE tab | Restart Fresh with `fresh-restart --all` (a Fresh pane started before the host loop has no host). `herdr pane list` should show `hs-preview-host` in the Fresh pane's tokens |
+| Spaces rail shows no agent name for a CLI that is clearly running | Add its command word to `AGENT_OF` at the top of `dotfiles/herdr-plugins/ide/bin/ide-agent-title` (then run the agent again — the hook fires per typed command). herdr only auto-detects the agents in `herdr integration status`; everything else is named solely by this table's `--display-agent` |
+| Spaces rail shows no state for CodeBuddy (`·` instead of `◐`/`○`) | its hooks must be installed AND codebuddy restarted (it snapshots settings at startup): `jq -r '.hooks \| keys[]' ~/.codebuddy/settings.json` should list SessionStart, UserPromptSubmit, PreToolUse, Stop, PermissionRequest, Notification and SessionEnd, each pointing at `~/.codebuddy/hooks/herdr-agent-state.sh` (rerun `dotfiles/install.sh` to restore them). `herdr pane list` shows `agent: codebuddy` once a hook has reported |
+| No toast when an agent blocks or finishes | the feature lives in the sidebar (rebuild + redeploy: `herdr plugin action invoke herdr-sidebar.redeploy`), and at least one sidebar must run in that herdr session. It is quiet BY DESIGN for the focused pane, for the first beat after a sidebar starts (existing states are only primed, not replayed), and while a state does not change. An agent herdr never detects needs its hook to report `agent`/`display_agent` — a CodeBuddy pane with no `agent` in `herdr pane list` has no name to put in the toast |
+| After a herdr restart (or a reboot) the IDE is empty shells and a file click reports `fresh-open` exiting 1 | `herdr pane list` shows the `Fresh` pane with **no** `fresh_daemon` token: herdr restored it without metadata and nothing runs in it. Press `ctrl+b i` (or click a file again) — `herdr-ide` heals that pane in place, so no rebuild and no lost layout. `fresh-restart` deliberately skips tokenless panes |
+| After reopening herdr a space's Fresh or Agent pane is a bare prompt | Nothing heals until that space is focused: click into it. `bin/ide-heal --dry-run` shows what it would do (`fresh PANE` / `agent PANE` / `stamp PANE`). An agent you quit in the same server run is not restarted, since its pane keeps `ide_role=agent`. An editor started before the session memory existed remembers no files until `dotfiles-ide.restart-fresh` |
+| a tab called `terminal` appeared | That is the parked Terminal (see *IDE layout*), not a leak. Ctrl+` from the IDE's Fresh pane brings it back under Fresh and the parking tab closes; Ctrl+` on the Terminal parks it again. After a herdr restart the parked tab can get a sidebar docked into it, because the restored tab has lost its `ide-parked-for` token: close that sidebar, or press Ctrl+` from the IDE tab, which finds the Terminal by its label |
+| A Fresh key does nothing | `fresh --cmd config show \| grep selection_` (config linked?), `ls -la ~/.config/fresh/plugins`, restart the daemon |
+| Fresh burns CPU while unfocused, a daemon sits at 15-25 % | `ps -eo pid,pcpu,args \| grep 'fresh-editor/fresh --server'`, then sample `/proc/<pid>/stat` twice for the live number. Two known causes: a plugin recursing into its own command (*Gotchas*), and a stray daemon with no pane attached — `fresh --cmd daemon list`, `fresh --cmd daemon kill <name>`. Baseline is ~2-3 % per editor daemon (plugins + LSP + timers). `tail -200 ~/.local/state/fresh/logs/fresh-server-<pid>.log` names the looping handler |
+| An LSP key does nothing | `alt+shift+q` / `alt+shift+w` / `alt+o` need a trusted workspace and a running server (status bar `LSP (on)`; `F12` works too). If `alt+w` opened lazygit, herdr still owns it — `herdr server reload-config`, then compare `dotfiles/config/herdr/config.toml` |
+| `ctrl+shift+a` does nothing | Windows Terminal's Select-all binding; `herdr plugin action invoke herdr-sidebar.git-commit-ai` to test without the key |
+| "AI commit is not set up" toast | `s` in a sidebar → **AI commit…**: enter API URL, key and model, then **Test connection** |
+| Agent pane title stays "Agent" | the pane's shell must be zsh with the hook sourced (`. …/shell/agent-title.zsh`, or rebuild with `ctrl+b i`); check the title with `herdr pane list \| jq '.result.panes[] \| select(.label=="Agent") \| .title'` |
+| Spaces rail shows a space's agent idle while it is working | `herdr integration status`: the agent needs its hook (`herdr integration install pi`). An agent STARTED BEFORE the install must be **restarted** — `/reload` is not enough (verified: the hook only arms itself on `session_start`, which a reload does not re-emit) |
+| "No Agent pane in this tab" | the tab has no pane labelled `Agent`; run `ctrl+b i` |
+| Sidebar lacks a new feature | `herdr plugin list --json` → `plugin_root` must be this checkout; rebuild + redeploy |
+| Actions missing in `herdr plugin action list` | manifest error: `herdr plugin log list --plugin herdr-sidebar` |
+| Conflict colors/keys missing | the file must contain `<<<<<<<` markers; `ls -la ~/.config/fresh/config.json` must be a symlink; `fresh --cmd config show \| grep conflict_`; restart Fresh with `fresh-restart` |
+| `ctrl+alt+f` / `ctrl+alt+e` does nothing | `herdr plugin action list \| grep -E 'search-popup\|replace-popup'`; `herdr server reload-config` |
+| `ctrl+alt+q` lists nothing or misses a symbol | the index is heuristic: only extensions in `symbol_search.rs`'s `LANGUAGES` table are scanned, files over 1 MiB, hidden and gitignored paths are skipped, and the list caps at 5000 symbols (the footer says `index capped`). A language that is missing there, or a symbol defined by a macro, needs the LSP instead: `alt+shift+q` |
+| `ctrl+alt+q` does nothing at all | two live-verified causes, in order: (1) a popup from an earlier attempt is still running — herdr reuses one popup per entrypoint, so the key silently starts nothing (`pkill -f -- "--symbol[-]popup"`, note the bracket or the pattern kills the shell typing it); (2) herdr is not reading the config you edited — `ls -la ~/.config/herdr/config.toml` must point at the file containing the binding (`herdr server reload-config` reports `applied` either way), and `herdr config check` should say `ok` |
+| `ctrl+alt+u` does nothing | a merge-editor popup from an earlier attempt is still running: herdr reuses one popup per entrypoint, so the key silently starts nothing (`pkill -f -- "--merge[-]popup"`; the bracket keeps the pattern from matching the shell that runs it). Otherwise `herdr plugin action list \| grep merge-editor` must list it, and `herdr server reload-config` then `herdr config check` should say `ok`. Outside a repository with conflicts the popup just says so. |
+| A picture opens as garbage in Fresh | pictures open in the sidebar preview since the media-routing change; rebuild and redeploy the sidebar (`dotfiles/herdr-sidebar/build.sh`) if an old build is still running. The explicit "Open in Editor" menu item still sends it to Fresh |
+| A file opens in another workspace's Fresh | fixed: `fresh-open` only uses this workspace's editor; check the Fresh pane's `fresh_daemon` token with `herdr pane list` |
+| AI commit is slow | the whole curated diff goes in ONE request; a slow model/gateway is the usual cause — pick a faster model in ⚙ Settings → AI commit |
+| `ctrl+shift+a` message never appears in the box | the tab needs a sidebar (its Source Control view takes the request); the request expires after 30 s; ⚙ Settings → AI commit must be filled in |
+| A `*.log` tab opens when I open a file | That language's server is missing and `lsp` auto-starts it: `dotfiles/install-lsp.sh --only <language>` (markdown, go, rust, dart, php, js, python), then `fresh-restart --all` |
+| Status bar says `Restricted` / `LSP (off)` | the workspace is not trusted: Fresh never starts servers there. `Ctrl+P` → "Trust This Folder" |
+| `LSP (rust)`: "outdated toolchain version" | the downloaded rust-analyzer is newer than your `rustc` supports: `dotfiles/install-lsp.sh --update --only rust` picks the release that matches |
+| No completions in Rust std | `rust-src` is missing: `apt-cache policy rust-src`, then `dotfiles/install-lsp.sh --update` (or `rustup component add rust-src`) |
+| `ctrl+b alt+g` (lazygit) does nothing | `command -v lazygit`. Ubuntu 25.10+: `sudo apt install lazygit`. Older Ubuntu (24.04) has no lazygit package: install a release binary from github.com/jesseduffield/lazygit/releases into `~/.local/bin` |
+| Ctrl+click / Send to Agent / sidebar click still run scripts from `~/code/dotfiles` | rerun `docs/install-herdr-ide.sh` (it re-points the links, the `dotfiles-ide` registration and `editor-command.txt`), then `dotfiles/herdr-plugins/ide/bin/fresh-restart --all` so the daemons pick up `DOTFILES_IDE_BIN` |
+
+More internals (herdr behaviour, heartbeat liveness, preview tabs, release
+flow) are in the repo's `AGENTS.md`.
