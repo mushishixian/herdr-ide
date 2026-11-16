@@ -191,8 +191,11 @@ export default class GitQuickAction extends View {
       .when(Boolean(this.detail && !this.error), (el) =>
         el.child(div().text_size(11.5).text_color(t.muted).child(this.detail)),
       )
-      .when(Boolean(this.committedMsg), (el) =>
-        el.child(
+      .when(Boolean(this.committedMsg), (el) => {
+        // The popup is a fixed-size overlay: size the box to the message, then scroll inside it.
+        const lines = this.committedMsg.split("\n").length;
+        const boxH = Math.min(210, Math.max(40, lines * 18 + 6));
+        return el.child(
           v_flex()
             .p(10)
             .gap(4)
@@ -201,9 +204,20 @@ export default class GitQuickAction extends View {
             .border_1()
             .border_color(t.ansi2)
             .child(div().text_size(10.5).font_semibold().text_color(t.ansi2).child("COMMIT MESSAGE"))
-            .child(div().text_size(12.5).text_color(t.foreground).child(this.committedMsg)),
-        ),
-      )
+            .child(
+              div()
+                .relative()
+                .h(boxH)
+                .child(
+                  div()
+                    .absolute()
+                    .inset_0()
+                    .overflow_y_scroll()
+                    .child(div().text_size(12.5).text_color(t.foreground).child(this.committedMsg)),
+                ),
+            ),
+        );
+      })
       .when(Boolean(this.error), (el) =>
         el.child(div().text_size(12).text_color(t.blocked).child(this.error)),
       )

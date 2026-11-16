@@ -1366,7 +1366,20 @@ export default class IdeSidebar extends View {
                     .min_w(0)
                     .gap(2)
                     .child(div().text_size(11).font_semibold().text_color(t.ansi2).child(this.busy ? "AI Commit…" : "AI Commit ✓"))
-                    .child(div().text_size(11.5).text_color(t.foreground).child(this.aiNotice)),
+                    .child((() => {
+                      const lines = String(this.aiNotice ?? "").split("\n").length;
+                      const h = Math.min(150, Math.max(30, lines * 16 + 6));
+                      return div()
+                        .relative()
+                        .h(h)
+                        .child(
+                          div()
+                            .absolute()
+                            .inset_0()
+                            .overflow_y_scroll()
+                            .child(div().text_size(11.5).text_color(t.foreground).child(this.aiNotice)),
+                        );
+                    })()),
                 )
                 .child(
                   div()
