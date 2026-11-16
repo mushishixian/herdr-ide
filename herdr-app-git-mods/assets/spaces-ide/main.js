@@ -155,6 +155,7 @@ export default class Spaces extends View {
     this.termAgent = {}; // terminal -> { status, rawStatus, tail, doneAt }
     this.spaceAgent = {}; // spaceId -> "working" | "blocked" | "done" | "idle" | null
     this.probingAgents = false;
+    this.lastDirtySeq = shared("ide.git.dirtySeq") ?? 0; // commits/pushes elsewhere move the counts
     this.spinIdx = 0;
     this.lastRenderSig = "";
     // Spaces made while this runs wait (at most a moment) for their git, so a
@@ -240,6 +241,16 @@ export default class Spaces extends View {
     const ps = panes();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
     const due = this.due(now, sp, ps);
+    // A commit, push or pull from the sidebar bumps this: re-read now instead of
+    // waiting for the workspace watch or the 60s fallback.
+    const dirtySeq = shared("ide.git.dirtySeq") ?? 0;
+    if (dirtySeq !== this.lastDirtySeq) {
+      this.lastDirtySeq = dirtySeq;
+      for (const s of sp) {
+        const k = where(s, ps);
+        if (JSON.parse(k)[1]) due.add(k);
+      }
+    }
     if (due.size) this.refreshGit(due, cx);
     const anyWorking = sp.some((s) => (s.status || this.spaceAgent[s.id]) === "working");
     if (anyWorking) this.spinIdx = (this.spinIdx + 1) % FRAMES.length;
