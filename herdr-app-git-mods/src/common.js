@@ -634,6 +634,18 @@ function summarizeDiffStatFallback(statOut) {
   return files.length ? `chore: update ${files.join(", ")}` : "chore: update repository files";
 }
 
+function cleanAiCommitText(rawText) {
+  const lines = (rawText || "")
+    .replace(/^```[\w]*\n?/gm, "")
+    .replace(/```$/gm, "")
+    .split("\n")
+    .map((l) => l.replace(/\r$/, "").trimEnd());
+  while (lines.length && !lines[0].trim()) lines.shift();
+  if (!lines.length) return "";
+  lines[0] = lines[0].trim().replace(/^["'`]+|["'`]+$/g, "");
+  return lines.slice(0, 6).join("\n").trim();
+}
+
 async function generateAiCommitMessage(stat, patch, root, on) {
   try {
     const raw = await readTextFile(`${appHome()}/ai-commit.json`);
@@ -647,7 +659,7 @@ async function generateAiCommitMessage(stat, patch, root, on) {
           messages: [
             {
               role: "system",
-              content: "Write ONE concise Conventional Commit subject line (max 72 chars, imperative mood, no quotes or markdown) summarizing the git diff.",
+              content: "Write a Conventional Commit message: 1 clear subject line (<=72 chars), optionally followed by a blank line and 1-3 short bullet points summarizing key changes. Plain text only, no markdown fences or quotes.",
             },
             { role: "user", content: `Stat:\n${stat}\n\nDiff:\n${patch}` },
           ],
@@ -660,7 +672,8 @@ async function generateAiCommitMessage(stat, patch, root, on) {
         ], { timeout: 15000 });
         if (resp.code === 0 && resp.stdout) {
           const text = JSON.parse(resp.stdout)?.choices?.[0]?.message?.content?.trim();
-          if (text) return text.split("\n")[0].replace(/^["'`]+|["'`]+$/g, "");
+          const cleaned = cleanAiCommitText(text);
+          if (cleaned) return cleaned;
         }
       }
     }
@@ -669,18 +682,33 @@ async function generateAiCommitMessage(stat, patch, root, on) {
   try {
     const claude = await exec(
       "claude",
-      ["-p", `Write ONE concise Conventional Commit message line (max 72 chars, no markdown) for:\n${stat}\n\n${patch.slice(0, 3500)}`],
+      ["-p", `Write a Conventional Commit message (1 subject line + optional 1-3 short bullet lines, plain text, no markdown):\n${stat}\n\n${patch.slice(0, 3500)}`],
       { cwd: root, on, timeout: 15000 },
     );
     if (claude.code === 0 && claude.stdout.trim()) {
-      return claude.stdout.trim().split("\n")[0].replace(/^["'`]+|["'`]+$/g, "");
+      const cleaned = cleanAiCommitText(claude.stdout);
+      if (cleaned) return cleaned;
     }
   } catch {}
 
   return summarizeDiffStatFallback(stat);
 }
 
+function summarizeGitSyncText(rawText, fallback) {
+  const lines = (rawText || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !/^To\s+https?:\/\//i.test(l) && !/^From\s+https?:\/\//i.test(l));
+  return lines.join(" · ") || (rawText || "").trim() || fallback;
+}
+
 async function runGitSyncWithUpstream(kind, root, on) {
+  notify({
+    title: kind === "pull" ? "Git Pull" : "Git Push",
+    body: kind === "pull" ? "正在从远程拉取代码…" : "正在推送代码到远程仓库…",
+    level: "info",
+    timeout: 2500,
+  });
   let r = await exec("git", [kind], { cwd: root, on });
   let out = (r.stdout ?? "").trim();
   let err = (r.stderr ?? "").trim();
@@ -693,11 +721,13 @@ async function runGitSyncWithUpstream(kind, root, on) {
     }
   }
   const ok = r.code === 0;
-  const detail = ok
-    ? (out || err || (kind === "pull" ? "Already up to date." : "Push complete."))
-    : (err || out || `git ${kind} failed`);
+  const rawDetail = ok ? (out || err) : (err || out);
+  const detail = summarizeGitSyncText(
+    rawDetail,
+    ok ? (kind === "pull" ? "Already up to date." : "Push complete.") : `git ${kind} failed`,
+  );
   notify({
-    title: kind === "pull" ? (ok ? "Git Pull" : "Git Pull Failed") : (ok ? "Git Push" : "Git Push Failed"),
+    title: kind === "pull" ? (ok ? "Git Pull 完成" : "Git Pull 失败") : (ok ? "Git Push 完成" : "Git Push 失败"),
     body: detail,
     level: ok ? "success" : "error",
     timeout: 4500,

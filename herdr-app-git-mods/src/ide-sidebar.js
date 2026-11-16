@@ -68,6 +68,7 @@ export default class IdeSidebar extends View {
     this.busy = false;
     this.error = null;
     this.note = null;
+    this.aiNotice = null;
     this.message = "";
     this.thinking = "off";
     this.autoTriedSpaces = new Set();
@@ -806,17 +807,22 @@ export default class IdeSidebar extends View {
     if (!this.root || this.busy) return;
     this.busy = true;
     this.note = null;
+    this.syncLabel = args.length === 1 && (args[0] === "pull" || args[0] === "push")
+      ? (args[0] === "pull" ? "Pulling…" : "Pushing…")
+      : null;
     cx.notify();
     cx.spawn(async (cx) => {
       if (args.length === 1 && (args[0] === "pull" || args[0] === "push")) {
         const res = await runGitSyncWithUpstream(args[0], this.root, this.on);
         this.busy = false;
+        this.syncLabel = null;
         if (!res.ok) this.note = res.detail;
         this.refresh(cx);
         return;
       }
       const r = await exec("git", args, { cwd: this.root, on: this.on });
       this.busy = false;
+      this.syncLabel = null;
       if (r.code !== 0) {
         this.note = (r.stderr || r.stdout || "git command failed").trim();
         if (title) notify({ title: `${title} Failed`, body: this.note, level: "error", timeout: 4500 });
@@ -874,6 +880,7 @@ export default class IdeSidebar extends View {
     if (!this.root || this.busy) return;
     this.busy = true;
     this.note = null;
+    this.aiNotice = "Generating AI commit message…";
     cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -881,7 +888,8 @@ export default class IdeSidebar extends View {
           const add = await exec("git", ["add", "-A"], { cwd: this.root, on: this.on });
           if (add.code !== 0) {
             this.note = (add.stderr || add.stdout || "git add failed").trim();
-            notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 4500 });
+            this.aiNotice = null;
+            notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 5000 });
             return;
           }
         }
@@ -889,23 +897,34 @@ export default class IdeSidebar extends View {
         const diffStat = stat.stdout.trim();
         if (!diffStat) {
           this.note = "Nothing to commit (working tree clean).";
+          this.aiNotice = null;
           notify({ title: "AI Commit", body: this.note, level: "info", timeout: 3500 });
           return;
         }
+        const summaryLine = diffStat.split("\n").pop()?.trim() || "";
         const patch = (await exec("git", [...READ, "diff", "--cached", "--no-color"], { cwd: this.root, on: this.on })).stdout.slice(0, 6000);
         const msg = await generateAiCommitMessage(diffStat, patch, this.root, this.on);
         this.message = msg;
-        this.commitInput.set_value(msg);
+        this.commitInput.set_value(msg.split("\n")[0]);
+        this.aiNotice = summaryLine ? `${msg}\n${summaryLine}` : msg;
+        cx.notify();
         const r = await exec("git", ["commit", "-m", msg], { cwd: this.root, on: this.on });
         if (r.code === 0) {
           this.message = "";
           this.commitInput.set_value("");
           bumpGitDirty();
-          notify({ title: "AI Commit", body: msg, level: "success", timeout: 4500 });
+          notify({ title: "AI Commit ✓", body: msg.split("\n")[0], level: "success", timeout: 7000 });
           this.refresh(cx);
+          const shown = this.aiNotice;
+          cx.timer.after(9000, (cx2) => {
+            if (this.aiNotice === shown) {
+              this.aiNotice = null;
+              cx2.notify();
+            }
+          });
         } else {
           this.note = (r.stderr || r.stdout || "git commit failed").trim();
-          notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 4500 });
+          notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 5000 });
         }
       } finally {
         this.busy = false;
@@ -1284,6 +1303,9 @@ export default class IdeSidebar extends View {
                 .child(`↑${this.ahead}`),
             ),
           )
+          .when(Boolean(this.syncLabel), (el) =>
+            el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(this.syncLabel)),
+          )
           .child(div().flex_1())
           .child(miniBtn("scm-tree", cfg.scmTreeView ? "Tree" : "List", "Toggle List/Tree view", (_e, cx) => { updateIdeSettings({ scmTreeView: !cfg.scmTreeView }); cx.notify(); }))
           .child(miniBtn("scm-pull", this.behind > 0 ? `↓${this.behind}` : "↓", "Pull (Ctrl+Alt+P)", (_e, cx) => this.runGit(["pull"], "Git Pull", cx)))
@@ -1384,6 +1406,41 @@ export default class IdeSidebar extends View {
                   ),
                 ),
             ).child(Scrollbar.vertical("scm-scroll").absolute().inset_0()),
+          )
+          .when(Boolean(this.aiNotice), (el) =>
+            el.child(
+              h_flex()
+                .mx(8)
+                .mb(4)
+                .px(8)
+                .py(6)
+                .gap(6)
+                .items_start()
+                .rounded(6)
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.ansi2)
+                .child(
+                  v_flex()
+                    .flex_1()
+                    .min_w(0)
+                    .gap(2)
+                    .child(div().text_size(11).font_semibold().text_color(t.ansi2).child(this.busy ? "AI Commit…" : "AI Commit ✓"))
+                    .child(div().text_size(11.5).text_color(t.foreground).child(this.aiNotice)),
+                )
+                .child(
+                  div()
+                    .id("scm-ai-close")
+                    .px(4)
+                    .py(1)
+                    .rounded(4)
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => { this.aiNotice = null; cx.notify(); })
+                    .child("×"),
+                ),
+            ),
           )
           .when(Boolean(this.note), (el) => el.child(div().px(10).py(4).text_size(11).text_color(t.ansi1).child(this.note)))
           .child(
@@ -1564,6 +1621,9 @@ export default class IdeSidebar extends View {
           .child(tabBtn("explorer", "Files"))
           .child(tabBtn("search", "Search"))
           .child(tabBtn("scm", `Git${this.staged.length + this.unstaged.length ? ` (${this.staged.length + this.unstaged.length})` : ""}`))
+          .when(Boolean(this.syncLabel), (el) =>
+            el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(this.syncLabel)),
+          )
           .child(div().flex_1())
           .child(tabBtn("settings", "⚙")),
       )

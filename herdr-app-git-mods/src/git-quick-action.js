@@ -12,6 +12,7 @@ export default class GitQuickAction extends View {
     this.detail = "";
     this.error = null;
     this.draft = "";
+    this.committedMsg = null;
     this.needEdit = false;
     this.handle = cx.focus_handle();
     this.input = InputState.new({ placeholder: "Commit message…" });
@@ -110,6 +111,10 @@ export default class GitQuickAction extends View {
           cx.notify();
           return;
         }
+        const summary = diff.out.split("\n").pop()?.trim() || "";
+        this.detail = summary;
+        this.status = "Generating AI commit message…";
+        cx.notify();
         const patch = await this.git(["diff", "--cached", "--no-color"], this.root, on);
         const msg = await generateAiCommitMessage(diff.out, patch.out.slice(0, 6000), this.root, on);
         this.draft = msg;
@@ -121,17 +126,22 @@ export default class GitQuickAction extends View {
 
   async commitWithMessage(msg, cx) {
     if (!msg || !this.root) return;
-    this.status = `Committing: ${msg}`;
+    this.status = "Committing changes…";
+    this.draft = msg;
     this.needEdit = false;
     cx.notify();
     const r = await this.git(["commit", "-m", msg], this.root, this.on);
     if (r.ok) {
       bumpGitDirty();
-      notify({ title: "AI Commit", body: msg, level: "success", timeout: 4500 });
+      this.status = "Committed ✓";
+      this.committedMsg = msg;
+      notify({ title: "AI Commit ✓", body: msg.split("\n")[0], level: "success", timeout: 7000 });
+      cx.notify();
+      await cx.sleep(2400);
       this.close();
     } else {
       this.error = r.err || r.out || "git commit failed";
-      notify({ title: "Git Commit Failed", body: this.error, level: "error", timeout: 4500 });
+      notify({ title: "Git Commit Failed", body: this.error, level: "error", timeout: 5000 });
       this.needEdit = true;
       cx.notify();
     }
@@ -146,29 +156,53 @@ export default class GitQuickAction extends View {
       .p(16)
       .gap(10)
       .bg(t.popover)
-      .text_size(13)
+      .text_size(12.5)
       .on_key_down((e) => {
-        if (e.key === "escape") this.close();
+        if (e.key === "escape" || (e.key === "enter" && this.committedMsg)) this.close();
       })
       .child(
         h_flex()
           .items_center()
           .gap(8)
-          .child(svg("mods/workspace-chrome/branch.svg").size(15).text_color(t.accent))
-          .child(div().flex_1().font_semibold().text_color(t.foreground).child(this.error ? "Git Action Error" : this.status))
+          .child(svg("mods/workspace-chrome/branch.svg").size(15).text_color(this.committedMsg ? t.ansi2 : t.accent))
+          .child(
+            div()
+              .flex_1()
+              .text_size(13)
+              .font_semibold()
+              .text_color(this.committedMsg ? t.ansi2 : t.foreground)
+              .child(this.error ? "Git Action Error" : this.status),
+          )
           .child(
             div()
               .id("gqa-esc")
-              .px(6)
+              .px(7)
               .py(2)
               .rounded(4)
+              .bg(t.raised)
               .text_size(11)
-              .text_color(t.dim)
+              .text_color(t.muted)
               .cursor_pointer()
               .hover((s) => s.bg(t.hover).text_color(t.foreground))
               .on_click(() => this.close())
-              .child("Esc"),
+              .child(this.committedMsg ? "Done (Esc)" : "Esc"),
           ),
+      )
+      .when(Boolean(this.detail && !this.error), (el) =>
+        el.child(div().text_size(11.5).text_color(t.muted).child(this.detail)),
+      )
+      .when(Boolean(this.committedMsg), (el) =>
+        el.child(
+          v_flex()
+            .p(10)
+            .gap(4)
+            .rounded(7)
+            .bg(t.background)
+            .border_1()
+            .border_color(t.ansi2)
+            .child(div().text_size(10.5).font_semibold().text_color(t.ansi2).child("COMMIT MESSAGE"))
+            .child(div().text_size(12.5).text_color(t.foreground).child(this.committedMsg)),
+        ),
       )
       .when(Boolean(this.error), (el) =>
         el.child(div().text_size(12).text_color(t.blocked).child(this.error)),

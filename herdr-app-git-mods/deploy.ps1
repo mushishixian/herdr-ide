@@ -89,16 +89,16 @@ foreach ($m in $branchModes) {
 # 2. Git Quick Actions (Pull / Push / Undo Commit / AI Commit)
 $qaRaw = Bundle-WithCommon "src\git-quick-action.js"
 $actions = @(
-  @{ name = "git-pull";      action = "pull";      title = "Git Pull";    height = 120 },
-  @{ name = "git-push";      action = "push";      title = "Git Push";    height = 120 },
-  @{ name = "git-undo";      action = "undo";      title = "Undo Commit"; height = 120 },
-  @{ name = "git-ai-commit"; action = "ai-commit"; title = "AI Commit";   height = 180 }
+  @{ name = "git-pull";      action = "pull";      title = "Git Pull";    width = 480; height = 140 },
+  @{ name = "git-push";      action = "push";      title = "Git Push";    width = 480; height = 140 },
+  @{ name = "git-undo";      action = "undo";      title = "Undo Commit"; width = 480; height = 140 },
+  @{ name = "git-ai-commit"; action = "ai-commit"; title = "AI Commit";   width = 560; height = 260 }
 )
 foreach ($a in $actions) {
   $code = Inline-ForcedMode $qaRaw "{ action: `"$($a.action)`" }"
   Deploy-Mod $a.name @{
     place = "none"; title = $a.title
-    overlay = @{ kind = "popup"; at = "top"; offset = 40; width = 460; height = $a.height }
+    overlay = @{ kind = "popup"; at = "top"; offset = 40; width = $a.width; height = $a.height }
   } $code
 }
 
@@ -143,6 +143,9 @@ Deploy-Mod "ide-menu" @{
   place = "none"; title = "Menu"
 } $menuCode
 
-# 8. Top bar for terminals-git layout
+# 8. Top bar for terminals-git layout & larger Toast notifications
 $tbCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\terminals-bar-git.js"), $utf8NoBom)
 Deploy-Mod "terminals-bar-git" $null $tbCode
+
+$toastCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\ide-toast.js"), $utf8NoBom)
+Deploy-Mod "ide-toast" @{ place = "none" } $toastCode

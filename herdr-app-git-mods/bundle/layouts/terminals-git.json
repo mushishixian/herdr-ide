@@ -8,6 +8,7 @@
   "titlebar": "none",
   "traffic_lights": [16, 18],
   "theme": "graphite",
+  "toast": "ide-toast",
   "background": "#131619",
   "padding": [6, 6],
   "gap": 8,
