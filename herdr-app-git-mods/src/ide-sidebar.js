@@ -13,6 +13,27 @@ function locationKey() {
   return JSON.stringify({ cwd: l.cwd, on: l.on, space: l.space?.id });
 }
 
+const NODE_LS = 'const fs=require("fs");const o={};for(const p of process.argv.slice(1)){try{o[p]=fs.readdirSync(p,{withFileTypes:true}).filter(d=>d.name!==".git").slice(0,500).map(d=>[d.name,d.isDirectory()?1:0])}catch(e){o[p]=null}}process.stdout.write(JSON.stringify(o))';
+
+// One node spawn lists every folder at once: PowerShell takes ~1s to start, node ~150ms,
+// and a refresh would otherwise spawn one shell per expanded folder.
+async function listMany(paths, on) {
+  if (!on && win()?.platform === "windows") {
+    const r = await exec("node", ["-e", NODE_LS, ...paths], { on }).catch(() => null);
+    if (r && r.code === 0) {
+      try {
+        const map = JSON.parse(r.stdout || "{}");
+        return paths.map((path) => {
+          const items = map[path];
+          if (!Array.isArray(items)) throw new Error("Cannot list folder");
+          return items.map(([name, dir]) => ({ name, dir: dir === 1 }));
+        });
+      } catch {}
+    }
+  }
+  return Promise.all(paths.map((path) => listDirectory(path, on)));
+}
+
 async function listDirectory(path, on) {
   if (!on && win()?.platform === "windows") {
     const r = await exec(
@@ -322,12 +343,8 @@ export default class IdeSidebar extends View {
           const base = this.root || cwd;
           const cfgNow = getIdeSettings();
           const folderList = ["", ...this.folders];
-          const results = await Promise.all(
-            folderList.map(async (folder) => ({
-              folder,
-              items: await listDirectory(folder ? `${base}/${folder}` : base, on),
-            })),
-          );
+          const listed = await listMany(folderList.map((folder) => (folder ? `${base}/${folder}` : base)), on);
+          const results = folderList.map((folder, i) => ({ folder, items: listed[i] }));
           if (this.context !== targetContext) return;
           for (const { folder, items } of results) {
             this.entries.set(
@@ -409,7 +426,7 @@ export default class IdeSidebar extends View {
     this.pendingFolders.add(folder);
     cx.spawn(async (cx) => {
       try {
-        const items = await listDirectory(folder ? `${base}/${folder}` : base, on);
+        const [items] = await listMany([folder ? `${base}/${folder}` : base], on);
         if (this.context !== targetContext) return;
         const cfgNow = getIdeSettings();
         this.entries.set(
