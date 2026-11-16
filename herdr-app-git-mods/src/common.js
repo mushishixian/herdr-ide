@@ -619,6 +619,92 @@ function toBase64Utf8(str) {
   return out;
 }
 
+function bumpGitDirty() {
+  setShared("ide.git.dirtySeq", (shared("ide.git.dirtySeq") ?? 0) + 1);
+}
+
+function summarizeDiffStatFallback(statOut) {
+  const files = (statOut || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.includes("|"))
+    .map((l) => l.split("|")[0].trim().split("/").pop())
+    .slice(0, 4);
+  return files.length ? `chore: update ${files.join(", ")}` : "chore: update repository files";
+}
+
+async function generateAiCommitMessage(stat, patch, root, on) {
+  try {
+    const raw = await readTextFile(`${appHome()}/ai-commit.json`);
+    if (raw) {
+      const cfg = JSON.parse(raw);
+      if (cfg.api_key) {
+        const base = (cfg.api_url || "https://api.openai.com/v1").replace(/\/+$/, "");
+        const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
+        const payload = JSON.stringify({
+          model: cfg.model || "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: "Write ONE concise Conventional Commit subject line (max 72 chars, imperative mood, no quotes or markdown) summarizing the git diff.",
+            },
+            { role: "user", content: `Stat:\n${stat}\n\nDiff:\n${patch}` },
+          ],
+        });
+        const resp = await exec("curl", [
+          "-sS", "-X", "POST", url,
+          "-H", "Content-Type: application/json",
+          "-H", `Authorization: Bearer ${cfg.api_key}`,
+          "-d", payload,
+        ], { timeout: 15000 });
+        if (resp.code === 0 && resp.stdout) {
+          const text = JSON.parse(resp.stdout)?.choices?.[0]?.message?.content?.trim();
+          if (text) return text.split("\n")[0].replace(/^["'`]+|["'`]+$/g, "");
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    const claude = await exec(
+      "claude",
+      ["-p", `Write ONE concise Conventional Commit message line (max 72 chars, no markdown) for:\n${stat}\n\n${patch.slice(0, 3500)}`],
+      { cwd: root, on, timeout: 15000 },
+    );
+    if (claude.code === 0 && claude.stdout.trim()) {
+      return claude.stdout.trim().split("\n")[0].replace(/^["'`]+|["'`]+$/g, "");
+    }
+  } catch {}
+
+  return summarizeDiffStatFallback(stat);
+}
+
+async function runGitSyncWithUpstream(kind, root, on) {
+  let r = await exec("git", [kind], { cwd: root, on });
+  let out = (r.stdout ?? "").trim();
+  let err = (r.stderr ?? "").trim();
+  if (r.code !== 0 && kind === "push" && (err.includes("no upstream") || err.includes("set-upstream"))) {
+    const br = await exec("git", ["symbolic-ref", "--short", "HEAD"], { cwd: root, on });
+    if (br.code === 0 && br.stdout.trim()) {
+      r = await exec("git", ["push", "-u", "origin", br.stdout.trim()], { cwd: root, on });
+      out = (r.stdout ?? "").trim();
+      err = (r.stderr ?? "").trim();
+    }
+  }
+  const ok = r.code === 0;
+  const detail = ok
+    ? (out || err || (kind === "pull" ? "Already up to date." : "Push complete."))
+    : (err || out || `git ${kind} failed`);
+  notify({
+    title: kind === "pull" ? (ok ? "Git Pull" : "Git Pull Failed") : (ok ? "Git Push" : "Git Push Failed"),
+    body: detail,
+    level: ok ? "success" : "error",
+    timeout: 4500,
+  });
+  if (ok) bumpGitDirty();
+  return { ok, detail };
+}
+
 async function saveText(absPath, content, prevRaw, on) {
   if (!on) {
     await writeTextFile(absPath, content, prevRaw);

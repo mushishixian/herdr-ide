@@ -800,12 +800,20 @@ export default class IdeSidebar extends View {
     this.note = null;
     cx.notify();
     cx.spawn(async (cx) => {
+      if (args.length === 1 && (args[0] === "pull" || args[0] === "push")) {
+        const res = await runGitSyncWithUpstream(args[0], this.root, this.on);
+        this.busy = false;
+        if (!res.ok) this.note = res.detail;
+        this.refresh(cx);
+        return;
+      }
       const r = await exec("git", args, { cwd: this.root, on: this.on });
       this.busy = false;
       if (r.code !== 0) {
         this.note = (r.stderr || r.stdout || "git command failed").trim();
+        if (title) notify({ title: `${title} Failed`, body: this.note, level: "error", timeout: 4500 });
       } else if (title) {
-        notify({ title, body: r.stdout.trim() || "Done", level: "success" });
+        notify({ title, body: r.stdout.trim() || r.stderr.trim() || "Done", level: "success", timeout: 4500 });
       }
       this.refresh(cx);
     });
@@ -857,44 +865,40 @@ export default class IdeSidebar extends View {
   draftAi(cx) {
     if (!this.root || this.busy) return;
     this.busy = true;
+    this.note = null;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const stat = await exec("git", [...READ, "diff", "--cached", "--stat"], { cwd: this.root, on: this.on });
-        const useStaged = Boolean(stat.stdout.trim());
-        const diffStat = useStaged ? stat.stdout : (await exec("git", [...READ, "diff", "--stat"], { cwd: this.root, on: this.on })).stdout;
-        const patch = (await exec("git", [...READ, "diff", ...(useStaged ? ["--cached"] : []), "--no-color"], { cwd: this.root, on: this.on })).stdout.slice(0, 5000);
-        let msg = "";
-        try {
-          const raw = await readTextFile(`${appHome()}/ai-commit.json`);
-          if (raw) {
-            const cfg = JSON.parse(raw);
-            if (cfg.api_key) {
-              const base = (cfg.api_url || "https://api.openai.com/v1").replace(/\/+$/, "");
-              const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
-              const payload = JSON.stringify({
-                model: cfg.model || "gpt-4o-mini",
-                messages: [
-                  { role: "system", content: "Write ONE concise Conventional Commit line (max 72 chars, no quotes)." },
-                  { role: "user", content: `${diffStat}\n\n${patch}` },
-                ],
-              });
-              const resp = await exec("curl", [
-                "-sS", "-X", "POST", url,
-                "-H", "Content-Type: application/json",
-                "-H", `Authorization: Bearer ${cfg.api_key}`,
-                "-d", payload,
-              ], { timeout: 15000 });
-              if (resp.code === 0 && resp.stdout) msg = JSON.parse(resp.stdout)?.choices?.[0]?.message?.content?.trim()?.split("\n")[0] ?? "";
-            }
+        if (this.staged.length === 0) {
+          const add = await exec("git", ["add", "-A"], { cwd: this.root, on: this.on });
+          if (add.code !== 0) {
+            this.note = (add.stderr || add.stdout || "git add failed").trim();
+            notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 4500 });
+            return;
           }
-        } catch {}
-        if (!msg) {
-          const files = diffStat.split("\n").filter((l) => l.includes("|")).map((l) => l.split("|")[0].trim().split("/").pop()).slice(0, 4);
-          msg = files.length ? `chore: update ${files.join(", ")}` : "chore: update changes";
         }
-        this.message = msg.replace(/^["'`]+|["'`]+$/g, "");
-        this.commitInput.set_value(this.message);
+        const stat = await exec("git", [...READ, "diff", "--cached", "--stat"], { cwd: this.root, on: this.on });
+        const diffStat = stat.stdout.trim();
+        if (!diffStat) {
+          this.note = "Nothing to commit (working tree clean).";
+          notify({ title: "AI Commit", body: this.note, level: "info", timeout: 3500 });
+          return;
+        }
+        const patch = (await exec("git", [...READ, "diff", "--cached", "--no-color"], { cwd: this.root, on: this.on })).stdout.slice(0, 6000);
+        const msg = await generateAiCommitMessage(diffStat, patch, this.root, this.on);
+        this.message = msg;
+        this.commitInput.set_value(msg);
+        const r = await exec("git", ["commit", "-m", msg], { cwd: this.root, on: this.on });
+        if (r.code === 0) {
+          this.message = "";
+          this.commitInput.set_value("");
+          bumpGitDirty();
+          notify({ title: "AI Commit", body: msg, level: "success", timeout: 4500 });
+          this.refresh(cx);
+        } else {
+          this.note = (r.stderr || r.stdout || "git commit failed").trim();
+          notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 4500 });
+        }
       } finally {
         this.busy = false;
         cx.notify();
@@ -1358,7 +1362,7 @@ export default class IdeSidebar extends View {
           .child(
             h_flex().flex_none().p(8).gap(6).border_t(1).border_color(t.border)
               .child(div().flex_1().h(30).px(8).rounded(7).border_1().border_color(t.border).child(Input.new(this.commitInput).h_full().text_size(12)))
-              .child(miniBtn("scm-ai", "✧", "AI Draft Message", (_e, cx) => this.draftAi(cx)))
+              .child(miniBtn("scm-ai", "✧", "AI Commit (Generate & Commit)", (_e, cx) => this.draftAi(cx)))
               .child(
                 div().id("scm-commit-btn").h(30).px(10).flex().items_center().rounded(7).bg(this.message.trim() ? t.accent : t.raised).text_color(this.message.trim() ? "#ffffff" : t.dim).text_size(12).cursor_pointer()
                   .on_click((_e, cx) => this.commit(cx))

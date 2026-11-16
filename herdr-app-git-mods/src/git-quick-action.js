@@ -5,16 +5,6 @@ import {
   notify, checking, readTextFile, appHome,
 } from "herdr";
 
-function summarizeDiffStat(statOut) {
-  const lines = statOut.split("\n").map((l) => l.trim()).filter(Boolean);
-  const files = lines
-    .filter((l) => l.includes("|"))
-    .map((l) => l.split("|")[0].trim().split("/").pop())
-    .slice(0, 4);
-  if (!files.length) return "chore: update repository files";
-  return `chore: update ${files.join(", ")}`;
-}
-
 export default class GitQuickAction extends View {
   init(p, cx) {
     this.action = p?.action || "pull";
@@ -64,37 +54,14 @@ export default class GitQuickAction extends View {
       this.root = top.out;
       this.on = on;
 
-      if (this.action === "pull") {
-        this.status = "Pulling from remote…";
+      if (this.action === "pull" || this.action === "push") {
+        this.status = this.action === "pull" ? "Pulling from remote…" : "Pushing to remote…";
         cx.notify();
-        const r = await this.git(["pull"], this.root, on);
-        if (r.ok) {
-          notify({ title: "Git Pull", body: r.out || "Already up to date.", level: "success" });
+        const res = await runGitSyncWithUpstream(this.action, this.root, on);
+        if (res.ok) {
           this.close();
         } else {
-          this.error = r.err || r.out || "git pull failed";
-          notify({ title: "Git Pull Failed", body: this.error, level: "error" });
-          cx.notify();
-        }
-        return;
-      }
-
-      if (this.action === "push") {
-        this.status = "Pushing to remote…";
-        cx.notify();
-        let r = await this.git(["push"], this.root, on);
-        if (!r.ok && (r.err.includes("no upstream") || r.err.includes("set-upstream"))) {
-          const br = await this.git(["symbolic-ref", "--short", "HEAD"], this.root, on);
-          if (br.ok) {
-            r = await this.git(["push", "-u", "origin", br.out], this.root, on);
-          }
-        }
-        if (r.ok) {
-          notify({ title: "Git Push", body: r.err || r.out || "Push complete.", level: "success" });
-          this.close();
-        } else {
-          this.error = r.err || r.out || "git push failed";
-          notify({ title: "Git Push Failed", body: this.error, level: "error" });
+          this.error = res.detail;
           cx.notify();
         }
         return;
@@ -107,112 +74,67 @@ export default class GitQuickAction extends View {
         const subj = await this.git(["log", "-1", "--pretty=%s"], this.root, on);
         const r = await this.git(["reset", "--soft", "HEAD~1"], this.root, on);
         if (r.ok) {
+          bumpGitDirty();
           notify({
             title: "Undo Last Commit",
             body: `Reset ${head.out} (${subj.out}). Changes kept staged.\nRecover: git reset --soft ${head.out}`,
             level: "info",
+            timeout: 4500,
           });
           this.close();
         } else {
           this.error = r.err || r.out || "git reset --soft HEAD~1 failed";
+          notify({ title: "Undo Failed", body: this.error, level: "error", timeout: 4500 });
           cx.notify();
         }
         return;
       }
 
       if (this.action === "ai-commit") {
-        this.status = "Staging & drafting AI commit message…";
+        this.status = "Staging & generating AI commit…";
         cx.notify();
-        const add = await this.git(["add", "-A"], this.root, on);
-        if (!add.ok) {
-          this.error = add.err || "git add -A failed";
-          cx.notify();
-          return;
+        const stagedCheck = await this.git(["diff", "--cached", "--name-only"], this.root, on);
+        if (!stagedCheck.out) {
+          const add = await this.git(["add", "-A"], this.root, on);
+          if (!add.ok) {
+            this.error = add.err || "git add -A failed";
+            notify({ title: "AI Commit Failed", body: this.error, level: "error", timeout: 4500 });
+            cx.notify();
+            return;
+          }
         }
         const diff = await this.git(["diff", "--cached", "--stat"], this.root, on);
         if (!diff.out) {
           this.error = "Nothing to commit (working tree clean).";
+          notify({ title: "AI Commit", body: this.error, level: "info", timeout: 3500 });
           cx.notify();
           return;
         }
         const patch = await this.git(["diff", "--cached", "--no-color"], this.root, on);
-        const msg = await this.generateAiMessage(diff.out, patch.out.slice(0, 6000));
+        const msg = await generateAiCommitMessage(diff.out, patch.out.slice(0, 6000), this.root, on);
         this.draft = msg;
         this.input.set_value(msg);
-        this.needEdit = true;
-        this.status = "Review AI commit message (Enter to commit):";
-        this.input.focus();
-        cx.notify();
+        await this.commitWithMessage(msg, cx);
       }
     });
   }
 
-  async generateAiMessage(stat, patch) {
-    // 1. Try OpenAI-compatible config in ~/.config/herdr-app/ai-commit.json
-    try {
-      const raw = await readTextFile(`${appHome()}/ai-commit.json`);
-      if (raw) {
-        const cfg = JSON.parse(raw);
-        if (cfg.api_key) {
-          const base = (cfg.api_url || "https://api.openai.com/v1").replace(/\/+$/, "");
-          const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
-          const payload = JSON.stringify({
-            model: cfg.model || "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content: "Write a concise Conventional Commit subject line (max 72 chars, imperative mood, no quotes or markdown) summarizing the git diff.",
-              },
-              { role: "user", content: `Stat:\n${stat}\n\nDiff:\n${patch}` },
-            ],
-          });
-          const resp = await exec("curl", [
-            "-sS", "-X", "POST", url,
-            "-H", "Content-Type: application/json",
-            "-H", `Authorization: Bearer ${cfg.api_key}`,
-            "-d", payload,
-          ], { timeout: 15000 });
-          if (resp.code === 0 && resp.stdout) {
-            const data = JSON.parse(resp.stdout);
-            const text = data?.choices?.[0]?.message?.content?.trim();
-            if (text) return text.split("\n")[0].replace(/^["'`]+|["'`]+$/g, "");
-          }
-        }
-      }
-    } catch {}
-
-    // 2. Fallback to claude CLI if installed on target machine
-    try {
-      const claude = await exec(
-        "claude",
-        ["-p", `Write ONE concise Conventional Commit message line (max 72 chars, no markdown) for:\n${stat}\n\n${patch.slice(0, 3500)}`],
-        { cwd: this.root, on: this.on, timeout: 15000 },
-      );
-      if (claude.code === 0 && claude.stdout.trim()) {
-        return claude.stdout.trim().split("\n")[0].replace(/^["'`]+|["'`]+$/g, "");
-      }
-    } catch {}
-
-    // 3. Deterministic fallback from changed filenames
-    return summarizeDiffStat(stat);
-  }
-
-  commitWithMessage(msg, cx) {
+  async commitWithMessage(msg, cx) {
     if (!msg || !this.root) return;
-    this.status = "Committing…";
+    this.status = `Committing: ${msg}`;
     this.needEdit = false;
     cx.notify();
-    cx.spawn(async (cx) => {
-      const r = await this.git(["commit", "-m", msg], this.root, this.on);
-      if (r.ok) {
-        notify({ title: "Git Commit", body: msg, level: "success" });
-        this.close();
-      } else {
-        this.error = r.err || r.out || "git commit failed";
-        this.needEdit = true;
-        cx.notify();
-      }
-    });
+    const r = await this.git(["commit", "-m", msg], this.root, this.on);
+    if (r.ok) {
+      bumpGitDirty();
+      notify({ title: "AI Commit", body: msg, level: "success", timeout: 4500 });
+      this.close();
+    } else {
+      this.error = r.err || r.out || "git commit failed";
+      notify({ title: "Git Commit Failed", body: this.error, level: "error", timeout: 4500 });
+      this.needEdit = true;
+      cx.notify();
+    }
   }
 
   render() {

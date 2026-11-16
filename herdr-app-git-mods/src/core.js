@@ -416,13 +416,12 @@ export default class GitBranch extends View {
     this.error = null;
     cx.notify();
     cx.spawn(async (cx) => {
-      const res = await this.git([kind]);
+      const res = await runGitSyncWithUpstream(kind, this.root, this.on);
       this.busy = false;
       if (res.ok) {
-        notify({ title: `Git ${kind === "pull" ? "Pull" : "Push"}`, body: res.stdout || "Up to date", level: "success" });
         this.loadRepo(cx);
       } else {
-        this.error = res.stderr || res.stdout || `git ${kind} failed`;
+        this.error = res.detail;
         cx.notify();
       }
     });

@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, agents, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -25,7 +25,7 @@ function place(s, ps) {
   const tabs = new Set((s.tabs ?? []).map((c) => c.id));
   return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }
-const rowHeight = ({ tree }) => (tree ? 28 : 30);
+const rowHeight = ({ tree }) => (tree ? 36 : 38);
 const RAIL_CELL = 32;
 // A space's name and its git tail never shrink below this, so a short one ("api")
 // stays readable instead of turning into an ellipsis next to a long branch.
@@ -63,6 +63,35 @@ export function tone(t, status) {
 }
 
 const FRAMES = ["◐", "◓", "◑", "◒"];
+
+function detectAgentLabel(tabPanes, spaceAgents) {
+  const live = spaceAgents[0];
+  if (live) {
+    const raw = (live.program?.name || live.program?.id || "").toLowerCase();
+    if (raw.includes("claude")) return "claude";
+    if (raw.includes("codex")) return "codex";
+    if (raw.includes("gemini")) return "gemini";
+    if (raw.includes("opencode")) return "opencode";
+    if (raw.includes("pi")) return "pi";
+    if (raw.includes("omp")) return "omp";
+    return live.program?.name || live.program?.id || "agent";
+  }
+  for (const p of tabPanes) {
+    const prog = `${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
+    const title = (p.title || "").toLowerCase();
+    if (prog.includes("fresh") || prog.includes("nvim") || title.includes("— fresh") || title.includes(" - fresh")) continue;
+    if (/cmdc|command[- ]?code/.test(prog) || /command code|^⌘\s/.test(title)) return "cmdc";
+    if (/codebuddy|\bcbc\b/.test(prog) || title.includes("codebuddy")) return "codebuddy";
+    if (prog.includes("claude") || title.includes("claude")) return "claude";
+    if (prog.includes("codex") || title.includes("codex")) return "codex";
+    if (prog.includes("gemini") || title.includes("gemini")) return "gemini";
+    if (prog.includes("opencode") || title.includes("opencode")) return "opencode";
+    if (/\bdsh\b/.test(prog)) return "dsh";
+    if (/\baider\b/.test(prog)) return "aider";
+    if (p.program && !p.program.shell) return p.program.id || p.program.name;
+  }
+  return null;
+}
 
 function isKnownCliAgent(p) {
   const prog = `${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
@@ -603,6 +632,8 @@ export default class Spaces extends View {
       .child((() => {
         const tabIds = new Set((w.tabs ?? []).map((c) => c.id));
         const tabPanes = panes().filter((p) => p.terminal && tabIds.has(p.tab));
+        const spAgents = agents().filter((a) => tabIds.has(a.tab));
+        const agentName = detectAgentLabel(tabPanes, spAgents);
         const spinWorking = !w.status && tabPanes.some((p) => /^[\u2800-\u28FF\u25D0-\u25D3◐◓◑◒⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(p.title || ""));
         const detected = w.status || this.spaceAgent[w.id] || (spinWorking ? "working" : null);
         const runningProg = !detected && tabPanes.some((p) => isKnownCliAgent(p));
@@ -617,14 +648,50 @@ export default class Spaces extends View {
           ? t.ansi2
           : detected ? (t[detected] ?? t.dim)
           : t.accent;
-        return h_flex()
-          .gap(9)
-          .items_center()
-          .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
-          .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
-          .child(div().flex_initial().min_w(SIDE_MIN).truncate().text_color(t.foreground).child(w.name))
-          .when(Boolean(stGlyph), el => el.child(div().flex_none().text_size(11).text_color(stColor).child(stGlyph)))
-          .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1());
+        const branchRaw = g ? (g.branch ?? "detached") : null;
+        const sameName = (a) => a && a.toLowerCase() === w.name.toLowerCase();
+        const branchShown = branchRaw && !sameName(branchRaw) ? branchRaw : null;
+        const repoShown = g && !tree && !sameName(g.name) ? g.name : null;
+        const gitWhere = [repoShown, branchShown].filter(Boolean).join(" · ") || (g ? (g.branch ?? "detached") : null);
+        return v_flex()
+          .gap(1)
+          .justify_center()
+          .child(
+            h_flex()
+              .gap(7)
+              .items_center()
+              .when(Boolean(tree), el => el.pl(18).child(svg("mods/workspace-chrome/branch.svg").size(12).flex_none().text_color(t.dim)))
+              .when(!tree, el => el.child(h_flex().size(16).flex_none().rounded(4).bg(fill).items_center().justify_center().text_size(9.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
+              .child(div().flex_1().min_w(SIDE_MIN).truncate().text_size(12.5).font_medium().text_color(t.foreground).child(w.name))
+              .when(Boolean(stGlyph || agentName), (el) =>
+                el.child(
+                  h_flex()
+                    .flex_none()
+                    .gap(3)
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(detected === "working" ? t.working + "22" : detected === "blocked" ? t.blocked + "22" : t.background)
+                    .items_center()
+                    .when(Boolean(stGlyph), (e) => e.child(div().text_size(10.5).text_color(stColor).child(stGlyph)))
+                    .when(Boolean(agentName), (e) => e.child(div().max_w(68).truncate().text_size(10.5).text_color(detected ? stColor : t.muted).child(agentName))),
+                ),
+              ),
+          )
+          .when(Boolean(g), (el) =>
+            el.child(
+              h_flex()
+                .pl(tree ? 32 : 23)
+                .gap(5)
+                .items_center()
+                .text_size(10.5)
+                .text_color(t.dim)
+                .child(svg("mods/workspace-chrome/branch.svg").size(10).flex_none().text_color(t.dim))
+                .child(div().flex_1().min_w(0).truncate().child(gitWhere || ""))
+                .when(g.ahead > 0, (e) => e.child(div().flex_none().text_color(t.ansi2).child(`↑${g.ahead}`)))
+                .when(g.behind > 0, (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${g.behind}`))),
+            ),
+          );
       })());
   }
 
