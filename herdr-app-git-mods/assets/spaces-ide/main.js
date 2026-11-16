@@ -98,9 +98,15 @@ function isKnownCliAgent(p) {
   const title = (p.title || "").toLowerCase();
   if (prog.includes("fresh") || prog.includes("nvim") || title.includes("— fresh") || title.includes(" - fresh")) return false;
   if (/cmdc|command[- ]?code|codebuddy|cbc|claude|codex|gemini|opencode|dsh|aider/.test(prog)) return true;
-  if (/command code|codebuddy|^⌘\s|^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/.test(title)) return true;
+  if (/command code|codebuddy|claude|codex|gemini|opencode|aider|^⌘\s|^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/.test(title)) return true;
   return Boolean(p.program && !p.program.shell);
 }
+
+// Spinners are not just braille: CodeBuddy/Claude spin ✶ ✹ ✳ …, so match any of them.
+const SPIN_CHARS = "\u2800-\u28FF\u25D0-\u25D3◐◓◑◒✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋";
+const SPIN_LINE = new RegExp(`^\\s*[${SPIN_CHARS}]\\s*\\S.*(?:…|\\.\\.\\.)`, "u");
+// A live status line such as "✹ Tidying… (101s · running REPL · Task running for a while)".
+const WORKING_TEXT = /\(\s*\d+s\s*·|\b\d+s\s*·\s*(?:running|working|thinking|waiting)\b|Task running for a while|\brunning (?:REPL|command|tool|tools|task|tasks)\b/i;
 
 function classifyAgentOutput(raw, prevInfo, now) {
   const lines = (raw || "").split("\n").map((l) => l.replace(/\r$/, "").trim()).filter(Boolean);
@@ -109,17 +115,18 @@ function classifyAgentOutput(raw, prevInfo, now) {
   const changed = prevInfo && prevInfo.tail !== tail;
 
   const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel/i.test(lines.slice(-8).join("\n"));
-  const atPrompt =
-    /^[❯›>]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|)[.…\s]*$/m.test(bottom) &&
-    !hasInterruptHint;
+  const hasWorkingLine = lines.slice(-8).some((l) => SPIN_LINE.test(l) || WORKING_TEXT.test(l));
+  const promptLine = /^[❯›>]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|)[.…\s]*$/;
+  const atPrompt = lines.slice(-4).some((l) => promptLine.test(l)) && !hasWorkingLine && !hasInterruptHint;
   const isBlocked =
     !atPrompt &&
     /\b(allow once|allow for this session|do you want to|approve|reject|select an option|press enter to confirm)\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/i.test(lines.slice(-10).join("\n"));
   const hasWorkingSignal =
     hasInterruptHint ||
+    hasWorkingLine ||
     (!atPrompt &&
-      (lines.slice(-4).some((l) => /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]\s*\S/.test(l)) ||
-        /^(?:Thinking|Generating|Searching|Running|Executing|Reading|Writing|Editing|Working)\b/im.test(bottom)));
+      (lines.slice(-4).some((l) => SPIN_LINE.test(l)) ||
+        /^(?:Thinking|Generating|Searching|Running|Executing|Reading|Writing|Editing|Working|Repairing|Tidying)\b/im.test(bottom)));
 
   let status = "idle";
   if (isBlocked) status = "blocked";

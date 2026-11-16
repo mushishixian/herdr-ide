@@ -153,3 +153,7 @@ Deploy-Mod "ide-toast" @{ place = "none" } $toastCode
 # 9. Git status bar (embedded by layoutside.json; mod.json keeps it from docking on its own)
 $gsCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\git-status\main.js"), $utf8NoBom)
 Deploy-Mod "git-status" @{ place = "none"; title = "Git Status" } $gsCode
+
+# 10. Spaces rail (hand-written mod: agent status probing lives here)
+$spCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "assets\spaces-ide\main.js"), $utf8NoBom)
+Deploy-Mod "spaces-ide" $null $spCode
