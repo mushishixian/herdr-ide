@@ -10,7 +10,7 @@
   "scmTreeView": false,
   "autoStashSwitch": false,
   "refreshSec": 10,
-  "autoResumeAgent": true,
-  "autoRestoreFiles": true,
-  "defaultAgent": "auto"
+  "fetchSec": 60,
+  "coolInactiveFresh": true,
+  "autoRestoreFiles": true
 }
