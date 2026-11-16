@@ -77,7 +77,7 @@
             "pane": {
               "header": {
                 "content": {
-                  "mod": "terminals-pane"
+                  "mod": "ide-pane-header"
                 },
                 "height": 38
               },

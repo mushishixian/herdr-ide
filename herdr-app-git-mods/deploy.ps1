@@ -157,3 +157,7 @@ Deploy-Mod "git-status" @{ place = "none"; title = "Git Status" } $gsCode
 # 10. Spaces rail (hand-written mod: agent status probing lives here)
 $spCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "assets\spaces-ide\main.js"), $utf8NoBom)
 Deploy-Mod "spaces-ide" $null $spCode
+
+# 11. Pane header with a per-agent icon (replaces the shipped terminals-pane)
+$phCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\ide-pane-header\main.js"), $utf8NoBom)
+Deploy-Mod "ide-pane-header" @{ place = "none"; title = "Pane Header" } $phCode

@@ -8,6 +8,7 @@
   - `src/*.js`：被 `deploy.ps1` 与 `src/common.js` 合包后部署的 mod
   - `assets/spaces-ide/main.js`：手写的 space 侧栏 mod（不合包，原样部署）
   - `mods/git-status/main.js`：被布局内嵌的状态栏 mod
+  - `mods/ide-pane-header/main.js`：替换内置 `terminals-pane` 的 pane 头部，按 agent 换图标（`layout` 的 `pane.header.content.mod` 指向它）
   - `bundle/`：从本机运行配置导出的快照（布局、键位、AI commit 配置），随 zip 分发
 - `herdr-sidebar/`：上游 herdr 的源码与文档（AGENTS.md、docs/），只作参考，不参与部署
 - `herdr-ide-portable.zip`：可搬到新电脑的便携包（仓库根，由 `export-bundle.ps1` 生成）
