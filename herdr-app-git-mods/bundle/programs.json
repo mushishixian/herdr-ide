@@ -8,6 +8,15 @@
       "color": "#ffffff",
       "match": ["command-code"],
       "run": ["cmdc"]
+    },
+    "codebuddy": {
+      "name": "CodeBuddy",
+      "icon": "icons/claude.svg",
+      "tint": true,
+      "tile": "#10b981",
+      "color": "#ffffff",
+      "match": ["codebuddy", "codebuddy-code", "cbc"],
+      "run": ["codebuddy"]
     }
   }
 }

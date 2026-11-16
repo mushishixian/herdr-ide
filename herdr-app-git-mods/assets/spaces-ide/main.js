@@ -62,6 +62,50 @@ export function tone(t, status) {
   return t[status] ?? t.unknown;
 }
 
+const FRAMES = ["◐", "◓", "◑", "◒"];
+
+function isKnownCliAgent(p) {
+  const prog = `${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
+  const title = (p.title || "").toLowerCase();
+  if (prog.includes("fresh") || prog.includes("nvim") || title.includes("— fresh") || title.includes(" - fresh")) return false;
+  if (/cmdc|command[- ]?code|codebuddy|cbc|claude|codex|gemini|opencode|dsh|aider/.test(prog)) return true;
+  if (/command code|codebuddy|^⌘\s|^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/.test(title)) return true;
+  return Boolean(p.program && !p.program.shell);
+}
+
+function classifyAgentOutput(raw, prevInfo, now) {
+  const lines = (raw || "").split("\n").map((l) => l.replace(/\r$/, "").trim()).filter(Boolean);
+  const tail = lines.slice(-14).join("\n");
+  const bottom = lines.slice(-6).join("\n");
+  const changed = prevInfo && prevInfo.tail !== tail;
+
+  const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel/i.test(lines.slice(-8).join("\n"));
+  const atPrompt =
+    /^[❯›>]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|)[.…\s]*$/m.test(bottom) &&
+    !hasInterruptHint;
+  const isBlocked =
+    !atPrompt &&
+    /\b(allow once|allow for this session|do you want to|approve|reject|select an option|press enter to confirm)\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/i.test(lines.slice(-10).join("\n"));
+  const hasWorkingSignal =
+    hasInterruptHint ||
+    (!atPrompt &&
+      (lines.slice(-4).some((l) => /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]\s*\S/.test(l)) ||
+        /^(?:Thinking|Generating|Searching|Running|Executing|Reading|Writing|Editing|Working)\b/im.test(bottom)));
+
+  let status = "idle";
+  if (isBlocked) status = "blocked";
+  else if (hasWorkingSignal || (changed && !atPrompt)) status = "working";
+  else if (prevInfo && prevInfo.rawStatus === "working" && atPrompt) status = "done";
+  else if (prevInfo && prevInfo.status === "done" && now - (prevInfo.doneAt ?? 0) < 15000) status = "done";
+
+  return {
+    status,
+    rawStatus: hasWorkingSignal || (changed && !atPrompt) ? "working" : isBlocked ? "blocked" : "idle",
+    tail,
+    doneAt: status === "done" ? (prevInfo?.doneAt || now) : 0,
+  };
+}
+
 export default class Spaces extends View {
   init(_props, cx) {
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
@@ -72,6 +116,11 @@ export default class Spaces extends View {
     this.ready = {}; // machine -> its layout was readable at the last look
     this.at = {}; // space -> its where() at the last look
     this.watching = new Map(); // local repos' pending folder watches
+    this.termAgent = {}; // terminal -> { status, rawStatus, tail, doneAt }
+    this.spaceAgent = {}; // spaceId -> "working" | "blocked" | "done" | "idle" | null
+    this.probingAgents = false;
+    this.spinIdx = 0;
+    this.lastRenderSig = "";
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
@@ -91,15 +140,79 @@ export default class Spaces extends View {
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // Refresh only when the refs could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
+    cx.timer.every(900, (cx) => this.probeCustomAgents(cx));
+  }
+
+  probeCustomAgents(cx) {
+    if (this.probingAgents) return;
+    const sp = spaces();
+    const ps = panes();
+    const targets = [];
+    const tabToSpace = new Map();
+    for (const s of sp) {
+      if (s.status) continue;
+      for (const t of s.tabs ?? []) tabToSpace.set(t.id, s);
+    }
+    for (const p of ps) {
+      if (!p.terminal || p.status) continue;
+      const s = tabToSpace.get(p.tab);
+      if (!s) continue;
+      if (isKnownCliAgent(p) || this.termAgent[p.terminal]) {
+        targets.push({ spaceId: s.id, active: s.active && p.focused, terminal: p.terminal });
+      }
+    }
+    if (!targets.length) {
+      if (Object.keys(this.spaceAgent).length) {
+        this.spaceAgent = {};
+        cx.notify();
+      }
+      return;
+    }
+    this.probingAgents = true;
+    cx.spawn(async (cx2) => {
+      try {
+        const now = Date.now();
+        const nextSpace = {};
+        const rank = { blocked: 4, working: 3, done: 2, idle: 1 };
+        await Promise.all(
+          targets.slice(0, 12).map(async (tg) => {
+            try {
+              const r = await hc(["read", tg.terminal, "--lines", "18"]);
+              if (r.code !== 0) return;
+              const prev = this.termAgent[tg.terminal];
+              const info = classifyAgentOutput(r.stdout, prev, now);
+              if (tg.active && info.status === "done") info.status = "idle";
+              this.termAgent[tg.terminal] = info;
+              const cur = nextSpace[tg.spaceId];
+              if (!cur || (rank[info.status] ?? 0) > (rank[cur] ?? 0)) {
+                nextSpace[tg.spaceId] = info.status;
+              }
+            } catch {}
+          }),
+        );
+        this.spaceAgent = nextSpace;
+        cx2.notify();
+      } finally {
+        this.probingAgents = false;
+      }
+    });
   }
 
   checkNew(cx) {
     const now = Date.now();
     const sp = spaces();
+    const ps = panes();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
-    const due = this.due(now, sp, panes());
+    const due = this.due(now, sp, ps);
     if (due.size) this.refreshGit(due, cx);
-    if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
+    const anyWorking = sp.some((s) => (s.status || this.spaceAgent[s.id]) === "working");
+    if (anyWorking) this.spinIdx = (this.spinIdx + 1) % FRAMES.length;
+    const sig = sp.map((s) => `${s.id}:${s.active}:${s.status}:${this.spaceAgent[s.id] ?? ""}`).join(";")
+      + "|" + ps.map((p) => `${p.pane}:${p.status}:${p.program?.id ?? ""}:${p.title ?? ""}`).join(";")
+      + (anyWorking ? `:${this.spinIdx}` : "");
+    const changed = sig !== this.lastRenderSig;
+    this.lastRenderSig = sig;
+    if (changed || sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
   }
 
   // Places whose git could have changed: new ones (a new space, a cd), where a
@@ -491,9 +604,19 @@ export default class Spaces extends View {
         const tabIds = new Set((w.tabs ?? []).map((c) => c.id));
         const tabPanes = panes().filter((p) => p.terminal && tabIds.has(p.tab));
         const spinWorking = !w.status && tabPanes.some((p) => /^[\u2800-\u28FF\u25D0-\u25D3◐◓◑◒⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(p.title || ""));
-        const runningProg = !w.status && tabPanes.some((p) => (p.program && !p.program.shell) || /command code|^⌘\s/i.test(p.title || ""));
-        const stGlyph = w.status === "working" || spinWorking ? "◐" : w.status === "blocked" ? "●" : w.status === "done" ? "✓" : w.status === "idle" ? "○" : runningProg ? "▸" : null;
-        const stColor = w.status ? (t[w.status] ?? t.dim) : spinWorking ? t.working : t.accent;
+        const detected = w.status || this.spaceAgent[w.id] || (spinWorking ? "working" : null);
+        const runningProg = !detected && tabPanes.some((p) => isKnownCliAgent(p));
+        const stGlyph = detected === "working"
+          ? FRAMES[this.spinIdx % FRAMES.length]
+          : detected === "blocked" ? "●"
+          : detected === "done" ? "✓"
+          : detected === "idle" ? "○"
+          : runningProg ? "▸"
+          : null;
+        const stColor = detected === "done"
+          ? t.ansi2
+          : detected ? (t[detected] ?? t.dim)
+          : t.accent;
         return h_flex()
           .gap(9)
           .items_center()

@@ -1373,24 +1373,24 @@ export default class IdeSidebar extends View {
     const { space } = getContext();
     const snap = space ? shared("ide.ws.history")?.[wsHistoryKey(space, this.root)] : null;
 
-    const section = (title) => div().pt(6).pb(2).text_size(11).font_semibold().text_color(t.accent).child(title);
+    const section = (title) => div().pt(5).pb(1).px(4).text_size(10).font_semibold().text_color(t.accent).child(title);
     const row = (id, label, valueText, onClick) =>
       h_flex()
         .id(id)
-        .px(8)
-        .py(5)
-        .rounded(6)
+        .px(6)
+        .py(3)
+        .rounded(5)
         .items_center()
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
         .on_click(onClick)
-        .child(div().flex_1().text_size(12).text_color(t.foreground).child(label))
-        .child(div().px(7).py(2).rounded(4).bg(t.raised).text_size(11).text_color(t.accent).child(valueText));
+        .child(div().flex_1().truncate().text_size(11.5).text_color(t.foreground).child(label))
+        .child(div().px(6).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.accent).child(valueText));
 
     const field = (label, state) =>
-      v_flex().gap(3)
-        .child(div().text_size(11).text_color(t.muted).child(label))
-        .child(div().h(28).px(8).rounded(6).border_1().border_color(t.border).bg(t.surface).child(Input.new(state).h_full().text_size(12).text_color(t.foreground)));
+      h_flex().px(4).gap(6).items_center()
+        .child(div().w(72).flex_none().truncate().text_size(10.5).text_color(t.muted).child(label))
+        .child(div().flex_1().h(24).px(6).rounded(5).border_1().border_color(t.border).bg(t.surface).child(Input.new(state).h_full().text_size(11).text_color(t.foreground)));
 
     const cycle = (val, arr) => arr[(arr.indexOf(val) + 1) % arr.length];
 
@@ -1401,8 +1401,8 @@ export default class IdeSidebar extends View {
           .absolute()
           .inset_0()
           .overflow_y_scroll()
-          .p(10)
-          .gap(4)
+          .p(6)
+          .gap(1)
           .child(section("WORKSPACE & AGENT MEMORY"))
           .when(Boolean(snap?.agentName), (el) =>
             el.child(row("set-res-now", `Resume ${snap.agentName}`, "Launch", (_e, cx) => resumeWorkspaceAgent(snap, cx))),
@@ -1457,22 +1457,22 @@ export default class IdeSidebar extends View {
           .child(row("set-fetch", "Remote Fetch (Sync)", cfg.fetchSec > 0 ? `${cfg.fetchSec}s` : "Off", (_e, cx) => { updateIdeSettings({ fetchSec: cycle(cfg.fetchSec, [60, 120, 300, 0]) }); cx.notify(); }))
 
           .child(section("AI COMMIT"))
-          .child(field("OpenAI-compatible Base URL", this.aiUrlInput))
+          .child(field("Base URL", this.aiUrlInput))
           .child(field("API Key", this.aiKeyInput))
           .child(field("Model", this.aiModelInput))
           .child(row("set-think", "Thinking", this.thinking, (_e, cx) => { this.thinking = cycle(this.thinking, ["off", "low", "medium", "high"]); cx.notify(); }))
           .child(
-            h_flex().pt(4).justify_end()
+            h_flex().px(4).pt(2).justify_end()
               .child(
-                div().id("ide-ai-save").px(10).py(5).rounded(6).bg(t.accent).text_color("#ffffff").text_size(11.5).font_semibold().cursor_pointer()
+                div().id("ide-ai-save").px(8).py(3).rounded(5).bg(t.accent).text_color("#ffffff").text_size(11).font_semibold().cursor_pointer()
                   .on_click((_e, cx) => this.saveAiSettings(cx))
                   .child("Save AI Settings"),
               ),
           )
 
           .child(section("CONFIG FILES"))
-          .child(row("set-cfg-keys", "Edit keys.json", "Open", (_e, cx) => openInCenterEditor({ file: "keys.json", root: appHome(), on: null, line: 1 }, cx)))
-          .child(row("set-cfg-lay", "Edit terminals-git.json", "Open", (_e, cx) => openInCenterEditor({ file: "layouts/terminals-git.json", root: appHome(), on: null, line: 1 }, cx)))
+          .child(row("set-cfg-keys", "Edit keys.json", "Open", (_e, cx) => openInCenterEditor({ file: "keys.json", root: appHome(), on: null, line: 1, direct: true }, cx)))
+          .child(row("set-cfg-lay", "Edit terminals-git.json", "Open", (_e, cx) => openInCenterEditor({ file: "layouts/terminals-git.json", root: appHome(), on: null, line: 1, direct: true }, cx)))
           .child(row("set-cfg-app", "App Settings", "Open", () => run("app.settings"))),
       )
       .child(Scrollbar.vertical("ide-settings-scroll").absolute().inset_0());
@@ -1493,7 +1493,12 @@ export default class IdeSidebar extends View {
         .when(active, (el) => el.bg(t.accent).text_color("#ffffff").font_semibold())
         .when(!active, (el) => el.text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)))
         .on_click((_e, cx) => {
-          this.view = id;
+          if (id === "settings" && this.view === "settings") {
+            this.view = this.prevView || "scm";
+          } else {
+            if (this.view !== "settings") this.prevView = this.view;
+            this.view = id;
+          }
           this.refresh(cx);
           cx.notify();
         })

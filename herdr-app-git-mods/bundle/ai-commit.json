@@ -1,6 +1,6 @@
 {
-  "api_url": "",
-  "api_key": "",
-  "model": "",
+  "api_url": "https://api.siliconflow.cn/v1",
+  "api_key": "sk-gjvgmingajvqeefphxyggtcjxqjdyefjhdpqxlhivegdartx",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash",
   "thinking": "off"
 }
