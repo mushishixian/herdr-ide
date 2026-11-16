@@ -19,6 +19,7 @@ const DEFAULT_IDE_SETTINGS = {
   refreshSec: 10,
   fetchSec: 60,
   coolInactiveFresh: true,
+  showResumeBanner: true,
   autoResumeAgent: false,
   autoRestoreFiles: false,
   defaultAgent: "auto",

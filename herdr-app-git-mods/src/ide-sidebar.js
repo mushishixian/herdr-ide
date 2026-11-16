@@ -71,6 +71,7 @@ export default class IdeSidebar extends View {
     this.message = "";
     this.thinking = "off";
     this.autoTriedSpaces = new Set();
+    this.dismissedResume = new Set();
 
     // Search state
     this.searchResults = [];
@@ -293,7 +294,14 @@ export default class IdeSidebar extends View {
   hasLiveAgent(space) {
     if (!space) return false;
     const tabIds = new Set((space.tabs ?? []).map((t) => t.id));
-    return agents().some((a) => tabIds.has(a.tab)) || terminals().some((t) => tabIds.has(t.tab) && t.program?.agent);
+    if (agents().some((a) => tabIds.has(a.tab))) return true;
+    return terminals().some((t) => {
+      if (!tabIds.has(t.tab)) return false;
+      if (t.program?.agent) return true;
+      const prog = `${t.program?.id || ""} ${t.program?.name || ""}`.toLowerCase();
+      const title = (t.title || "").toLowerCase();
+      return /cmdc|command[- ]?code|codebuddy|cbc|claude|codex|gemini|opencode|\bpi\b|omp|dsh/.test(prog) || /command code|codebuddy|^⌘\s/.test(title);
+    });
   }
 
   refresh(cx) {
@@ -934,9 +942,11 @@ export default class IdeSidebar extends View {
   }
 
   renderResumeBanner(t, cx) {
+    if (!getIdeSettings().showResumeBanner) return null;
     const { space } = getContext();
     if (!space) return null;
     const key = wsHistoryKey(space, this.root);
+    if (this.dismissedResume.has(key)) return null;
     const snap = shared("ide.ws.history")?.[key];
     if (!snap?.agentName || this.hasLiveAgent(space)) return null;
 
@@ -971,6 +981,23 @@ export default class IdeSidebar extends View {
           .cursor_pointer()
           .on_click((_e, cx) => resumeWorkspaceAgent(snap, cx))
           .child("Resume"),
+      )
+      .child(
+        div()
+          .id("ide-resume-close")
+          .px(5)
+          .py(3)
+          .rounded(4)
+          .text_size(11.5)
+          .text_color(t.dim)
+          .cursor_pointer()
+          .tooltip("Dismiss")
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => {
+            this.dismissedResume.add(key);
+            cx.notify();
+          })
+          .child("×"),
       );
   }
 
@@ -1411,6 +1438,7 @@ export default class IdeSidebar extends View {
           .when(Boolean(snap?.agentName), (el) =>
             el.child(row("set-res-now", `Resume ${snap.agentName}`, "Launch", (_e, cx) => resumeWorkspaceAgent(snap, cx))),
           )
+          .child(row("set-show-res", "Show Resume Banner", cfg.showResumeBanner ? "On" : "Off", (_e, cx) => { updateIdeSettings({ showResumeBanner: !cfg.showResumeBanner }); cx.notify(); }))
           .child(row("set-auto-res", "Auto-resume last agent", cfg.autoResumeAgent ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoResumeAgent: !cfg.autoResumeAgent }); cx.notify(); }))
           .child(row("set-auto-files", "Auto-restore open files", cfg.autoRestoreFiles ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoRestoreFiles: !cfg.autoRestoreFiles }); cx.notify(); }))
           .child(row("set-def-agent", "Default Agent", cfg.defaultAgent, (_e, cx) => { updateIdeSettings({ defaultAgent: cycle(cfg.defaultAgent, ["auto", "codex", "pi", "omp", "claude", "opencode"]) }); cx.notify(); }))

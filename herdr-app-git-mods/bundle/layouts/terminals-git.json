@@ -51,16 +51,9 @@
             {
               "id": "spaces",
               "type": "block",
-              "size": { "weight": 2 },
+              "size": { "weight": 1 },
               "min": 120,
               "content": { "mod": "spaces-ide" }
-            },
-            {
-              "id": "agents",
-              "type": "block",
-              "size": { "weight": 1 },
-              "min": 80,
-              "content": { "mod": "agents" }
             },
             {
               "id": "spaces-footer",
