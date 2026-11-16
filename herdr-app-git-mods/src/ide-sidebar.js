@@ -1,7 +1,7 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import {
-  spaces, panes, agents, terminals, focused, exec, readTextFile, writeTextFile, watchFolder,
+  spaces, panes, terminals, focused, exec, readTextFile, writeTextFile, watchFolder,
   theme, settings, openOverlay, notify, checking, appHome, window as win,
   run, shared, setShared,
 } from "herdr";
@@ -72,7 +72,6 @@ export default class IdeSidebar extends View {
     this.message = "";
     this.thinking = "off";
     this.autoTriedSpaces = new Set();
-    this.dismissedResume = new Set();
 
     // Search state
     this.searchResults = [];
@@ -292,19 +291,6 @@ export default class IdeSidebar extends View {
     });
   }
 
-  hasLiveAgent(space) {
-    if (!space) return false;
-    const tabIds = new Set((space.tabs ?? []).map((t) => t.id));
-    if (agents().some((a) => tabIds.has(a.tab))) return true;
-    return terminals().some((t) => {
-      if (!tabIds.has(t.tab)) return false;
-      if (t.program?.agent) return true;
-      const prog = `${t.program?.id || ""} ${t.program?.name || ""}`.toLowerCase();
-      const title = (t.title || "").toLowerCase();
-      return /cmdc|command[- ]?code|codebuddy|cbc|claude|codex|gemini|opencode|\bpi\b|omp|dsh/.test(prog) || /command code|codebuddy|^⌘\s/.test(title);
-    });
-  }
-
   refresh(cx) {
     const { cwd, on, space } = getContext();
     const k = locationKey();
@@ -372,9 +358,6 @@ export default class IdeSidebar extends View {
         if (switched && space && !this.autoTriedSpaces.has(space.id)) {
           this.autoTriedSpaces.add(space.id);
           if (snap?.lastView && this.view !== snap.lastView) this.view = snap.lastView;
-          if (cfg.autoResumeAgent && snap?.agentName && !this.hasLiveAgent(space)) {
-            resumeWorkspaceAgent(snap, cx);
-          }
           if (cfg.autoRestoreFiles && snap?.lastFiles?.length) {
             const first = snap.lastFiles[0];
             openInCenterEditor({ file: first.file, root: base, on, line: first.line ?? 1 }, cx);
@@ -960,66 +943,6 @@ export default class IdeSidebar extends View {
     });
   }
 
-  renderResumeBanner(t, cx) {
-    if (!getIdeSettings().showResumeBanner) return null;
-    const { space } = getContext();
-    if (!space) return null;
-    const key = wsHistoryKey(space, this.root);
-    if (this.dismissedResume.has(key)) return null;
-    const snap = shared("ide.ws.history")?.[key];
-    if (!snap?.agentName || this.hasLiveAgent(space)) return null;
-
-    return h_flex()
-      .mx(6)
-      .mt(6)
-      .px(8)
-      .py(6)
-      .gap(6)
-      .items_center()
-      .rounded(7)
-      .bg(t.raised)
-      .border_1()
-      .border_color(t.accent)
-      .child(
-        v_flex()
-          .flex_1()
-          .min_w(0)
-          .child(div().text_size(11).font_semibold().text_color(t.foreground).truncate().child(`Last: ${snap.agentName}`))
-          .when(Boolean(snap.title), (el) => el.child(div().text_size(10.5).text_color(t.dim).truncate().child(snap.title))),
-      )
-      .child(
-        div()
-          .id("ide-resume-agent")
-          .px(8)
-          .py(4)
-          .rounded(5)
-          .bg(t.accent)
-          .text_size(11)
-          .font_semibold()
-          .text_color("#ffffff")
-          .cursor_pointer()
-          .on_click((_e, cx) => resumeWorkspaceAgent(snap, cx))
-          .child("Resume"),
-      )
-      .child(
-        div()
-          .id("ide-resume-close")
-          .px(5)
-          .py(3)
-          .rounded(4)
-          .text_size(11.5)
-          .text_color(t.dim)
-          .cursor_pointer()
-          .tooltip("Dismiss")
-          .hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .on_click((_e, cx) => {
-            this.dismissedResume.add(key);
-            cx.notify();
-          })
-          .child("×"),
-      );
-  }
-
   renderExplorer(t, cx) {
     const cfg = getIdeSettings();
     const base = this.root || this.cwd;
@@ -1458,9 +1381,6 @@ export default class IdeSidebar extends View {
 
   renderSettings(t, cx) {
     const cfg = getIdeSettings();
-    const { space } = getContext();
-    const snap = space ? shared("ide.ws.history")?.[wsHistoryKey(space, this.root)] : null;
-
     const section = (title) => div().pt(5).pb(1).px(4).text_size(10).font_semibold().text_color(t.accent).child(title);
     const row = (id, label, valueText, onClick) =>
       h_flex()
@@ -1492,13 +1412,7 @@ export default class IdeSidebar extends View {
           .p(6)
           .gap(1)
           .child(section("WORKSPACE & AGENT MEMORY"))
-          .when(Boolean(snap?.agentName), (el) =>
-            el.child(row("set-res-now", `Resume ${snap.agentName}`, "Launch", (_e, cx) => resumeWorkspaceAgent(snap, cx))),
-          )
-          .child(row("set-show-res", "Show Resume Banner", cfg.showResumeBanner ? "On" : "Off", (_e, cx) => { updateIdeSettings({ showResumeBanner: !cfg.showResumeBanner }); cx.notify(); }))
-          .child(row("set-auto-res", "Auto-resume last agent", cfg.autoResumeAgent ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoResumeAgent: !cfg.autoResumeAgent }); cx.notify(); }))
           .child(row("set-auto-files", "Auto-restore open files", cfg.autoRestoreFiles ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoRestoreFiles: !cfg.autoRestoreFiles }); cx.notify(); }))
-          .child(row("set-def-agent", "Default Agent", cfg.defaultAgent, (_e, cx) => { updateIdeSettings({ defaultAgent: cycle(cfg.defaultAgent, ["auto", "codex", "pi", "omp", "claude", "opencode"]) }); cx.notify(); }))
 
           .child(section("EDITOR & LAYOUT"))
           .child(row("set-ed-eng", "Editor Engine", {
@@ -1594,8 +1508,6 @@ export default class IdeSidebar extends View {
         .child(label);
     };
 
-    const resumeBanner = this.renderResumeBanner(t, cx);
-
     return v_flex()
       .id("ide-sidebar")
       .track_focus(this.handle)
@@ -1627,7 +1539,6 @@ export default class IdeSidebar extends View {
           .child(div().flex_1())
           .child(tabBtn("settings", "⚙")),
       )
-      .when(Boolean(resumeBanner), (el) => el.child(resumeBanner))
       .when(this.view === "explorer", (el) => el.child(this.renderExplorer(t, cx)))
       .when(this.view === "search", (el) => el.child(this.renderSearch(t, cx)))
       .when(this.view === "scm", (el) => el.child(this.renderScm(t, cx)))

@@ -1,5 +1,5 @@
 import {
-  spaces, panes, agents, terminals, focused, exec, readTextFile, writeTextFile,
+  spaces, panes, terminals, focused, exec, readTextFile, writeTextFile,
   shared, setShared, run, appHome, notify, window as win,
 } from "herdr";
 
@@ -19,10 +19,7 @@ const DEFAULT_IDE_SETTINGS = {
   refreshSec: 10,
   fetchSec: 60,
   coolInactiveFresh: true,
-  showResumeBanner: true,
-  autoResumeAgent: false,
   autoRestoreFiles: false,
-  defaultAgent: "auto",
 };
 
 function classifyFileIcon(name, isDir, isOpen) {
@@ -135,35 +132,12 @@ function sq(s) {
   return String(s).replace(/'/g, "'\\''");
 }
 
-function buildResumeArgv(agentName, sessionId) {
-  const n = (agentName || "").toLowerCase();
-  if (n.includes("codex")) return sessionId ? ["codex", "resume", sessionId] : ["codex", "resume", "--last"];
-  if (n === "pi" || n.includes("pi-coding")) return sessionId ? ["pi", "--session", sessionId] : ["pi", "--continue"];
-  if (n.includes("omp") || n.includes("oh-my-pi")) return sessionId ? ["omp", `--resume=${sessionId}`] : ["omp", "--continue"];
-  if (n.includes("claude")) return sessionId ? ["claude", "--resume", sessionId] : ["claude", "--continue"];
-  if (n.includes("opencode")) return ["opencode", "-c"];
-  if (n.includes("gemini")) return ["gemini", "--resume", "latest"];
-  return agentName ? [agentName] : null;
-}
-
 function recordWorkspaceSnapshot(space, root, activeView) {
   if (!space) return null;
   const key = wsHistoryKey(space, root);
   const all = { ...(shared("ide.ws.history") ?? {}) };
   const prev = all[key] ?? {};
-  const tabIds = new Set((space.tabs ?? []).map((t) => t.id));
-  const spaceAgents = agents().filter((a) => tabIds.has(a.tab));
-  const spaceTerms = terminals().filter((t) => tabIds.has(t.tab));
-
-  let agentName = prev.agentName ?? null;
-  let title = prev.title ?? null;
-  let cwd = root || space.folder || prev.cwd || null;
-  const liveAgent = spaceAgents[0] ?? spaceTerms.find((t) => t.program?.agent);
-  if (liveAgent) {
-    agentName = liveAgent.program?.name || liveAgent.program?.id || agentName;
-    title = liveAgent.title || liveAgent.name || title;
-    cwd = liveAgent.cwd || cwd;
-  }
+  const cwd = root || space.folder || prev.cwd || null;
 
   const next = {
     ...prev,
@@ -171,8 +145,6 @@ function recordWorkspaceSnapshot(space, root, activeView) {
     spaceName: space.name,
     machine: space.machine ?? null,
     cwd,
-    agentName,
-    title,
     lastView: activeView ?? prev.lastView ?? "scm",
     updatedAt: Date.now(),
   };
@@ -190,23 +162,6 @@ function rememberOpenedFile(space, root, file, line) {
   files.unshift({ file, line: line ?? 1 });
   all[key] = { ...prev, key, cwd: root || space.folder, lastFiles: files.slice(0, 8), updatedAt: Date.now() };
   setShared("ide.ws.history", all);
-}
-
-function resumeWorkspaceAgent(entry, cx) {
-  const space = spaces().find((s) => s.active);
-  if (!space || !entry?.agentName) return;
-  const argv = buildResumeArgv(entry.agentName, entry.sessionId);
-  if (!argv) return;
-  const activeTab = space.tabs?.find((t) => t.active)?.id;
-  const tabPanes = panes().filter((p) => p.tab === activeTab);
-  const target = tabPanes.find((p) => p.focused) ?? tabPanes.find((p) => p.terminal) ?? tabPanes[0];
-  if (target) {
-    run("pane.split", { direction: "right", pane: target.pane, argv });
-    swapToCenter(getIdeSettings(), cx, activeTab);
-  } else {
-    run("tab.new", { space: space.id, folder: entry.cwd, argv });
-  }
-  notify({ title: "Resuming Agent", body: `${argv.join(" ")}${entry.title ? ` (${entry.title})` : ""}`, level: "info" });
 }
 
 function isEditorPane(p, trackedPaneId) {

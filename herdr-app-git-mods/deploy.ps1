@@ -149,3 +149,7 @@ Deploy-Mod "terminals-bar-git" $null $tbCode
 
 $toastCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\ide-toast.js"), $utf8NoBom)
 Deploy-Mod "ide-toast" @{ place = "none" } $toastCode
+
+# 9. Git status bar (embedded by layoutside.json; mod.json keeps it from docking on its own)
+$gsCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\git-status\main.js"), $utf8NoBom)
+Deploy-Mod "git-status" @{ place = "none"; title = "Git Status" } $gsCode
