@@ -1360,26 +1360,6 @@ export default class IdeSidebar extends View {
             .when(entry.dir && this.pendingFolders.has(path), (el) => el.child(div().text_size(10.5).text_color(t.dim).child("…")))
             .when(Boolean(mark), (el) =>
               el.child(div().text_size(10.5).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark)),
-            )
-            .child(
-              div()
-                .id(`ide-del-${path}`)
-                .px(4)
-                .rounded(4)
-                .text_size(11)
-                .text_color(t.dim)
-                .tooltip(`Delete ${entry.name}`)
-                .hover((s) => s.bg(t.raised).text_color(t.ansi1))
-                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                .on_click((_e, cx) => {
-                  if (cfg.confirmDelete) {
-                    this.confirmDel = path;
-                    cx.notify();
-                  } else {
-                    this.deleteItem(path, cx);
-                  }
-                })
-                .child("×"),
             ),
         );
         if (entry.dir && open) walk(path, depth + 1);
