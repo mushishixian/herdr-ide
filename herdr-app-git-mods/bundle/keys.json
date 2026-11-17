@@ -74,7 +74,8 @@
     "ctrl-alt-k": "mod.open:git-push",
     "ctrl-alt-z": "mod.open:git-undo",
     "ctrl-alt-h": "mod.open:git-history",
-    "ctrl-shift-a": "mod.open:git-ai-commit"
+    "ctrl-shift-a": "mod.open:git-ai-commit",
+    "ctrl-shift-alt-a": "mod.open:git-ai-sync"
   },
   "terminal": {
     "ctrl-backspace": "send:\u0017",

@@ -91,8 +91,9 @@ $qaRaw = Bundle-WithCommon "src\git-quick-action.js"
 $actions = @(
   @{ name = "git-pull";      action = "pull";      title = "Git Pull";    width = 480; height = 140 },
   @{ name = "git-push";      action = "push";      title = "Git Push";    width = 480; height = 140 },
-  @{ name = "git-undo";      action = "undo";      title = "Undo Commit"; width = 480; height = 140 },
-  @{ name = "git-ai-commit"; action = "ai-commit"; title = "AI Commit";   width = 560; height = 360 }
+  @{ name = "git-undo";      action = "undo";      title = "Undo Commit";     width = 480; height = 140 },
+  @{ name = "git-ai-commit"; action = "ai-commit"; title = "AI Commit";       width = 560; height = 360 },
+  @{ name = "git-ai-sync";   action = "ai-sync";   title = "AI Commit & Sync"; width = 560; height = 380 }
 )
 foreach ($a in $actions) {
   $code = Inline-ForcedMode $qaRaw "{ action: `"$($a.action)`" }"
