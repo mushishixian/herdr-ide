@@ -3,7 +3,7 @@ import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gp
 import {
   spaces, panes, terminals, focused, exec, readTextFile, writeTextFile, watchFolder,
   theme, settings, openOverlay, notify, checking, appHome, window as win,
-  run, shared, setShared,
+  run, shared, setShared, nextCommand,
 } from "herdr";
 
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
@@ -118,6 +118,20 @@ export default class IdeSidebar extends View {
 
     if (checking()) return;
     setShared("ide.sidebar.alive", true);
+    setShared("ide.recent.overlay", null);
+    setShared("ide.glh.open", null);
+    // Global keystrokes reach the sidebar (always shown) as <mod>.<command>
+    // via keys.json: ctrl-tab switches recent files, and ctrl-alt-o relays the
+    // Fresh editor's line-history request (git_line_history.ts writes it and
+    // runs `herdr-app.exe do ide-sidebar.lineHistory`).
+    cx.spawn(async (cx2) => {
+      for (;;) {
+        const cmd = await nextCommand();
+        if (cmd === "recent") this.switchRecentFile(cx2);
+        else if (cmd === "lineHistory") this.openFreshLineHistory(cx2);
+        cx2.notify();
+      }
+    });
     this.bootSettings(cx);
     this.refresh(cx);
     cx.timer.every(25, (cx2) => this.pollSharedSignals(cx2));
@@ -174,6 +188,60 @@ export default class IdeSidebar extends View {
         });
       }
     });
+  }
+
+  // Ctrl+Tab: a popup list of the active tab's recent files (ide.ws.history,
+  // written by openInCenterEditor for every engine). Another ctrl-tab while
+  // the list is up cycles the selection; Enter or a click reopens the file.
+  switchRecentFile(cx) {
+    const space = spaces().find((s) => s.active);
+    const tab = space?.tabs?.find((t) => t.active);
+    const tabPanes = panes().filter((p) => !tab || p.tab === tab.id);
+    const editorPane = tabPanes.find((p) => isEditorPane(p, shared("ide.editor.paneByTab")?.[tab?.id]));
+    const root = editorPane?.cwd || space?.folder || "";
+    const files = shared("ide.ws.history")?.[wsHistoryKey(space, root)]?.lastFiles ?? [];
+    if (!files.length) {
+      notify({ title: "Recent files", body: "Open a file first.", level: "info", timeout: 2500 });
+      return;
+    }
+    if (shared("ide.recent.overlay")) return run("ide-recent.cycle");
+    run("mod.open", { name: "ide-recent" });
+  }
+
+  // Ctrl+Alt+O from the Fresh editor: its plugin writes the selected range to
+  // <state>/fresh-ide/line-history-request.json and runs
+  // `herdr-app.exe do ide-sidebar.lineHistory`. Show the popup from that file;
+  // without a fresh request, hand a built-in editor pane its own selection.
+  async openFreshLineHistory(cx) {
+    const space = spaces().find((s) => s.active);
+    const on = space?.machine ?? null;
+    let req = null;
+    try {
+      const r = await exec("sh", ["-c", 'p="${XDG_STATE_HOME:-$HOME/.local/state}/fresh-ide/line-history-request.json"; [ -f "$p" ] && cat "$p"'], { on, timeout: 5000 });
+      const raw = r.code === 0 ? r.stdout : null;
+      const q = raw ? JSON.parse(raw) : null;
+      const age = Date.now() - (q?.ts ?? 0);
+      if (q?.file && q.start >= 1 && age >= -10000 && age < 300000) req = q;
+    } catch {}
+    if (req) {
+      const file = String(req.file);
+      const slash = file.lastIndexOf("/");
+      const name = slash >= 0 ? file.slice(slash + 1) : file;
+      // The popup reads this shared request (mod.json places it top-centre);
+      // while it is already open a new seq refreshes it in place.
+      setShared("ide.glh.request", {
+        root: slash > 0 ? file.slice(0, slash) : "/",
+        file: `./${name}`,
+        on,
+        start: req.start,
+        end: req.end ?? req.start,
+        title: name,
+        seq: (shared("ide.glh.request")?.seq ?? 0) + 1,
+      });
+      if (!shared("ide.glh.open")) run("mod.open", { name: "git-line-history" });
+      return;
+    }
+    notify({ title: "Line history", body: "Select lines in the editor first.", level: "info", timeout: 2500 });
   }
 
   pollSharedSignals(cx) {

@@ -235,6 +235,37 @@ export default class IdeEditor extends View {
     else cx.notify();
   }
 
+  openLineHistory(cx) {
+    const now = Date.now();
+    if (this._lastHistoryAt && now - this._lastHistoryAt < 800) return; // guard a double key-down
+    this._lastHistoryAt = now;
+    const tab = this.tabs.find((tb) => tb.key === this.activeKey);
+    if (!tab || !tab.file || tab.kind !== "file" || !this.code) return;
+    const range = this.code.selected_range?.();
+    const text = this.code.value();
+    if (!range) return;
+    const lineAt = (off) => text.slice(0, Math.max(0, Math.min(off, text.length))).split("\n").length;
+    let start = lineAt(range.start);
+    let end = lineAt(range.end);
+    // A selection ending at column 0 of the next line excludes that line.
+    if (range.end > range.start && range.end <= text.length && text[range.end - 1] === "\n") end -= 1;
+    if (end < start) [start, end] = [end, start];
+    if (start < 1) start = 1;
+    if (end < start) end = start;
+    // The popup reads this shared request (mod.json places it top-centre);
+    // while it is already open a new seq refreshes it in place.
+    setShared("ide.glh.request", {
+      root: tab.root,
+      file: tab.file,
+      on: tab.on ?? null,
+      start,
+      end,
+      title: tab.title || tab.file.split("/").pop(),
+      seq: (shared("ide.glh.request")?.seq ?? 0) + 1,
+    });
+    if (!shared("ide.glh.open")) run("mod.open", { name: "git-line-history" });
+  }
+
   render(cx) {
     const t = theme();
     const active = this.tabs.find((tb) => tb.key === this.activeKey);
@@ -263,6 +294,9 @@ export default class IdeEditor extends View {
       .on_key_down((e, cx) => {
         if (e.key === "s" && e.modifiers.control && !isDiff) {
           this.saveActive(cx);
+          cx.stop_propagation();
+        } else if (e.key === "o" && e.modifiers.control && e.modifiers.alt && !isDiff) {
+          this.openLineHistory(cx);
           cx.stop_propagation();
         }
       })

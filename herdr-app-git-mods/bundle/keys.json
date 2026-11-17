@@ -34,7 +34,7 @@
     "ctrl-9": "tab.select:9",
     "ctrl-pagedown": "tab.next",
     "ctrl-pageup": "tab.prev",
-    "ctrl-tab": "tab.next",
+    "ctrl-tab": "ide-sidebar.recent",
     "ctrl-shift-tab": "tab.prev",
     "alt-]": "tab.next",
     "alt-[": "tab.prev",
@@ -73,6 +73,7 @@
     "ctrl-alt-p": "mod.open:git-pull",
     "ctrl-alt-k": "mod.open:git-push",
     "ctrl-alt-z": "mod.open:git-undo",
+    "ctrl-alt-h": "mod.open:git-history",
     "ctrl-shift-a": "mod.open:git-ai-commit"
   },
   "terminal": {
@@ -84,6 +85,7 @@
     "ctrl-shift-f": "terminal.search",
     "ctrl-v": "terminal.paste_image",
     "ctrl-insert": "terminal.copy",
-    "shift-insert": "terminal.paste"
+    "shift-insert": "terminal.paste",
+    "ctrl-tab": "ide-sidebar.recent"
   }
 }

@@ -150,6 +150,28 @@ Deploy-Mod "terminals-bar-git" $null $tbCode
 $toastCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\ide-toast.js"), $utf8NoBom)
 Deploy-Mod "ide-toast" @{ place = "none" } $toastCode
 
+# Git history popups: selected-line history (opened by ide-editor Ctrl+Alt+O or
+# relayed from Fresh via ide-sidebar) and repository commit history (Ctrl+Alt+H).
+$glhRaw = Bundle-WithCommon "src\git-line-history.js"
+$glhLineCode = Inline-ForcedMode $glhRaw '{ mode: "line" }'
+Deploy-Mod "git-line-history" @{
+  place = "none"; title = "Line History"
+  overlay = @{ kind = "popup"; at = "top"; offset = 40; width = 860; height = 560 }
+} $glhLineCode
+
+$glhRepoCode = Inline-ForcedMode $glhRaw '{ mode: "repo" }'
+Deploy-Mod "git-history" @{
+  place = "none"; title = "Commit History"
+  overlay = @{ kind = "popup"; at = "top"; offset = 40; width = 860; height = 560 }
+} $glhRepoCode
+
+# Recent-files list popup (ide-sidebar opens it on ctrl-tab)
+$rcCode = Bundle-WithCommon "src\ide-recent.js"
+Deploy-Mod "ide-recent" @{
+  place = "none"; title = "Recent Files"
+  overlay = @{ kind = "popup"; at = "top"; offset = 32; width = 560; height = 420 }
+} $rcCode
+
 # 9. Git status bar (embedded by layoutside.json; mod.json keeps it from docking on its own)
 $gsCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\git-status\main.js"), $utf8NoBom)
 Deploy-Mod "git-status" @{ place = "none"; title = "Git Status" } $gsCode
