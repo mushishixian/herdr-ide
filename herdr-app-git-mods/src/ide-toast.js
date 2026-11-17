@@ -11,13 +11,25 @@ export default class IdeToast extends View {
     const login = /^([a-z0-9][a-z0-9_.-]{0,31}) needs login; run hc machine login \1$/.exec(p.body ?? "");
     const command = login ? `hc machine login ${login[1]}` : null;
     const isCommit = /commit/i.test(p.title ?? "");
+    const bodyText = p.body ?? "";
+    // A long single-line body (git pull/push detail is joined with " · ") wraps
+    // inside the narrow toast. Estimate the wrapped line count and give the body
+    // a scrollable box of that height so nothing is silently clipped.
+    const bodyUnits = [...bodyText].reduce(
+      (n, ch) => n + (/[\u2E80-\u9FFF\uFF00-\uFFEF]/.test(ch) ? 2 : 1), 0);
+    const estLines = Math.max(
+      (bodyText.match(/\n/g)?.length ?? 0) + 1,
+      Math.ceil(bodyUnits / 50),
+    );
+    const longBody = !login && Boolean(bodyText) && estLines > 2;
+    const boxH = Math.min(5, estLines) * 16;
     return h_flex()
       .id("toast")
-      .size_full()
+      .w_full()
       .px(14)
       .py(4)
       .gap(10)
-      .items_center()
+      .items_start()
       .bg(t.popover)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
@@ -44,12 +56,33 @@ export default class IdeToast extends View {
               .text_color(t.foreground)
               .child(login ? `${login[1]} needs a login: run` : (p.title ?? "")),
           )
-          .when(!login && Boolean(p.body), (el) =>
+          .when(!login && Boolean(bodyText) && !longBody, (el) =>
             el.child(
               div()
                 .text_size(11.5)
                 .text_color(isCommit ? t.foreground : t.muted)
-                .child(p.body ?? ""),
+                .child(bodyText),
+            ),
+          )
+          .when(longBody, (el) =>
+            el.child(
+              div()
+                .relative()
+                .w_full()
+                .h(boxH)
+                .child(
+                  div()
+                    .absolute()
+                    .inset_0()
+                    .overflow_y_scroll()
+                    .child(
+                      div()
+                        .whitespace_normal()
+                        .text_size(11.5)
+                        .text_color(isCommit ? t.foreground : t.muted)
+                        .child(bodyText),
+                    ),
+                ),
             ),
           )
           .when(Boolean(login), (el) =>

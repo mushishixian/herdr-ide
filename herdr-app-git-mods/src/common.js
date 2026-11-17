@@ -275,6 +275,48 @@ async function wakeFreshDaemon(daemonName, on) {
   await exec("bash", ["-c", script, "fresh-wake", daemonName], { on }).catch(() => {});
 }
 
+// One exec for the whole open: scan /proc for a Fresh TUI attached to this daemon
+// (SIGCONTing what cooling stopped), then run open-file. `fresh --cmd session
+// open-file` exits 0 even with no daemon — it then starts a detached one and the
+// file opens where no pane shows it — so with no TUI attached we exit 75 and the
+// caller rebuilds the pane instead. The scan reads cmdline with bash builtins
+// only: a fork per process costs ~250ms on a busy WSL, builtins ~60ms.
+async function runFreshOpenAttached(daemonName, target, root, on) {
+  const cache = shared("ide.freshBinByHost") ?? {};
+  const known = cache[on || "local"] ?? "";
+  const script = `
+    attached=""
+    for p in /proc/[0-9]*/cmdline; do
+      pid=\${p%/cmdline}; pid=\${pid#/proc/}
+      args=""
+      while IFS= read -r -d "" arg; do args="$args$arg "; done 2>/dev/null < "$p"
+      bin=\${args%% *}
+      case "$bin" in */fresh|fresh) ;; *) continue ;; esac
+      case "$args" in
+        *" --server --session-name $1 "*|*" --server --session-name $1")
+          read -r _ _ _ _ pgid _ 2>/dev/null < "/proc/$pid/stat"
+          if [ "$pgid" = "$pid" ]; then kill -CONT -- "-$pid" 2>/dev/null || true
+          else kill -CONT "$pid" 2>/dev/null || true; fi ;;
+        *" -a $1 "*|*" -a $1")
+          kill -CONT "$pid" 2>/dev/null || true
+          attached=a ;;
+      esac
+    done
+    [ -n "$attached" ] || exit 75
+    F="$3"; [ -x "$F" ] || F="$HOME/.local/share/fresh-editor/fresh"; [ -x "$F" ] || F="$(command -v fresh || echo fresh)"
+    printf '%s\\n' "$F"
+    exec "$F" --no-upgrade-check --cmd session open-file "$1" "$2"
+  `;
+  const r = await exec("bash", ["-c", script, "fresh-open", daemonName, target, known], { cwd: root, on, timeout: 2500 }).catch(() => null);
+  if (r?.stdout) {
+    const bin = r.stdout.split("\n")[0]?.trim();
+    if (bin && !bin.includes(" ") && bin !== known) {
+      setShared("ide.freshBinByHost", { ...cache, [on || "local"]: bin });
+    }
+  }
+  return r;
+}
+
 async function syncFreshCooling(activeDaemonName, enableCooling, on) {
   const script = `
     keep="$1"; cool="$2"
@@ -302,25 +344,6 @@ async function syncFreshCooling(activeDaemonName, enableCooling, on) {
   await exec("bash", ["-c", script, "fresh-cool", activeDaemonName || "", enableCooling ? "1" : "0"], { on }).catch(() => {});
 }
 
-async function runFreshOpenFast(daemonName, target, root, on) {
-  const hostKey = on || "local";
-  const cache = shared("ide.freshBinByHost") ?? {};
-  const args = ["--no-upgrade-check", "--cmd", "session", "open-file", daemonName, target];
-  if (cache[hostKey]) {
-    const r = await exec(cache[hostKey], args, { cwd: root, on, timeout: 2500 }).catch(() => null);
-    if (r) return r;
-  }
-  const script = 'F="$HOME/.local/share/fresh-editor/fresh"; [ -x "$F" ] || F="$(command -v fresh || echo fresh)"; printf "%s\\n" "$F"; "$F" "$@"';
-  const r = await exec("sh", ["-c", script, "fresh-open", ...args], { cwd: root, on, timeout: 2500 }).catch(() => null);
-  if (r?.stdout) {
-    const bin = r.stdout.split("\n")[0]?.trim();
-    if (bin && !bin.includes(" ")) {
-      setShared("ide.freshBinByHost", { ...cache, [hostKey]: bin });
-    }
-  }
-  return r;
-}
-
 async function execTerminalEditorJump(job, cx) {
   const cfg = getIdeSettings();
   run("pane.focus", { pane: job.pane });
@@ -342,19 +365,18 @@ async function execTerminalEditorJump(job, cx) {
     return;
   }
 
-  // Fast path: active Fresh is already awake — try direct open-file without waking /proc first.
-  let res = await runFreshOpenFast(job.daemonName, job.target, job.root, job.on);
+  // One exec checks a TUI is attached to this daemon and opens the file (exit 75:
+  // none attached — open-file would start a detached daemon no pane shows).
+  let res = await runFreshOpenAttached(job.daemonName, job.target, job.root, job.on);
   let out = `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`;
-  if (res && res.code === 0 && !out.includes("Version mismatch")) {
-    enforceTabEditorOrderAndMouse(job.activeTab, cfg);
-    return;
+  const opened = () => res && res.code === 0 && !out.includes("Version mismatch");
+  if (!opened() && res?.code !== 75) {
+    // Slow fallback: wake if SIGSTOPped and retry once before respawning.
+    await wakeFreshDaemon(job.daemonName, job.on);
+    res = await runFreshOpenAttached(job.daemonName, job.target, job.root, job.on);
+    out = `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`;
   }
-
-  // Slow fallback: wake if SIGSTOPped and retry once before respawning.
-  await wakeFreshDaemon(job.daemonName, job.on);
-  res = await runFreshOpenFast(job.daemonName, job.target, job.root, job.on);
-  out = `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`;
-  if (res && res.code === 0 && !out.includes("Version mismatch")) {
+  if (opened()) {
     enforceTabEditorOrderAndMouse(job.activeTab, cfg);
     return;
   }
