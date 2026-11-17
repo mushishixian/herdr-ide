@@ -22,14 +22,13 @@ export default class IdeToast extends View {
       Math.ceil(bodyUnits / 50),
     );
     const longBody = !login && Boolean(bodyText) && estLines > 2;
-    const boxH = Math.min(5, estLines) * 16;
     return h_flex()
       .id("toast")
-      .w_full()
+      .size_full()
       .px(14)
       .py(4)
       .gap(10)
-      .items_start()
+      .items_center()
       .bg(t.popover)
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
@@ -67,9 +66,10 @@ export default class IdeToast extends View {
           .when(longBody, (el) =>
             el.child(
               div()
+                .flex_1()
+                .min_h(0)
                 .relative()
                 .w_full()
-                .h(boxH)
                 .child(
                   div()
                     .absolute()
