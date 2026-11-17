@@ -80,6 +80,7 @@ export default class IdeSidebar extends View {
     this.lastFreshProbeAt = 0;
     this.loadSeq = 0;
     this.explorerSeq = 0;
+    this.bgJobsByRepo = new Map();
     this.seenTabPanes = new Map();
     this.lastStatusRaw = null;
 
@@ -142,6 +143,9 @@ export default class IdeSidebar extends View {
         const cmd = await nextCommand();
         if (cmd === "recent") this.switchRecentFile(cx2);
         else if (cmd === "lineHistory") this.openFreshLineHistory(cx2);
+        else if (cmd === "aiCommit") this.startBgGitJob("ai-commit", cx2);
+        else if (cmd === "aiSync") this.startBgGitJob("ai-sync", cx2);
+        else if (cmd === "sync") this.startBgGitJob("sync", cx2);
         cx2.notify();
       }
     });
@@ -202,6 +206,68 @@ export default class IdeSidebar extends View {
             this.fetching = false;
           }
         });
+      }
+    });
+  }
+
+  startBgGitJob(action, cx) {
+    const { cwd, on } = getContext();
+    if (!cwd) {
+      notify({ title: "Git", body: "No active folder or workspace.", level: "warning", timeout: 3000 });
+      return;
+    }
+    cx.spawn(async (cx2) => {
+      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
+      if (!top || top.code !== 0 || !top.stdout.trim()) {
+        notify({ title: "Git", body: "Current folder is not a git repository.", level: "warning", timeout: 3000 });
+        return;
+      }
+      const jobRoot = top.stdout.trim();
+      const jobKey = `${on ?? "local"}:${jobRoot}`;
+      if (this.bgJobsByRepo.has(jobKey)) {
+        notify({
+          title: "Git 任务进行中",
+          body: `${jobRoot.split(/[\\/]/).pop()} 正在执行 ${this.bgJobsByRepo.get(jobKey)}，请稍候…`,
+          level: "info",
+          timeout: 2500,
+        });
+        return;
+      }
+      const initialLabel = action === "ai-sync" ? "AI Sync…" : action === "ai-commit" ? "AI Commit…" : "Syncing…";
+      this.bgJobsByRepo.set(jobKey, initialLabel);
+      if (action === "ai-commit" || action === "ai-sync") {
+        notify({
+          title: action === "ai-sync" ? "AI Commit & Sync" : "AI Commit",
+          body: "已在后台开始执行（切换窗口或按 Esc 不会打断）…",
+          level: "info",
+          timeout: 2500,
+        });
+      }
+      cx2.notify();
+      try {
+        await runAiSyncPipeline({
+          action,
+          root: jobRoot,
+          on,
+          onProgress: (patch) => {
+            if (patch?.status) {
+              const shortLabel = patch.status.includes("Pull") ? "Pulling…"
+                : patch.status.includes("Push") ? "Pushing…"
+                : patch.status.includes("Generating") ? "AI…"
+                : patch.status.includes("Commit") ? "Committing…"
+                : initialLabel;
+              this.bgJobsByRepo.set(jobKey, shortLabel);
+              cx2.notify();
+            }
+          },
+        });
+      } finally {
+        this.bgJobsByRepo.delete(jobKey);
+        if ((this.root || this.cwd) === jobRoot && this.on === on) {
+          this.refresh(cx2);
+        } else {
+          cx2.notify();
+        }
       }
     });
   }
@@ -1096,12 +1162,12 @@ export default class IdeSidebar extends View {
     if (!this.root || this.busy) return;
     this.busy = true;
     this.note = null;
-    this.syncLabel = args.length === 1 && (args[0] === "pull" || args[0] === "push")
-      ? (args[0] === "pull" ? "Pulling…" : "Pushing…")
+    this.syncLabel = args.length === 1 && (args[0] === "pull" || args[0] === "push" || args[0] === "sync")
+      ? (args[0] === "sync" ? "Syncing…" : args[0] === "pull" ? "Pulling…" : "Pushing…")
       : null;
     cx.notify();
     cx.spawn(async (cx) => {
-      if (args.length === 1 && (args[0] === "pull" || args[0] === "push")) {
+      if (args.length === 1 && (args[0] === "pull" || args[0] === "push" || args[0] === "sync")) {
         const res = await runGitSyncWithUpstream(args[0], this.root, this.on);
         this.busy = false;
         this.syncLabel = null;
@@ -1249,6 +1315,14 @@ export default class IdeSidebar extends View {
     });
   }
 
+  formatPathTooltip(relPath, base, leafOverride) {
+    const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+    const relDisp = sep === "\\" ? relPath.replace(/\//g, "\\") : relPath;
+    const absDisp = base ? `${base.replace(/[\\/]+$/, "")}${sep}${relDisp}` : relDisp;
+    const leaf = leafOverride || relPath.split(/[\\/]/).pop() || relPath;
+    return absDisp === leaf ? absDisp : `${leaf} — ${absDisp}`;
+  }
+
   renderExplorer(t, cx) {
     const cfg = getIdeSettings();
     const base = this.root || this.cwd;
@@ -1267,21 +1341,22 @@ export default class IdeSidebar extends View {
         rows.push(
           h_flex()
             .id(`ide-f-${path}`)
-            .h(26)
+            .h(21)
             .flex_none()
-            .pl(8 + depth * 14)
-            .pr(6)
-            .gap(6)
+            .pl(6 + depth * 12)
+            .pr(4)
+            .gap(5)
             .items_center()
-            .rounded(6)
+            .rounded(4)
             .cursor_pointer()
+            .tooltip(this.formatPathTooltip(path, base, entry.name))
             .when(isActive, (el) => el.bg(t.selected).text_color(t.foreground).font_semibold())
             .when(!isActive, (el) => el.hover((s) => s.bg(t.hover)))
             .on_click((_e, cx) => (entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx)))
             .on_mouse_down("right", () => this.openExplorerMenu(entry, path))
-            .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(11).text_color(t.dim) : div().w(11))
+            .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(10).text_color(t.dim) : div().w(10))
             .child(renderFileIcon(div, svg, entry.name, entry.dir, open, cfg.iconTheme, t))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).child(entry.name))
+            .child(div().flex_1().min_w(0).truncate().text_size(12).child(entry.name))
             .when(entry.dir && this.pendingFolders.has(path), (el) => el.child(div().text_size(10.5).text_color(t.dim).child("…")))
             .when(Boolean(mark), (el) =>
               el.child(div().text_size(10.5).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark)),
@@ -1293,6 +1368,7 @@ export default class IdeSidebar extends View {
                 .rounded(4)
                 .text_size(11)
                 .text_color(t.dim)
+                .tooltip(`Delete ${entry.name}`)
                 .hover((s) => s.bg(t.raised).text_color(t.ansi1))
                 .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                 .on_click((_e, cx) => {
@@ -1327,9 +1403,9 @@ export default class IdeSidebar extends View {
       .min_h(0)
       .child(
         h_flex()
-          .h(34)
-          .px(10)
-          .gap(4)
+          .h(28)
+          .px(8)
+          .gap(3)
           .items_center()
           .border_b(1)
           .border_color(t.border)
@@ -1367,7 +1443,7 @@ export default class IdeSidebar extends View {
       .child(
         div().flex_1().min_h(0).relative()
           .child(
-            v_flex().id("ide-exp-tree").track_scroll(this.treeScroll).absolute().inset_0().overflow_y_scroll().p(4)
+            v_flex().id("ide-exp-tree").track_scroll(this.treeScroll).absolute().inset_0().overflow_y_scroll().p(2)
               .children(rows)
               .when(rows.length === 0, (el) => el.child(div().p(10).text_size(12).text_color(t.dim).child(this.error || (this.loadingExplorer ? "Loading files…" : "No files")))),
           )
@@ -1409,21 +1485,25 @@ export default class IdeSidebar extends View {
       )
       .child(
         div().flex_1().min_h(0).relative().child(
-          v_flex().id("ide-sr-list").absolute().inset_0().overflow_y_scroll().gap(2)
+          v_flex().id("ide-sr-list").absolute().inset_0().overflow_y_scroll().gap(1)
             .when(this.searchBusy, (el) => el.child(div().p(8).text_color(t.dim).child("Searching…")))
             .when(!this.searchBusy && this.searchQueried && this.searchResults.length === 0, (el) => el.child(div().p(8).text_color(t.dim).child("No matches found")))
             .children(
-              this.searchResults.map((m, i) =>
-                v_flex()
+              this.searchResults.map((m, i) => {
+                const base = this.root || this.cwd;
+                const leaf = `${m.path.split(/[\\/]/).pop() || m.path}:${m.line}`;
+                return v_flex()
                   .id(`ide-sr-${i}`)
-                  .p(6)
-                  .rounded(6)
+                  .px(5)
+                  .py(3)
+                  .rounded(4)
                   .cursor_pointer()
+                  .tooltip(this.formatPathTooltip(m.path, base, leaf))
                   .hover((s) => s.bg(t.hover))
                   .on_click((_e, cx) => this.openFile(m.path, m.line, cx))
                   .child(div().text_size(11).text_color(t.accent).truncate().child(`${m.path}:${m.line}`))
-                  .child(div().text_size(11.5).text_color(t.foreground).truncate().child(m.text)),
-              ),
+                  .child(div().text_size(11.5).text_color(t.foreground).truncate().child(m.text));
+              }),
             ),
         ).child(Scrollbar.vertical("ide-sr-list").absolute().inset_0()),
       );
@@ -1431,6 +1511,7 @@ export default class IdeSidebar extends View {
 
   renderScm(t, cx) {
     const cfg = getIdeSettings();
+    const base = this.root || this.cwd;
     const miniBtn = (id, label, tip, onClick) =>
       div().id(id).px(6).py(2).rounded(4).text_size(11).text_color(t.muted).cursor_pointer().tooltip(tip).hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
 
@@ -1438,16 +1519,19 @@ export default class IdeSidebar extends View {
       const staged = kind === "staged";
       const conflict = kind === "conflict";
       const actBtn = (suffix, txt, tip, fn) =>
-        div().id(`scm-${kind}-${suffix}-${idx}`).px(5).py(1).rounded(4).text_size(11).text_color(t.dim).tooltip(tip).hover((s) => s.bg(t.raised).text_color(t.foreground)).on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(fn).child(txt);
+        div().id(`scm-${kind}-${suffix}-${idx}`).px(4).py(0.5).rounded(4).text_size(11).text_color(t.dim).tooltip(tip).hover((s) => s.bg(t.raised).text_color(t.foreground)).on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(fn).child(txt);
 
+      const fileName = f.path.split(/[\\/]/).pop() || f.path;
       return h_flex()
         .id(`scm-row-${kind}-${idx}`)
-        .h(26)
-        .px(6)
-        .gap(5)
+        .h(21)
+        .pl(labelOverride ? 12 : 5)
+        .pr(5)
+        .gap(4)
         .items_center()
-        .rounded(5)
+        .rounded(4)
         .cursor_pointer()
+        .tooltip(this.formatPathTooltip(f.path, base))
         .hover((s) => s.bg(t.hover))
         .on_mouse_down("right", () => this.openScmMenu(f, kind))
         .on_click((_e, cx) => {
@@ -1457,8 +1541,9 @@ export default class IdeSidebar extends View {
             this.showDiff(f.path, staged, f.status === "?", cx);
           }
         })
-        .child(div().w(12).text_size(11).font_semibold().text_color(conflict || f.status === "D" ? t.ansi1 : f.status === "A" || f.status === "?" ? t.ansi2 : t.blocked).child(f.status))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).child(labelOverride ?? f.path))
+        .child(div().w(11).flex_none().text_size(10.5).font_semibold().text_color(conflict || f.status === "D" ? t.ansi1 : f.status === "A" || f.status === "?" ? t.ansi2 : t.blocked).child(f.status))
+        .child(renderFileIcon(div, svg, fileName, false, false, cfg.iconTheme, t))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).child(labelOverride ?? fileName))
         .when(conflict, (el) => el.child(actBtn("res", "Resolve", "Open 3-way merge editor", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90, props: { file: f.path } }))))
         .when(staged, (el) =>
           el
@@ -1485,20 +1570,31 @@ export default class IdeSidebar extends View {
       }
       const out = [];
       for (const [dir, items] of groups.entries()) {
-        out.push(div().px(6).pt(3).text_size(10.5).text_color(t.dim).truncate().child(dir));
-        items.forEach((it, idx) => out.push(fileRow(it, kind, `${dir}-${idx}`, `  ${it.name}`)));
+        out.push(
+          div()
+            .id(`scm-dir-${kind}-${dir}`)
+            .px(6)
+            .pt(3)
+            .text_size(10.5)
+            .text_color(t.dim)
+            .truncate()
+            .tooltip(dir === "." ? (base || ".") : this.formatPathTooltip(dir, base, dir))
+            .child(dir),
+        );
+        items.forEach((it, idx) => out.push(fileRow(it, kind, `${dir}-${idx}`, it.name)));
       }
       return out;
     };
+    const curSyncBadge = this.currentSyncBadge();
 
     return v_flex()
       .flex_1()
       .min_h(0)
       .child(
         h_flex()
-          .h(34)
-          .px(10)
-          .gap(4)
+          .h(28)
+          .px(8)
+          .gap(3)
           .items_center()
           .border_b(1)
           .border_color(t.border)
@@ -1516,7 +1612,23 @@ export default class IdeSidebar extends View {
               .child(svg("mods/workspace-chrome/branch.svg").size(12).text_color(t.accent))
               .child(div().max_w(100).truncate().text_size(12).font_semibold().child(this.branch || "git")),
           )
-          .when(this.behind > 0, (el) =>
+          .when(this.behind > 0 && this.ahead > 0, (el) =>
+            el.child(
+              div()
+                .id("scm-sync-badge")
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.accent + "24")
+                .text_size(11)
+                .text_color(t.accent)
+                .cursor_pointer()
+                .tooltip(`Sync: Pull ${this.behind} & Push ${this.ahead}`)
+                .on_click((_e, cx) => this.runGit(["sync"], "Git Sync", cx))
+                .child(`↓${this.behind} ↑${this.ahead}`),
+            ),
+          )
+          .when(this.behind > 0 && this.ahead === 0, (el) =>
             el.child(
               div()
                 .id("scm-behind-badge")
@@ -1532,7 +1644,7 @@ export default class IdeSidebar extends View {
                 .child(`↓${this.behind}`),
             ),
           )
-          .when(this.ahead > 0, (el) =>
+          .when(this.ahead > 0 && this.behind === 0, (el) =>
             el.child(
               div()
                 .id("scm-ahead-badge")
@@ -1548,13 +1660,19 @@ export default class IdeSidebar extends View {
                 .child(`↑${this.ahead}`),
             ),
           )
-          .when(Boolean(this.syncLabel), (el) =>
-            el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(this.syncLabel)),
+          .when(Boolean(curSyncBadge), (el) =>
+            el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(curSyncBadge)),
           )
           .child(div().flex_1())
           .child(miniBtn("scm-tree", cfg.scmTreeView ? "Tree" : "List", "Toggle List/Tree view", (_e, cx) => { updateIdeSettings({ scmTreeView: !cfg.scmTreeView }); cx.notify(); }))
-          .child(miniBtn("scm-pull", this.behind > 0 ? `↓${this.behind}` : "↓", "Pull (Ctrl+Alt+P)", (_e, cx) => this.runGit(["pull"], "Git Pull", cx)))
-          .child(miniBtn("scm-push", this.ahead > 0 ? `↑${this.ahead}` : "↑", "Push (Ctrl+Alt+K)", (_e, cx) => this.runGit(["push"], "Git Push", cx)))
+          .when(this.behind > 0 && this.ahead > 0, (el) =>
+            el.child(miniBtn("scm-sync", `↓${this.behind} ↑${this.ahead}`, `Sync: Pull ${this.behind} & Push ${this.ahead}`, (_e, cx) => this.runGit(["sync"], "Git Sync", cx))),
+          )
+          .when(!(this.behind > 0 && this.ahead > 0), (el) =>
+            el
+              .child(miniBtn("scm-pull", this.behind > 0 ? `↓${this.behind}` : "↓", "Pull (Ctrl+Alt+P)", (_e, cx) => this.runGit(["pull"], "Git Pull", cx)))
+              .child(miniBtn("scm-push", this.ahead > 0 ? `↑${this.ahead}` : "↑", "Push (Ctrl+Alt+K)", (_e, cx) => this.runGit(["push"], "Git Push", cx))),
+          )
           .child(miniBtn("scm-undo", "↶", "Undo last commit (Ctrl+Alt+Z)", (_e, cx) => this.runGit(["reset", "--soft", "HEAD~1"], "Undo Commit", cx)))
           .child(miniBtn("scm-ref", "↻", "Refresh", (_e, cx) => this.refresh(cx))),
       )
@@ -1563,11 +1681,11 @@ export default class IdeSidebar extends View {
         el
           .child(
             div().flex_1().min_h(0).relative().child(
-              v_flex().id("scm-scroll").absolute().inset_0().overflow_y_scroll().p(6).gap(6)
+              v_flex().id("scm-scroll").absolute().inset_0().overflow_y_scroll().p(4).gap(1)
                 .when(this.conflicts.length > 0, (el2) =>
                   el2
                     .child(
-                      h_flex().px(4).gap(4).items_center()
+                      h_flex().px(4).pb(1).gap(4).items_center()
                         .child(div().flex_1().text_size(11).font_semibold().text_color(t.blocked).child(`MERGE CONFLICTS (${this.conflicts.length})`))
                         .child(miniBtn("scm-merge-ed", "Merge Editor", "Open 3-Way Merge Editor (Ctrl+Alt+U)", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90 })))
                         .child(miniBtn("scm-merge-abort", "Abort", "Abort merge", (_e, cx) => {
@@ -1578,13 +1696,13 @@ export default class IdeSidebar extends View {
                     .children(this.conflicts.map((f, i) => fileRow(f, "conflict", i))),
                 )
                 .child(
-                  h_flex().px(4).items_center()
+                  h_flex().px(4).pt(2).pb(1).items_center()
                     .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`STAGED (${this.staged.length})`))
                     .when(this.staged.length > 0, (el2) => el2.child(miniBtn("scm-unstage-all", "− All", "Unstage all", (_e, cx) => this.runGit(["reset", "HEAD"], null, cx)))),
                 )
                 .children(renderGroup(this.staged, "staged"))
                 .child(
-                  h_flex().px(4).pt(4).gap(4).items_center()
+                  h_flex().px(4).pt(6).pb(1).gap(4).items_center()
                     .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`CHANGES (${this.unstaged.length})`))
                     .when(this.unstaged.length > 0, (el2) =>
                       el2
@@ -1610,7 +1728,7 @@ export default class IdeSidebar extends View {
                 )
                 .children(renderGroup(this.unstaged, "unstaged"))
                 .child(
-                  h_flex().id("scm-commits-hdr").pt(6).px(4).items_center().cursor_pointer().on_click((_e, cx) => { this.showCommits = !this.showCommits; cx.notify(); })
+                  h_flex().id("scm-commits-hdr").pt(7).pb(1).px(4).items_center().cursor_pointer().on_click((_e, cx) => { this.showCommits = !this.showCommits; cx.notify(); })
                     .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`${this.showCommits ? "▾" : "▸"} COMMITS (${this.commits.length})`)),
                 )
                 .when(this.showCommits, (el2) =>
@@ -1618,12 +1736,14 @@ export default class IdeSidebar extends View {
                     this.commits.map((c, i) =>
                       h_flex()
                         .id(`scm-c-${i}`)
-                        .px(6)
-                        .py(3)
-                        .gap(6)
-                        .rounded(5)
+                        .h(21)
+                        .px(5)
+                        .gap(5)
+                        .items_center()
+                        .rounded(4)
                         .text_size(11.5)
                         .cursor_pointer()
+                        .tooltip(`${c.hash} — ${c.subject} (${c.rel})`)
                         .hover((s) => s.bg(t.hover))
                         .on_mouse_down("right", () => this.openCommitMenu(c))
                         .on_click((_e, cx) => this.showRefDiff(c.hash, false, cx))
@@ -1634,7 +1754,7 @@ export default class IdeSidebar extends View {
                   ),
                 )
                 .child(
-                  h_flex().id("scm-stash-hdr").pt(4).px(4).items_center().cursor_pointer().on_click((_e, cx) => { this.showStashes = !this.showStashes; cx.notify(); })
+                  h_flex().id("scm-stash-hdr").pt(6).pb(1).px(4).items_center().cursor_pointer().on_click((_e, cx) => { this.showStashes = !this.showStashes; cx.notify(); })
                     .child(div().flex_1().text_size(11).font_semibold().text_color(t.dim).child(`${this.showStashes ? "▾" : "▸"} STASHES (${this.stashes.length})`))
                     .child(miniBtn("scm-stash-push", "+ Stash", "git stash push", (_e, cx) => this.runGit(["stash", "push"], "Stashed", cx))),
                 )
@@ -1643,10 +1763,10 @@ export default class IdeSidebar extends View {
                     this.stashes.map((s, i) =>
                       h_flex()
                         .id(`scm-st-${i}`)
-                        .px(6)
-                        .py(3)
-                        .gap(6)
-                        .rounded(5)
+                        .h(21)
+                        .px(5)
+                        .gap(5)
+                        .rounded(4)
                         .text_size(11.5)
                         .items_center()
                         .cursor_pointer()
@@ -1830,6 +1950,11 @@ export default class IdeSidebar extends View {
       .child(Scrollbar.vertical("ide-settings-scroll").absolute().inset_0());
   }
 
+  currentSyncBadge() {
+    const curJobKey = this.root ? `${this.on ?? "local"}:${this.root}` : null;
+    return (curJobKey && this.bgJobsByRepo?.get(curJobKey)) || this.syncLabel;
+  }
+
   render(cx) {
     if (!checking()) this.syncWorkPane();
     if (locationKey() !== this.context) this.refresh(cx);
@@ -1863,6 +1988,7 @@ export default class IdeSidebar extends View {
         })
         .child(label);
     };
+    const curSyncBadge = this.currentSyncBadge();
 
     return v_flex()
       .id("ide-sidebar")
@@ -1889,8 +2015,8 @@ export default class IdeSidebar extends View {
           .child(tabBtn("explorer", "Files"))
           .child(tabBtn("search", "Search"))
           .child(tabBtn("scm", `Git${this.staged.length + this.unstaged.length ? ` (${this.staged.length + this.unstaged.length})` : ""}`))
-          .when(Boolean(this.syncLabel), (el) =>
-            el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(this.syncLabel)),
+          .when(Boolean(curSyncBadge), (el) =>
+            el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(curSyncBadge)),
           )
           .child(div().flex_1())
           .child(tabBtn("settings", "⚙")),

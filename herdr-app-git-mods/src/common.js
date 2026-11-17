@@ -730,6 +730,11 @@ function summarizeGitSyncText(rawText, fallback) {
 }
 
 async function runGitSyncWithUpstream(kind, root, on) {
+  if (kind === "sync") {
+    const pullRes = await runGitSyncWithUpstream("pull", root, on);
+    if (!pullRes.ok) return pullRes;
+    return runGitSyncWithUpstream("push", root, on);
+  }
   notify({
     title: kind === "pull" ? "Git Pull" : "Git Push",
     body: kind === "pull" ? "正在从远程拉取代码…" : "正在推送代码到远程仓库…",
@@ -761,6 +766,138 @@ async function runGitSyncWithUpstream(kind, root, on) {
   });
   if (ok) bumpGitDirty();
   return { ok, detail };
+}
+
+async function runAiSyncPipeline({ action, root, on, onProgress }) {
+  const git = async (args) => {
+    const r = await exec("git", args, { cwd: root, on });
+    return { ok: r.code === 0, out: (r.stdout ?? "").trim(), err: (r.stderr ?? "").trim() };
+  };
+
+  if (action === "sync") {
+    onProgress?.({ status: "Syncing (Pull → Push)…" });
+    const res = await runGitSyncWithUpstream("sync", root, on);
+    return {
+      ok: res.ok,
+      status: res.ok ? "Synced ✓" : "Git Sync Failed",
+      detail: res.detail,
+      error: res.ok ? null : res.detail,
+    };
+  }
+
+  if (action === "ai-sync") {
+    const unmerged = await git(["ls-files", "--unmerged"]);
+    if (unmerged.out) {
+      const errMsg = "存在未解决的合并冲突，请先解决冲突后再执行 AI Commit & Sync。";
+      notify({ title: "AI Commit & Sync Blocked", body: errMsg, level: "error", timeout: 4500 });
+      return { ok: false, error: errMsg };
+    }
+  }
+
+  let committedMsg = null;
+  const allowClean = action === "ai-sync";
+  onProgress?.({ status: "Staging & checking changes…" });
+  const stagedCheck = await git(["diff", "--cached", "--name-only"]);
+  if (!stagedCheck.out) {
+    const add = await git(["add", "-A"]);
+    if (!add.ok) {
+      const errMsg = add.err || "git add -A failed";
+      notify({ title: "AI Commit Failed", body: errMsg, level: "error", timeout: 4500 });
+      return { ok: false, error: errMsg };
+    }
+  }
+  const diff = await git(["diff", "--cached", "--stat"]);
+  if (!diff.out) {
+    if (!allowClean) {
+      const infoMsg = "Nothing to commit (working tree clean).";
+      notify({ title: "AI Commit", body: infoMsg, level: "info", timeout: 3500 });
+      return { ok: false, clean: true, error: infoMsg };
+    }
+    onProgress?.({ detail: "工作区无新改动，继续检查远端同步…" });
+  } else {
+    const summary = diff.out.split("\n").pop()?.trim() || "";
+    onProgress?.({ status: "Generating AI commit message…", detail: summary });
+    const patch = await git(["diff", "--cached", "--no-color"]);
+    const msg = await generateAiCommitMessage(diff.out, patch.out.slice(0, 6000), root, on);
+    onProgress?.({ status: "Committing changes…", draft: msg });
+    const c = await git(["commit", "-m", msg]);
+    if (!c.ok) {
+      const errMsg = c.err || c.out || "git commit failed";
+      notify({ title: "Git Commit Failed", body: errMsg, level: "error", timeout: 5500 });
+      return { ok: false, error: errMsg, draft: msg, needEdit: true };
+    }
+    bumpGitDirty();
+    committedMsg = msg;
+    notify({ title: "AI Commit ✓", body: msg.split("\n")[0], level: "success", timeout: 6000 });
+    onProgress?.({ status: "Committed ✓", committedMsg: msg });
+    if (action === "ai-commit") {
+      return { ok: true, status: "Committed ✓", detail: summary, committedMsg: msg };
+    }
+  }
+
+  // action === "ai-sync": Pull if behind > 0, then Push if ahead > 0 or no upstream yet.
+  const remotes = await git(["remote"]);
+  if (!remotes.ok || !remotes.out) {
+    const infoMsg = "No git remote configured (skipped pull/push).";
+    notify({ title: "AI Commit & Sync", body: infoMsg, level: "info", timeout: 3500 });
+    return {
+      ok: true,
+      status: committedMsg ? "Committed locally ✓" : "Working tree clean ✓",
+      detail: infoMsg,
+      committedMsg,
+    };
+  }
+
+  const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+  let ahead = 0;
+  if (upstream.ok && upstream.out) {
+    onProgress?.({ status: "Checking remote changes…" });
+    const fetched = await git(["fetch", "--quiet"]);
+    if (!fetched.ok) {
+      const errMsg = fetched.err || fetched.out || "git fetch failed";
+      notify({ title: "Git Sync Failed", body: errMsg, level: "error", timeout: 4500 });
+      return { ok: false, error: errMsg, committedMsg };
+    }
+    const counts = await git(["rev-list", "--left-right", "--count", "HEAD...@{u}"]);
+    const parts = (counts.out || "").trim().split(/\s+/);
+    ahead = Number(parts[0] ?? 0);
+    const behind = Number(parts[1] ?? 0);
+    if (behind > 0) {
+      onProgress?.({ status: `Pulling incoming changes (↓${behind})…` });
+      const pullRes = await runGitSyncWithUpstream("pull", root, on);
+      if (!pullRes.ok) {
+        return { ok: false, error: pullRes.detail, committedMsg };
+      }
+      const afterCounts = await git(["rev-list", "--count", "@{u}..HEAD"]);
+      ahead = afterCounts.ok ? Number(afterCounts.out || 0) : ahead;
+    }
+    if (ahead === 0) {
+      notify({
+        title: "AI Commit & Sync ✓",
+        body: committedMsg ? `${committedMsg.split("\n")[0]}（远端已是最新）` : "工作区干净且已与远端同步",
+        level: "success",
+        timeout: 4000,
+      });
+      return {
+        ok: true,
+        status: committedMsg ? "Committed & synced ✓" : "Already up to date ✓",
+        detail: "No outgoing commits to push.",
+        committedMsg,
+      };
+    }
+  }
+
+  onProgress?.({ status: ahead > 0 ? `Pushing to remote (↑${ahead})…` : "Pushing to remote…" });
+  const pushRes = await runGitSyncWithUpstream("push", root, on);
+  if (!pushRes.ok) {
+    return { ok: false, error: pushRes.detail, committedMsg };
+  }
+  return {
+    ok: true,
+    status: committedMsg ? "AI Commit + Sync Complete ✓" : "Pushed ✓",
+    detail: pushRes.detail,
+    committedMsg,
+  };
 }
 
 async function saveText(absPath, content, prevRaw, on) {

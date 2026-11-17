@@ -25,11 +25,11 @@ function place(s, ps) {
   const tabs = new Set((s.tabs ?? []).map((c) => c.id));
   return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }
-const rowHeight = ({ tree }) => (tree ? 44 : 46);
+const rowHeight = ({ tree }) => (tree ? 34 : 36);
 const RAIL_CELL = 32;
 // A space's name and its git tail never shrink below this, so a short one ("api")
 // stays readable instead of turning into an ellipsis next to a long branch.
-const SIDE_MIN = 48;
+const SIDE_MIN = 40;
 const railCell = (el) => h_flex().flex_none().justify_center().child(el);
 const where = (s, ps) => JSON.stringify([s.machine ?? null, place(s, ps)]);
 const base = (path) => path.replace(/\/+$/, "").split("/").pop();
@@ -526,7 +526,7 @@ export default class Spaces extends View {
       const folded = this.folded.has(m);
       const icon = svg(`mods/workspace-chrome/${m ? "server" : "monitor"}.svg`).size(13).flex_none();
       const badge = div().absolute().right(-3).bottom(-2).size(6).rounded(3).border_1().border_color(t.chrome).bg(connected ? t.ansi2 : t.dim);
-      const head = h_flex().id(`machine-${m ?? "local"}`).h(26).flex_none().px(collapsed ? 0 : 8).gap(7).items_center().text_size(11).text_color(t.dim)
+      const head = h_flex().id(`machine-${m ?? "local"}`).h(22).flex_none().px(collapsed ? 0 : 6).gap(5).items_center().text_size(11).text_color(t.dim)
         .when(collapsed, el => el.mt(4).w(RAIL_CELL).justify_center().rounded(6).tooltip(login ? `${m} needs a login: run ${login}. Click for Copy.` : m ? `${m} · ${connected ? "connected" : (machine?.state ?? "asleep").replace(/_/g, " ")}` : "This computer"))
         .cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => {
@@ -610,12 +610,12 @@ export default class Spaces extends View {
     return v_flex()
       .relative()
       .id(`space-${w.id}`)
-      .px(10)
-      .py(6)
-      .min_h(rowHeight({ tree }))
+      .px(7)
+      .py(3.5)
+      .when(Boolean(g), (el) => el.min_h(rowHeight({ tree })))
       .flex_none()
       .justify_center()
-      .rounded(8)
+      .rounded(6)
       .when(on, (el) => el.bg(t.selected))
       .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
       .when(this.pressed === w.id && this.over !== w.id, (el) => el.opacity(0.5))
@@ -673,49 +673,49 @@ export default class Spaces extends View {
         const repoShown = g && !tree && !sameName(g.name) ? g.name : null;
         const gitWhere = [repoShown, branchShown].filter(Boolean).join(" · ") || (g ? (g.branch ?? "detached") : null);
         return v_flex()
-          .gap(3)
+          .gap(1)
           .justify_center()
           .child(
             h_flex()
-              .gap(8)
+              .gap(6)
               .items_center()
-              .when(Boolean(tree), el => el.pl(14).child(h_flex().w(16).flex_none().justify_center().items_center().child(svg("mods/workspace-chrome/branch.svg").size(12).text_color(t.dim))))
-              .when(!tree, el => el.child(h_flex().size(16).flex_none().rounded(4).bg(fill).items_center().justify_center().text_size(9.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
-              .child(div().flex_1().min_w(SIDE_MIN).truncate().text_size(12.5).font_medium().text_color(t.foreground).child(w.name))
+              .when(Boolean(tree), el => el.pl(12).child(h_flex().w(14).flex_none().justify_center().items_center().child(svg("mods/workspace-chrome/branch.svg").size(11).text_color(t.dim))))
+              .when(!tree, el => el.child(h_flex().size(14).flex_none().rounded(4).bg(fill).items_center().justify_center().text_size(9).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
+              .child(div().flex_1().min_w(SIDE_MIN).truncate().text_size(12).font_medium().text_color(t.foreground).child(w.name))
               .when(Boolean(stGlyph || agentName), (el) => {
                 const highlight = detected === "working" || detected === "blocked";
                 return el.child(
                   h_flex()
                     .flex_none()
-                    .gap(4)
-                    .px(highlight ? 5 : 0)
-                    .py(highlight ? 1 : 0)
+                    .gap(3)
+                    .px(highlight ? 4 : 0)
+                    .py(highlight ? 0.5 : 0)
                     .rounded(4)
                     .when(detected === "working", (b) => b.bg(t.working + "22"))
                     .when(detected === "blocked", (b) => b.bg(t.blocked + "22"))
                     .items_center()
-                    .when(Boolean(detected === "working"), (e) => e.child(div().text_size(10).text_color(stColor).child(stGlyph)))
+                    .when(Boolean(detected === "working"), (e) => e.child(div().text_size(9.5).text_color(stColor).child(stGlyph)))
                     .when(Boolean(detected && detected !== "working"), (e) =>
                       e.child(
                         detected === "done"
-                          ? div().text_size(10).text_color(stColor).child("✓")
-                          : div().size(6).rounded_full().bg(detected === "idle" ? t.dim : stColor),
+                          ? div().text_size(9.5).text_color(stColor).child("✓")
+                          : div().size(5).rounded_full().bg(detected === "idle" ? t.dim : stColor),
                       ),
                     )
                     .when(!detected && runningProg, (e) => e.child(div().size(5).rounded_full().bg(t.accent)))
-                    .when(Boolean(agentName), (e) => e.child(div().max_w(68).truncate().text_size(11).text_color(highlight ? stColor : t.muted).child(agentName))),
+                    .when(Boolean(agentName), (e) => e.child(div().max_w(62).truncate().text_size(10.5).text_color(highlight ? stColor : t.muted).child(agentName))),
                 );
               }),
           )
           .when(Boolean(g), (el) =>
             el.child(
               h_flex()
-                .pl(tree ? 14 : 0)
-                .gap(8)
+                .pl(tree ? 12 : 0)
+                .gap(6)
                 .items_center()
-                .text_size(11)
+                .text_size(10.5)
                 .text_color(t.dim)
-                .child(h_flex().w(16).flex_none().justify_center().items_center().child(svg("mods/workspace-chrome/branch.svg").size(11).text_color(t.dim)))
+                .child(h_flex().w(14).flex_none().justify_center().items_center().child(svg("mods/workspace-chrome/branch.svg").size(10).text_color(t.dim)))
                 .child(div().flex_1().min_w(0).truncate().child(gitWhere || ""))
                 .when(g.ahead > 0, (e) => e.child(div().flex_none().text_color(t.ansi2).child(`↑${g.ahead}`)))
                 .when(g.behind > 0, (e) => e.child(div().flex_none().text_color(t.ansi1).child(`↓${g.behind}`))),
@@ -763,13 +763,13 @@ export default class Spaces extends View {
       this.revealedAt = this.activeAt;
       if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
     }
-    return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
-      .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
+    return v_flex().size_full().min_h(0).bg(t.chrome).text_size(12.5)
+      .child(h_flex().h(26).pl(10).pr(6).items_center().justify_between().text_size(11).text_color(t.dim)
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
         .when(!collapsed, el => el.child("Spaces"))
-        .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
-          .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
-      .child(v_flex().flex_1().min_h(0).gap(3).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
+        .child(div().id("space-new").size(22).flex_none().flex().items_center().justify_center().rounded(5).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(13))))
+      .child(v_flex().flex_1().min_h(0).gap(1).px(collapsed ? 0 : 6).pb(8).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
         .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })

@@ -476,11 +476,16 @@ export default class GitBranch extends View {
         el.child(div().px(6).py(2).rounded(4).bg(t.hover).text_size(11).text_color(t.muted).child(this.on)),
       )
       .child(div().flex_1())
-      .when(Boolean(this.root), (el) =>
-        el
-          .child(headerBtn("gb-pull", "↓ Pull", "git pull (Ctrl+Alt+P)", (_e, cx) => this.runSync("pull", cx)))
-          .child(headerBtn("gb-push", "↑ Push", "git push (Ctrl+Alt+K)", (_e, cx) => this.runSync("push", cx))),
-      )
+      .when(Boolean(this.root), (el) => {
+        const activeSp = spaces().find((s) => s.active);
+        const sync = activeSp ? (shared("ide.gitSyncBySpace")?.[activeSp.id] ?? { ahead: 0, behind: 0 }) : { ahead: 0, behind: 0 };
+        if (sync.behind > 0 && sync.ahead > 0) {
+          return el.child(headerBtn("gb-sync", `↓${sync.behind} ↑${sync.ahead} Sync`, `Pull ${sync.behind} & Push ${sync.ahead}`, (_e, cx) => this.runSync("sync", cx)));
+        }
+        return el
+          .child(headerBtn("gb-pull", sync.behind > 0 ? `↓${sync.behind} Pull` : "↓ Pull", "git pull (Ctrl+Alt+P)", (_e, cx) => this.runSync("pull", cx)))
+          .child(headerBtn("gb-push", sync.ahead > 0 ? `↑${sync.ahead} Push` : "↑ Push", "git push (Ctrl+Alt+K)", (_e, cx) => this.runSync("push", cx)));
+      })
       .child(headerBtn("gb-esc", "Esc", "Close", () => this.close()));
 
     const tabs = h_flex()

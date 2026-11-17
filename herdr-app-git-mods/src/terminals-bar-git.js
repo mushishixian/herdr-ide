@@ -220,8 +220,14 @@ export default class TerminalsBarGit extends View {
           )
           .child(pillBtn("tm-git-new", "+", "New branch (Ctrl+Alt+N)", () => run("mod.open", { name: "git-new" })))
           .child(pillBtn("tm-git-merge", "Merge", "Merge branch (Ctrl+Alt+X)", () => run("mod.open", { name: "git-merge" })))
-          .child(pillBtn("tm-git-pull", sync.behind > 0 ? `↓${sync.behind}` : "↓", sync.behind > 0 ? `Pull ${sync.behind} incoming commit(s) (Ctrl+Alt+P)` : "Git Pull (Ctrl+Alt+P)", () => run("mod.open", { name: "git-pull" })))
-          .child(pillBtn("tm-git-push", sync.ahead > 0 ? `↑${sync.ahead}` : "↑", sync.ahead > 0 ? `Push ${sync.ahead} outgoing commit(s) (Ctrl+Alt+K)` : "Git Push (Ctrl+Alt+K)", () => run("mod.open", { name: "git-push" }))),
+          .when(sync.behind > 0 && sync.ahead > 0, (el2) =>
+            el2.child(pillBtn("tm-git-sync", `↓${sync.behind} ↑${sync.ahead}`, `Sync: Pull ${sync.behind} & Push ${sync.ahead}`, () => run("ide-sidebar.sync"))),
+          )
+          .when(!(sync.behind > 0 && sync.ahead > 0), (el2) =>
+            el2
+              .child(pillBtn("tm-git-pull", sync.behind > 0 ? `↓${sync.behind}` : "↓", sync.behind > 0 ? `Pull ${sync.behind} incoming commit(s) (Ctrl+Alt+P)` : "Git Pull (Ctrl+Alt+P)", () => run("mod.open", { name: "git-pull" })))
+              .child(pillBtn("tm-git-push", sync.ahead > 0 ? `↑${sync.ahead}` : "↑", sync.ahead > 0 ? `Push ${sync.ahead} outgoing commit(s) (Ctrl+Alt+K)` : "Git Push (Ctrl+Alt+K)", () => run("mod.open", { name: "git-push" }))),
+          ),
       )
       .child(pillBtn("tm-quick-open", "Files", "Quick Open (Ctrl+Q)", () => run("mod.open", { name: "quick-open" })))
       .child(

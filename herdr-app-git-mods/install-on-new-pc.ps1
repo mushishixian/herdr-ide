@@ -53,7 +53,7 @@ foreach ($f in $bundleFiles) {
 }
 
 # 4. Validate all deployed mods
-$mods = @("git-branch","git-merge","git-rename","git-new","git-pull","git-push","git-undo","git-ai-commit","git-ai-sync","git-line-history","git-history","merge-editor","ide-pane-header","quick-open","content-search","replace-popup","symbol-search","ide-sidebar","ide-editor","ide-menu","ide-recent","ide-toast","spaces-ide","terminals-bar-git","git-status")
+$mods = @("git-branch","git-merge","git-rename","git-new","git-pull","git-push","git-sync","git-undo","git-ai-commit","git-ai-sync","git-line-history","git-history","merge-editor","ide-pane-header","quick-open","content-search","replace-popup","symbol-search","ide-sidebar","ide-editor","ide-menu","ide-recent","ide-toast","spaces-ide","terminals-bar-git","git-status")
 foreach ($m in $mods) {
   $dir = Join-Path $herdrHome "mods\$m"
   if (Test-Path $dir) {
