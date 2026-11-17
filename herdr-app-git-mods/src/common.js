@@ -105,14 +105,36 @@ function updateIdeSettings(patch) {
 function getContext() {
   const space = spaces().find((s) => s.active);
   const f = focused();
-  const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
+  const allPanes = panes();
   const activeTab = space?.tabs?.find((t) => t.active)?.id;
-  const tabTerm = panes().find((p) => p.tab === activeTab && p.cwd)
-    ?? panes().find((p) => (space?.tabs ?? []).some((t) => t.id === p.tab) && p.cwd);
+  const tabPanes = activeTab ? allPanes.filter((p) => p.tab === activeTab) : [];
+  const trackedEdId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
+  const pane = f?.pane ? allPanes.find((p) => p.pane === f.pane) : null;
   const on = f?.pane === null
     ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null)
     : (space?.machine ?? null);
-  const rawCwd = pane?.cwd || f?.cwd || tabTerm?.cwd || space?.folder || null;
+
+  let rawCwd = null;
+  if (pane?.cwd && !isEditorPane(pane, trackedEdId)) {
+    rawCwd = pane.cwd;
+  } else if (f?.pane === null && f?.cwd) {
+    rawCwd = f.cwd;
+  } else {
+    const rememberedId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
+    const isWorkPane = (p) => Boolean(p?.cwd) && !isEditorPane(p, trackedEdId);
+    const workPane =
+      (rememberedId && tabPanes.find((p) => p.pane === rememberedId && isWorkPane(p))) ||
+      tabPanes.find((p) => p.focused && isWorkPane(p)) ||
+      tabPanes.find((p) => isWorkPane(p) && (p.status || p.app || p.program?.agent)) ||
+      tabPanes.find((p) => isWorkPane(p)) ||
+      tabPanes.find((p) => p.cwd) ||
+      (() => {
+        const spaceTabs = new Set((space?.tabs ?? []).map((t) => t.id));
+        const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab) && p.cwd);
+        return spacePanes.find((p) => !isEditorPane(p, shared("ide.editor.paneByTab")?.[p.tab])) ?? spacePanes[0] ?? null;
+      })();
+    rawCwd = workPane?.cwd || pane?.cwd || f?.cwd || space?.folder || null;
+  }
   const cwd = rawCwd ? rawCwd.replace(/ \(deleted\)$/, "") : null;
   return { cwd, on, space };
 }

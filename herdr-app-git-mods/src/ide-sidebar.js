@@ -78,6 +78,8 @@ export default class IdeSidebar extends View {
     this.lastFreshFile = null;
     this.probingFreshActive = false;
     this.lastFreshProbeAt = 0;
+    this.loadSeq = 0;
+    this.explorerSeq = 0;
     this.seenTabPanes = new Map();
     this.lastStatusRaw = null;
 
@@ -147,7 +149,10 @@ export default class IdeSidebar extends View {
     this.refresh(cx);
     cx.timer.every(25, (cx2) => this.pollSharedSignals(cx2));
     cx.timer.every(1500, (cx) => {
-      if (this.view === "scm" && this.root && !this.loading && !this.probing) {
+      if (!checking()) this.syncWorkPane();
+      if (locationKey() !== this.context) {
+        this.refresh(cx);
+      } else if (this.view === "scm" && this.root && !this.loading && !this.probing) {
         this.probeStatus(cx);
       }
       const cfg = getIdeSettings();
@@ -306,18 +311,34 @@ export default class IdeSidebar extends View {
     this.probing = true;
     const root = this.root;
     const on = this.on;
+    const targetContext = this.context;
+    const myLoadSeq = this.loadSeq;
     cx.spawn(async (cx) => {
       try {
         const st = await exec("git", [...READ, "status", "--porcelain=v1", "--branch", "-z", "--no-renames", "--untracked-files=all"], { cwd: root, on });
+        if (this.context !== targetContext || myLoadSeq !== this.loadSeq || this.root !== root) return;
         if (st.code === 0 && st.stdout !== this.lastStatusRaw) {
           this.applyStatusOutput(st.stdout);
           cx.notify();
         }
       } catch {}
       finally {
-        this.probing = false;
+        if (myLoadSeq === this.loadSeq) this.probing = false;
       }
     });
+  }
+
+  syncWorkPane() {
+    const space = spaces().find((s) => s.active);
+    const activeTab = space?.tabs?.find((t) => t.active)?.id;
+    const f = focused();
+    const fp = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
+    if (activeTab && fp?.cwd && !isEditorPane(fp, shared("ide.editor.paneByTab")?.[activeTab])) {
+      const wp = shared("ide.workPaneByTab") ?? {};
+      if (wp[activeTab] !== fp.pane) {
+        setShared("ide.workPaneByTab", { ...wp, [activeTab]: fp.pane });
+      }
+    }
   }
 
   applyStatusOutput(raw) {
@@ -420,6 +441,7 @@ export default class IdeSidebar extends View {
   }
 
   refresh(cx) {
+    if (!checking()) this.syncWorkPane();
     const { cwd, on, space } = getContext();
     const k = locationKey();
     const cfg = getIdeSettings();
@@ -442,14 +464,22 @@ export default class IdeSidebar extends View {
       this.pendingRevealPath = null;
       this.lastFreshRaw = null;
       this.lastFreshFile = null;
+      this.loadSeq += 1;
+      this.explorerSeq += 1;
+      this.loading = false;
+      this.loadingExplorer = false;
+      this.probing = false;
     }
     if (!cwd) return;
     if (this.view === "explorer" && !this.loadingExplorer) {
       this.loadingExplorer = true;
       const targetContext = this.context;
+      const myExpSeq = this.explorerSeq;
+      const myLoadSeq = this.loadSeq;
       cx.spawn(async (cx) => {
         try {
           const top = this.root ? null : await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
+          if (this.context !== targetContext || myExpSeq !== this.explorerSeq || myLoadSeq !== this.loadSeq) return;
           const rootPath = this.root || (top?.code === 0 ? top.stdout.trim() : null);
           if (rootPath) this.root = rootPath;
           const base = this.root || cwd;
@@ -457,7 +487,7 @@ export default class IdeSidebar extends View {
           const folderList = ["", ...this.folders];
           const listed = await listMany(folderList.map((folder) => (folder ? `${base}/${folder}` : base)), on);
           const results = folderList.map((folder, i) => ({ folder, items: listed[i] }));
-          if (this.context !== targetContext) return;
+          if (this.context !== targetContext || myExpSeq !== this.explorerSeq || myLoadSeq !== this.loadSeq) return;
           for (const { folder, items } of results) {
             this.entries.set(
               folder,
@@ -467,18 +497,25 @@ export default class IdeSidebar extends View {
             );
           }
         } catch (e) {
-          this.error = String(e?.message ?? e);
+          if (this.context === targetContext && myExpSeq === this.explorerSeq) {
+            this.error = String(e?.message ?? e);
+          }
         } finally {
-          this.loadingExplorer = false;
-          cx.notify();
+          if (myExpSeq === this.explorerSeq) {
+            this.loadingExplorer = false;
+            cx.notify();
+          }
         }
       });
     }
     if (this.loading) return;
     this.loading = true;
+    const targetContext = this.context;
+    const myLoadSeq = this.loadSeq;
     cx.spawn(async (cx) => {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
+        if (this.context !== targetContext || myLoadSeq !== this.loadSeq) return;
         this.root = top?.code === 0 ? top.stdout.trim() : null;
         const base = this.root || cwd;
         this.watch(base, cx);
@@ -511,6 +548,7 @@ export default class IdeSidebar extends View {
             git(["log", "-n", "12", "--pretty=%h%x09%s%x09%cr"]),
             git(["stash", "list", "--pretty=%gd%x09%s"]),
           ]);
+          if (this.context !== targetContext || myLoadSeq !== this.loadSeq) return;
           this.branch = br.code === 0 ? br.stdout.trim() : "HEAD";
           const activeSp = spaces().find((s) => s.active);
           if (activeSp?.id && this.branch && this.branch !== "HEAD") {
@@ -530,12 +568,16 @@ export default class IdeSidebar extends View {
             return { ref, msg };
           });
         }
-        this.error = null;
+        if (this.context === targetContext && myLoadSeq === this.loadSeq) this.error = null;
       } catch (e) {
-        this.error = String(e?.message ?? e);
+        if (this.context === targetContext && myLoadSeq === this.loadSeq) {
+          this.error = String(e?.message ?? e);
+        }
       } finally {
-        this.loading = false;
-        cx.notify();
+        if (myLoadSeq === this.loadSeq) {
+          this.loading = false;
+          cx.notify();
+        }
       }
     });
   }
@@ -1789,6 +1831,7 @@ export default class IdeSidebar extends View {
   }
 
   render(cx) {
+    if (!checking()) this.syncWorkPane();
     if (locationKey() !== this.context) this.refresh(cx);
     const t = theme();
     const tabBtn = (id, label) => {
