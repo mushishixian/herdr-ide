@@ -1,6 +1,6 @@
 import {
   spaces, panes, terminals, focused, exec, readTextFile, writeTextFile,
-  shared, setShared, run, appHome, notify, window as win,
+  shared, setShared, run, appHome, notify, window as win, openOverlay, closeOverlay,
 } from "herdr";
 
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
@@ -394,6 +394,11 @@ async function execTerminalEditorJump(job, cx) {
 
 function openInCenterEditor({ file, root, on, line, direct }, cx) {
   const cfg = getIdeSettings();
+  const diffOverlay = shared("ide.diff.overlay");
+  if (diffOverlay) {
+    setShared("ide.diff.overlay", null);
+    closeOverlay(diffOverlay);
+  }
   const space = spaces().find((s) => s.active);
   const activeTab = space?.tabs?.find((t) => t.active)?.id;
   const tabPanes = panes().filter((p) => !activeTab || p.tab === activeTab);
@@ -535,17 +540,6 @@ function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd,
 
 function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, root, on }, cx) {
   const cfg = getIdeSettings();
-  const space = spaces().find((s) => s.active);
-  const activeTab = space?.tabs?.find((t) => t.active)?.id;
-  const tabPanes = panes().filter((p) => !activeTab || p.tab === activeTab);
-  const paneMap = { ...(shared("ide.editor.paneByTab") ?? {}) };
-  const trackedId = activeTab ? paneMap[activeTab] : null;
-  const editorPanes = tabPanes.filter((p) => isEditorPane(p, trackedId));
-  for (let i = 1; i < editorPanes.length; i++) {
-    run("pane.close", { pane: editorPanes[i].pane });
-  }
-  const existingEd = editorPanes[0] ?? null;
-  const targetPane = findNonEditorTerminal(tabPanes, trackedId) ?? tabPanes[0];
   const seq = (shared("ide.editor.open")?.seq ?? 0) + 1;
   const payload = {
     kind: "diff",
@@ -559,6 +553,26 @@ function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, 
     on: on ?? null,
     seq,
   };
+  // Keep external terminal editors (Fresh/Nvim) alive in the center pane instead
+  // of closing and re-splitting panes on every file <-> diff switch.
+  if (cfg.editorEngine !== "builtin") {
+    setShared("ide.editor.open", payload);
+    if (!shared("ide.diff.overlay")) {
+      openOverlay({ mod: "ide-editor", kind: "popup", at: "top", offset: 24, width: 0.78, height: 0.88, props: payload });
+    }
+    return;
+  }
+  const space = spaces().find((s) => s.active);
+  const activeTab = space?.tabs?.find((t) => t.active)?.id;
+  const tabPanes = panes().filter((p) => !activeTab || p.tab === activeTab);
+  const paneMap = { ...(shared("ide.editor.paneByTab") ?? {}) };
+  const trackedId = activeTab ? paneMap[activeTab] : null;
+  const editorPanes = tabPanes.filter((p) => isEditorPane(p, trackedId));
+  for (let i = 1; i < editorPanes.length; i++) {
+    run("pane.close", { pane: editorPanes[i].pane });
+  }
+  const existingEd = editorPanes[0] ?? null;
+  const targetPane = findNonEditorTerminal(tabPanes, trackedId) ?? tabPanes[0];
   openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx);
 }
 

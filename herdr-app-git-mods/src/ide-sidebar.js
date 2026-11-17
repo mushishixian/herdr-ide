@@ -120,6 +120,7 @@ export default class IdeSidebar extends View {
     setShared("ide.sidebar.alive", true);
     setShared("ide.recent.overlay", null);
     setShared("ide.glh.open", null);
+    setShared("ide.diff.overlay", null);
     // Global keystrokes reach the sidebar (always shown) as <mod>.<command>
     // via keys.json: ctrl-tab switches recent files, and ctrl-alt-o relays the
     // Fresh editor's line-history request (git_line_history.ts writes it and

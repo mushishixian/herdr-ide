@@ -2,11 +2,12 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Scrollbar, v_virtual_list } from "gpui-base";
 import {
   exec, readTextFile, writeTextFile, theme, settings, props,
-  shared, setShared, notify, checking, window as win, run,
+  shared, setShared, notify, checking, window as win, run, closeOverlay,
 } from "herdr";
 
 export default class IdeEditor extends View {
   init(p, cx) {
+    this.isOverlay = Boolean(p?.overlay || props()?.overlay);
     this.tabs = []; // [{ key, kind: "file"|"diff", title, file, staged, untracked, ref, isStash, root, on, raw, dirty, diffLines, diffWidth, diffStats }]
     this.activeKey = null;
     this.editing = true;
@@ -18,6 +19,12 @@ export default class IdeEditor extends View {
 
     if (checking()) return;
 
+    if (this.isOverlay) {
+      setShared("ide.diff.overlay", p?.overlay ?? props()?.overlay);
+      this.handle.focus();
+      cx.timer.after(300, () => this.handle.focus());
+    }
+
     const req = shared("ide.editor.open");
     const initReq = req?.root && (req?.file || req?.ref) ? req : p;
     if (req?.seq) this.lastSeq = req.seq;
@@ -25,6 +32,12 @@ export default class IdeEditor extends View {
       this.openRequest(initReq, cx);
     }
     cx.timer.every(80, (cx2) => this.pollOpenRequest(cx2));
+  }
+
+  async close(_cx) {
+    if (!this.isOverlay) return;
+    setShared("ide.diff.overlay", null);
+    closeOverlay(props()?.overlay);
   }
 
   pollOpenRequest(cx) {
@@ -128,7 +141,7 @@ export default class IdeEditor extends View {
     this.code?.release();
     this.code = null;
     this.error = null;
-    this.loadingDiff = true;
+    if (!tab.diffLines?.length) this.loadingDiff = true;
     cx.notify();
     const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
     cx.spawn(async (cx) => {
@@ -196,7 +209,8 @@ export default class IdeEditor extends View {
       this.code?.release();
       this.code = null;
       this.activeKey = null;
-      run("pane.close");
+      if (this.isOverlay) this.close(cx);
+      else run("pane.close");
       return;
     }
     if (this.activeKey === key) {
@@ -270,6 +284,8 @@ export default class IdeEditor extends View {
     const t = theme();
     const active = this.tabs.find((tb) => tb.key === this.activeKey);
     const isDiff = active?.kind === "diff";
+    const vpH = cx?.viewport_size?.()?.height ?? 900;
+    const overlayH = Math.max(460, Math.round(vpH * 0.88) - 12);
 
     const btn = (id, label, accent, onClick) =>
       div()
@@ -287,12 +303,16 @@ export default class IdeEditor extends View {
     return v_flex()
       .id("ide-editor-pane")
       .track_focus(this.handle)
-      .size_full()
-      .min_h(0)
+      .w_full()
+      .when(this.isOverlay, (el) => el.h(overlayH))
+      .when(!this.isOverlay, (el) => el.size_full().min_h(0))
       .bg(t.background)
       .text_color(t.foreground)
       .on_key_down((e, cx) => {
-        if (e.key === "s" && e.modifiers.control && !isDiff) {
+        if (this.isOverlay && e.key === "escape") {
+          this.close(cx);
+          cx.stop_propagation();
+        } else if (e.key === "s" && e.modifiers.control && !isDiff) {
           this.saveActive(cx);
           cx.stop_propagation();
         } else if (e.key === "o" && e.modifiers.control && e.modifiers.alt && !isDiff) {
@@ -357,10 +377,14 @@ export default class IdeEditor extends View {
           .when(Boolean(active && isDiff), (el) =>
             el
               .when(Boolean(active.file), (el2) =>
-                el2.child(btn("ed-open-src", "Edit File", true, (_e, cx) => openInCenterEditor({ file: active.file, root: active.root, on: active.on, line: 1 }, cx))),
+                el2.child(btn("ed-open-src", "Edit File", true, (_e, cx) => {
+                  if (this.isOverlay) this.close(cx);
+                  openInCenterEditor({ file: active.file, root: active.root, on: active.on, line: 1, direct: true }, cx);
+                })),
               )
               .child(btn("ed-diff-ref", "↻ Refresh", false, (_e, cx) => this.loadDiffTab(active, cx))),
           )
+          .when(this.isOverlay, (el) => el.child(btn("ed-esc", "Esc", false, (_e, cx) => this.close(cx))))
           .when(Boolean(active && !isDiff), (el) =>
             el
               .child(btn("ed-mode", this.editing ? "Editing" : "Read-Only", false, (_e, cx) => this.toggleMode(cx)))
