@@ -813,7 +813,7 @@ export default class IdeSidebar extends View {
     if (act.id === "open") return this.openFile(path, 1, cx);
     if (act.id === "diff") return this.showDiff(path, Boolean(p.staged), Boolean(p.untracked || p.status === "?"), cx);
     if (act.id === "resolve") {
-      return openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 32, width: 960, height: 0.82, props: { file: path } });
+      return openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90, props: { file: path } });
     }
     if (act.id === "new_file" || act.id === "new_folder") {
       this.view = "explorer";
@@ -1215,14 +1215,14 @@ export default class IdeSidebar extends View {
         .on_mouse_down("right", () => this.openScmMenu(f, kind))
         .on_click((_e, cx) => {
           if (conflict) {
-            openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 32, width: 960, height: 0.82, props: { file: f.path } });
+            openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90, props: { file: f.path } });
           } else {
             this.showDiff(f.path, staged, f.status === "?", cx);
           }
         })
         .child(div().w(12).text_size(11).font_semibold().text_color(conflict || f.status === "D" ? t.ansi1 : f.status === "A" || f.status === "?" ? t.ansi2 : t.blocked).child(f.status))
         .child(div().flex_1().min_w(0).truncate().text_size(12).child(labelOverride ?? f.path))
-        .when(conflict, (el) => el.child(actBtn("res", "Resolve", "Open 3-way merge editor", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 32, width: 960, height: 0.82, props: { file: f.path } }))))
+        .when(conflict, (el) => el.child(actBtn("res", "Resolve", "Open 3-way merge editor", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90, props: { file: f.path } }))))
         .when(staged, (el) =>
           el
             .child(actBtn("open", "↗", "Open in Editor", (_e, cx) => this.openFile(f.path, 1, cx)))
@@ -1329,7 +1329,15 @@ export default class IdeSidebar extends View {
               v_flex().id("scm-scroll").absolute().inset_0().overflow_y_scroll().p(6).gap(6)
                 .when(this.conflicts.length > 0, (el2) =>
                   el2
-                    .child(div().px(4).text_size(11).font_semibold().text_color(t.blocked).child(`MERGE CONFLICTS (${this.conflicts.length})`))
+                    .child(
+                      h_flex().px(4).gap(4).items_center()
+                        .child(div().flex_1().text_size(11).font_semibold().text_color(t.blocked).child(`MERGE CONFLICTS (${this.conflicts.length})`))
+                        .child(miniBtn("scm-merge-ed", "Merge Editor", "Open 3-Way Merge Editor (Ctrl+Alt+U)", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90 })))
+                        .child(miniBtn("scm-merge-abort", "Abort", "Abort merge", (_e, cx) => {
+                          this.confirmGit = { prompt: "Abort current merge (git merge --abort)?", args: ["merge", "--abort"], title: "Merge Aborted" };
+                          cx.notify();
+                        })),
+                    )
                     .children(this.conflicts.map((f, i) => fileRow(f, "conflict", i))),
                 )
                 .child(

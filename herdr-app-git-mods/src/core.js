@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, panes, focused, exec, theme, props, closeOverlay, notify } from "herdr";
+import { spaces, panes, focused, exec, theme, props, closeOverlay, openOverlay, notify } from "herdr";
 
 const MODES = [
   { id: "switch", label: "Switch", key: "Ctrl+Alt+C" },
@@ -380,9 +380,11 @@ export default class GitBranch extends View {
       }
       this.busy = false;
       if (res.ok) {
+        bumpGitDirty();
         notify({ title: "Git Merge", body: res.stdout || `Merged ${branch.name}`, level: "success" });
         this.close();
       } else {
+        bumpGitDirty();
         const status = await this.git(["diff", "--name-only", "--diff-filter=U"]);
         const conflicts = status.stdout ? status.stdout.split("\n").filter(Boolean) : [];
         this.result = {
@@ -394,6 +396,11 @@ export default class GitBranch extends View {
     });
   }
 
+  openMergeEditor() {
+    this.close();
+    openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90 });
+  }
+
   runMergeAbort(cx) {
     this.busy = true;
     cx.notify();
@@ -401,6 +408,7 @@ export default class GitBranch extends View {
       const res = await this.git(["merge", "--abort"]);
       this.busy = false;
       if (res.ok) {
+        bumpGitDirty();
         notify({ title: "Git Merge", body: "Merge aborted", level: "info" });
         this.close();
       } else {
@@ -625,6 +633,21 @@ export default class GitBranch extends View {
             el.child(
               h_flex()
                 .justify_end()
+                .gap(8)
+                .child(
+                  div()
+                    .id("gb-merge-resolve")
+                    .px(10)
+                    .py(5)
+                    .rounded(6)
+                    .bg(t.accent)
+                    .text_size(12)
+                    .font_semibold()
+                    .text_color("#ffffff")
+                    .cursor_pointer()
+                    .on_click(() => this.openMergeEditor())
+                    .child("Resolve Conflicts (r)"),
+                )
                 .child(
                   div()
                     .id("gb-merge-abort")
@@ -773,6 +796,11 @@ export default class GitBranch extends View {
         }
         if (k === "a" && this.result?.conflicts?.length && !this.busy) {
           this.runMergeAbort(cx);
+          cx.stop_propagation();
+          return;
+        }
+        if (k === "r" && this.result?.conflicts?.length && !this.busy) {
+          this.openMergeEditor();
           cx.stop_propagation();
           return;
         }

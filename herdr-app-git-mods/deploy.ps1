@@ -106,7 +106,7 @@ foreach ($a in $actions) {
 $meCode = Bundle-WithCommon "src\merge-editor.js"
 Deploy-Mod "merge-editor" @{
   place = "none"; title = "3-Way Merge Editor"
-  overlay = @{ kind = "popup"; at = "top"; offset = 32; width = 960; height = 0.82 }
+  overlay = @{ kind = "popup"; at = "top"; offset = 24; width = 0.76; height = 0.90 }
 } $meCode
 
 # 4. Search / Navigation Popups (Quick Open / Content Search / Replace / Symbol Search)

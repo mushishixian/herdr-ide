@@ -111,7 +111,8 @@ function getContext() {
   const on = f?.pane === null
     ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null)
     : (space?.machine ?? null);
-  const cwd = pane?.cwd || f?.cwd || tabTerm?.cwd || space?.folder || null;
+  const rawCwd = pane?.cwd || f?.cwd || tabTerm?.cwd || space?.folder || null;
+  const cwd = rawCwd ? rawCwd.replace(/ \(deleted\)$/, "") : null;
   return { cwd, on, space };
 }
 
