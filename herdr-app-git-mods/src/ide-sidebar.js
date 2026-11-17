@@ -1474,8 +1474,8 @@ export default class IdeSidebar extends View {
       .child(
         h_flex().gap(4).flex_wrap()
           .child(popBtn("ide-qo", "Files (Ctrl+Q)", "quick-open"))
-          .child(popBtn("ide-cs", "Search (Ctrl+Alt+F)", "content-search"))
-          .child(popBtn("ide-rp", "Replace (Ctrl+Alt+E)", "replace-popup"))
+          .child(popBtn("ide-cs", "Search (Ctrl+Shift+F)", "content-search"))
+          .child(popBtn("ide-rp", "Replace (Ctrl+Shift+R)", "replace-popup"))
           .child(popBtn("ide-sy", "Symbols (Ctrl+Alt+Q)", "symbol-search")),
       )
       .child(
