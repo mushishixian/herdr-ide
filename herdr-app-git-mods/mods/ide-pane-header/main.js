@@ -3,7 +3,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, props, run, home, hc } from "herdr";
+import { panes, props, run, home, hc, theme } from "herdr";
 
 // name/argv token -> icon; brand icons are colored files (image), agent.svg is a
 // one-color glyph drawn with the theme text color.
@@ -79,13 +79,14 @@ export default class IdePaneHeader extends View {
   }
 
   button(id, icon, command, args) {
+    const t = theme();
     return div()
       .id(id)
       .p(4)
       .rounded(5)
-      .text_color("#5d6168")
+      .text_color(t.dim)
       .cursor_pointer()
-      .hover((s) => s.bg("#ffffff0d").text_color("#d6d8db"))
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click((_e, cx) => {
         cx.stop_propagation();
         run(command, args);
@@ -94,6 +95,7 @@ export default class IdePaneHeader extends View {
   }
 
   render() {
+    const t = theme();
     const p = this.me();
     if (!p) return div();
     const pane = p.pane;
@@ -116,12 +118,12 @@ export default class IdePaneHeader extends View {
       .when(Boolean(icon), (el) =>
         el.child(
           tint
-            ? svg(icon).size(16).flex_none().text_color(p.focused ? "#d6d8db" : "#8b8f95")
+            ? svg(icon).size(16).flex_none().text_color(p.focused ? t.foreground : t.dim)
             : image(icon).w(16).h(16).flex_none(),
         ),
       )
-      .child(div().flex_none().max_w(320).truncate().font_semibold().text_color(p.focused ? "#e8e9eb" : "#a9adb3").child(title))
-      .child(div().flex_1().truncate().text_color("#8b8f95").child(dir))
+      .child(div().flex_none().max_w(320).truncate().font_semibold().text_color(p.focused ? t.foreground : t.muted).child(title))
+      .child(div().flex_1().truncate().text_color(t.dim).child(dir))
       .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }))
       .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }))
       .child(this.button(`th-z-${pane}`, p.zoomed ? "unzoom" : "zoom", "pane.zoom", { pane }))

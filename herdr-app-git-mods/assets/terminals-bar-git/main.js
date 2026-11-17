@@ -4,16 +4,20 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, run, theme, home, openOverlay, window as win, shared, setShared } from "herdr";
 
-const C = {
-  tray: "#1d1f22",
-  tab: "#34373c",
-  tabEdge: "#4a4d53",
-  hover: "#ffffff07",
-  edge: "#383b40",
-  chip: "#252628",
-  text: "#e8e9eb",
-  dim: "#8b8f95",
-};
+// Top-bar palette derived from the theme so it follows light/dark appearance.
+let C = null;
+function refreshColors(t) {
+  C = {
+    tray: t.chrome,
+    tab: t.selected,
+    tabEdge: t.border,
+    hover: t.hover,
+    edge: t.raised,
+    chip: t.raised,
+    text: t.foreground,
+    dim: t.muted,
+  };
+}
 
 function folder(cwd) {
   if (!cwd) return "";
@@ -107,6 +111,7 @@ function pillBtn(id, label, tip, onClick) {
 export default class TerminalsBarGit extends View {
   render() {
     const t = theme();
+    refreshColors(t);
     const space = spaces().find((p) => p.active);
     if (!space) return div();
     const curBranch = space.branch || shared("ide.branchBySpace")?.[space.id] || null;
@@ -153,7 +158,7 @@ export default class TerminalsBarGit extends View {
             .min_w(0)
             .gap(6)
             .truncate()
-            .child(div().flex_none().text_color(c.active ? C.text : "#c4c6ca").child(c.name))
+            .child(div().flex_none().text_color(c.active ? C.text : C.dim).child(c.name))
             .when(Boolean(where), (el) => el.child(div().truncate().text_color(C.dim).child(where))),
         );
     };
