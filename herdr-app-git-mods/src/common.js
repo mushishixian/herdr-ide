@@ -20,6 +20,7 @@ const DEFAULT_IDE_SETTINGS = {
   fetchSec: 60,
   coolInactiveFresh: true,
   autoRestoreFiles: false,
+  autoReveal: true,
 };
 
 function classifyFileIcon(name, isDir, isOpen) {
@@ -154,6 +155,17 @@ function recordWorkspaceSnapshot(space, root, activeView) {
   return next;
 }
 
+function publishActiveFile(file, root, on) {
+  if (!file || !root) return;
+  setShared("ide.explorer.reveal", {
+    seq: (shared("ide.explorer.reveal")?.seq ?? 0) + 1,
+    file,
+    root,
+    on: on ?? null,
+    ts: Date.now(),
+  });
+}
+
 function rememberOpenedFile(space, root, file, line) {
   if (!space || !file) return;
   const key = wsHistoryKey(space, root);
@@ -254,7 +266,7 @@ function openExternalEditor(engine, file, root, on, line) {
 }
 
 function freshLaunchBash(root, daemonName, target) {
-  return `cd '${sq(root)}' && F="$HOME/.local/share/fresh-editor/fresh"; [ -x "$F" ] || F=fresh; exec "$F" --no-upgrade-check -a '${daemonName}' '${sq(target)}'`;
+  return `cd '${sq(root)}' && export FRESH_IDE_DAEMON='${daemonName}' && F="$HOME/.local/share/fresh-editor/fresh"; [ -x "$F" ] || F=fresh; exec "$F" --no-upgrade-check -a '${daemonName}' '${sq(target)}'`;
 }
 
 async function wakeFreshDaemon(daemonName, on) {
@@ -404,6 +416,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
   const tabPanes = panes().filter((p) => !activeTab || p.tab === activeTab);
 
   rememberOpenedFile(space, root, file, line);
+  publishActiveFile(file, root, on ?? null);
 
   if (cfg.editorEngine === "vscode" || cfg.editorEngine === "zed") {
     openExternalEditor(cfg.editorEngine, file, root, on, line);

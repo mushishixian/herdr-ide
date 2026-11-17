@@ -1,5 +1,5 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list, ScrollHandle } from "gpui-base";
 import {
   spaces, panes, terminals, focused, exec, readTextFile, writeTextFile, watchFolder,
   theme, settings, openOverlay, notify, checking, appHome, window as win,
@@ -68,6 +68,16 @@ export default class IdeSidebar extends View {
     this.lastMenuSeq = shared("ide.menu.action")?.seq ?? 0;
     this.lastDirtySeq = shared("ide.git.dirtySeq") ?? 0;
     this.lastJumpSeq = shared("ide.terminalEditor.jump")?.seq ?? 0;
+    this.lastRevealSeq = shared("ide.explorer.reveal")?.seq ?? 0;
+    this.treeScroll = ScrollHandle.new();
+    this.activeFile = null;
+    this.lastAutoRevealedFile = null;
+    this.pendingRevealPath = null;
+    this.lastHerdrRevealAt = 0;
+    this.lastFreshRaw = null;
+    this.lastFreshFile = null;
+    this.probingFreshActive = false;
+    this.lastFreshProbeAt = 0;
     this.seenTabPanes = new Map();
     this.lastStatusRaw = null;
 
@@ -261,6 +271,34 @@ export default class IdeSidebar extends View {
       this.lastJumpSeq = jump.seq;
       cx.spawn(async (cx2) => execTerminalEditorJump(jump, cx2));
     }
+    const rev = shared("ide.explorer.reveal");
+    if (rev?.seq && rev.seq !== this.lastRevealSeq) {
+      this.lastRevealSeq = rev.seq;
+      this.lastHerdrRevealAt = Date.now();
+      const base = this.root || this.cwd;
+      if (base && (!rev.on || rev.on === this.on)) {
+        const rel = this.normalizeRelPath(rev.file, rev.root);
+        if (rel) {
+          this.activeFile = rel;
+          if (getIdeSettings().autoReveal !== false) {
+            this.revealFileInExplorer(rel, cx, { scroll: true, rootOverride: rev.root });
+          } else {
+            cx.notify();
+          }
+        }
+      }
+    }
+    const now = Date.now();
+    if (
+      this.view === "explorer" &&
+      !this.probingFreshActive &&
+      now - (this.lastFreshProbeAt ?? 0) >= 550 &&
+      (this.on !== null || win()?.platform !== "windows") &&
+      getIdeSettings().autoReveal !== false
+    ) {
+      this.lastFreshProbeAt = now;
+      this.probeFreshActiveFile(cx);
+    }
   }
 
   probeStatus(cx) {
@@ -399,6 +437,11 @@ export default class IdeSidebar extends View {
       this.error = null;
       this.note = null;
       this.confirmDel = null;
+      this.activeFile = null;
+      this.lastAutoRevealedFile = null;
+      this.pendingRevealPath = null;
+      this.lastFreshRaw = null;
+      this.lastFreshFile = null;
     }
     if (!cwd) return;
     if (this.view === "explorer" && !this.loadingExplorer) {
@@ -447,6 +490,16 @@ export default class IdeSidebar extends View {
           if (cfg.autoRestoreFiles && snap?.lastFiles?.length) {
             const first = snap.lastFiles[0];
             openInCenterEditor({ file: first.file, root: base, on, line: first.line ?? 1 }, cx);
+          }
+        }
+        const lastFile = snap?.lastFiles?.[0]?.file;
+        if (!this.activeFile && lastFile) {
+          const rel = this.normalizeRelPath(lastFile, base);
+          if (rel) {
+            this.activeFile = rel;
+            if (cfg.autoReveal !== false) {
+              this.revealFileInExplorer(rel, cx, { scroll: this.view === "explorer", rootOverride: base });
+            }
           }
         }
 
@@ -527,6 +580,131 @@ export default class IdeSidebar extends View {
     const base = this.root || this.cwd;
     if (!base) return;
     openInCenterEditor({ file: path, root: base, on: this.on, line: typeof line === "number" ? line : 1, direct: true }, cx);
+  }
+
+  normalizeRelPath(file, rootOverride) {
+    const base = (this.root || this.cwd || "").replace(/[\\/]+$/, "");
+    if (!file || !base) return null;
+    let raw = String(file).replace(/\\/g, "/").replace(/\/+$/, "");
+    const normBase = base.replace(/\\/g, "/");
+    if (rootOverride) {
+      const normOv = String(rootOverride).replace(/\\/g, "/").replace(/\/+$/, "");
+      if (normOv !== normBase && (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw))) return null;
+    }
+    if (raw === normBase) return null;
+    if (raw.startsWith(normBase + "/")) {
+      raw = raw.slice(normBase.length + 1);
+    } else if (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) {
+      return null;
+    }
+    raw = raw.replace(/^\.\//, "");
+    return raw || null;
+  }
+
+  async probeFreshActiveFile(cx, forceReveal = false) {
+    const base = this.root || this.cwd;
+    if (!base || this.probingFreshActive) return;
+    if (!forceReveal && Date.now() - (this.lastHerdrRevealAt ?? 0) < 800) return;
+    this.probingFreshActive = true;
+    const targetContext = this.context;
+    const targetOn = this.on;
+    const activeTab = spaces().find((s) => s.active)?.tabs?.find((t) => t.active)?.id;
+    const daemonName = activeTab ? `ide-${shortHash(`${activeTab}:${base}`)}` : "";
+    try {
+      let raw = daemonName ? await readTextFile(`/tmp/fresh-ide-active-${daemonName}.json`, { on: targetOn }).catch(() => null) : null;
+      if (!raw) raw = await readTextFile("/tmp/fresh-ide-active.json", { on: targetOn }).catch(() => null);
+      if (!raw || this.context !== targetContext) return;
+      if (!forceReveal && raw === this.lastFreshRaw) return;
+      this.lastFreshRaw = raw;
+      const data = JSON.parse(raw);
+      if (!data?.file) return;
+      const rel = this.normalizeRelPath(data.file, null);
+      if (!rel) return;
+      if (this.lastHerdrRevealAt && data.ts && data.ts < this.lastHerdrRevealAt - 200) return;
+      const changed = rel !== this.lastFreshFile || rel !== this.activeFile;
+      this.lastFreshFile = rel;
+      this.activeFile = rel;
+      if (getIdeSettings().autoReveal !== false && (changed || forceReveal)) {
+        this.revealFileInExplorer(rel, cx, { scroll: this.view === "explorer", force: forceReveal });
+      } else if (changed) {
+        cx.notify();
+      }
+    } catch {} finally {
+      this.probingFreshActive = false;
+    }
+  }
+
+  revealFileInExplorer(rawFile, cx, { scroll = true, rootOverride = null, force = false } = {}) {
+    const rel = this.normalizeRelPath(rawFile, rootOverride);
+    if (!rel) return;
+    const base = this.root || this.cwd;
+    if (!base) return;
+    this.activeFile = rel;
+    if (!force && rel === this.lastAutoRevealedFile) {
+      if (scroll && this.view === "explorer") cx.notify();
+      return;
+    }
+    this.lastAutoRevealedFile = rel;
+
+    const parts = rel.split("/").filter(Boolean);
+    const ancestors = [];
+    for (let i = 0; i < parts.length - 1; i++) {
+      ancestors.push(parts.slice(0, i + 1).join("/"));
+    }
+    let expandedAny = false;
+    for (const dir of ancestors) {
+      if (!this.folders.has(dir)) {
+        this.folders.add(dir);
+        expandedAny = true;
+      }
+    }
+    const toLoad = ["", ...ancestors].filter((f) => !this.entries.has(f) && !this.pendingFolders.has(f));
+    if (scroll) this.pendingRevealPath = rel;
+
+    if (toLoad.length === 0) {
+      if (expandedAny || scroll) cx.notify();
+      return;
+    }
+
+    const on = this.on;
+    const targetContext = this.context;
+    for (const f of toLoad) this.pendingFolders.add(f);
+    cx.spawn(async (cx2) => {
+      try {
+        const listed = await listMany(toLoad.map((f) => (f ? `${base}/${f}` : base)), on);
+        if (this.context !== targetContext) return;
+        const cfgNow = getIdeSettings();
+        toLoad.forEach((folder, idx) => {
+          const items = listed[idx] ?? [];
+          this.entries.set(
+            folder,
+            items
+              .filter((e) => cfgNow.showHidden || !e.name.startsWith("."))
+              .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)),
+          );
+        });
+      } catch {}
+      finally {
+        for (const f of toLoad) this.pendingFolders.delete(f);
+        cx2.notify();
+      }
+    });
+    cx.notify();
+  }
+
+  revealActiveNow(cx) {
+    if (this.activeFile) {
+      this.revealFileInExplorer(this.activeFile, cx, { scroll: true, force: true });
+      return;
+    }
+    const { space } = getContext();
+    const base = this.root || this.cwd;
+    const last = base ? shared("ide.ws.history")?.[wsHistoryKey(space, base)]?.lastFiles?.[0]?.file : null;
+    if (last) {
+      this.revealFileInExplorer(last, cx, { scroll: true, rootOverride: base, force: true });
+    } else {
+      this.probeFreshActiveFile(cx, true);
+    }
   }
 
   createItem(cx) {
@@ -1033,12 +1211,17 @@ export default class IdeSidebar extends View {
     const cfg = getIdeSettings();
     const base = this.root || this.cwd;
     const rows = [];
+    let activeRowIdx = -1;
     const walk = (prefix, depth) => {
-      if (rows.length >= 600 || depth > 25) return;
+      if (rows.length >= 800 || depth > 25) return;
       for (const entry of this.entries.get(prefix) ?? []) {
         const path = prefix ? `${prefix}/${entry.name}` : entry.name;
         const open = this.folders.has(path);
+        const isActive = !entry.dir && this.activeFile === path;
         const mark = cfg.gitDecorations ? this.marks[`${base}/${path}`] : null;
+        if (this.pendingRevealPath && this.pendingRevealPath === path) {
+          activeRowIdx = rows.length;
+        }
         rows.push(
           h_flex()
             .id(`ide-f-${path}`)
@@ -1050,7 +1233,8 @@ export default class IdeSidebar extends View {
             .items_center()
             .rounded(6)
             .cursor_pointer()
-            .hover((s) => s.bg(t.hover))
+            .when(isActive, (el) => el.bg(t.selected).text_color(t.foreground).font_semibold())
+            .when(!isActive, (el) => el.hover((s) => s.bg(t.hover)))
             .on_click((_e, cx) => (entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx)))
             .on_mouse_down("right", () => this.openExplorerMenu(entry, path))
             .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(11).text_color(t.dim) : div().w(11))
@@ -1084,6 +1268,14 @@ export default class IdeSidebar extends View {
       }
     };
     walk("", 0);
+    if (this.pendingRevealPath) {
+      if (activeRowIdx >= 0) {
+        this.treeScroll.scroll_to_item(activeRowIdx);
+        this.pendingRevealPath = null;
+      } else if (!this.loadingExplorer && this.pendingFolders.size === 0 && this.entries.has("")) {
+        this.pendingRevealPath = null;
+      }
+    }
 
     const tinyBtn = (id, label, active, onClick) =>
       div().id(id).px(6).py(2).rounded(4).text_size(11).text_color(active ? t.accent : t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
@@ -1100,6 +1292,8 @@ export default class IdeSidebar extends View {
           .border_b(1)
           .border_color(t.border)
           .child(div().flex_1().truncate().text_size(12).font_semibold().child(base?.split(/[\\/]/).pop() ?? "Explorer"))
+          .child(tinyBtn("ide-exp-rev", "⌖", Boolean(this.activeFile), (_e, cx) => this.revealActiveNow(cx)))
+          .child(tinyBtn("ide-exp-col", "⊟", false, (_e, cx) => { this.folders.clear(); this.pendingRevealPath = null; cx.notify(); }))
           .child(tinyBtn("ide-exp-newf", "+F", false, (_e, cx) => { this.newPrompt = "file"; this.newNameInput.focus(); cx.notify(); }))
           .child(tinyBtn("ide-exp-newd", "+D", false, (_e, cx) => { this.newPrompt = "dir"; this.newNameInput.focus(); cx.notify(); }))
           .child(tinyBtn("ide-exp-hid", ".*", cfg.showHidden, (_e, cx) => { updateIdeSettings({ showHidden: !cfg.showHidden }); this.refresh(cx); }))
@@ -1131,7 +1325,7 @@ export default class IdeSidebar extends View {
       .child(
         div().flex_1().min_h(0).relative()
           .child(
-            v_flex().id("ide-exp-tree").absolute().inset_0().overflow_y_scroll().p(4)
+            v_flex().id("ide-exp-tree").track_scroll(this.treeScroll).absolute().inset_0().overflow_y_scroll().p(4)
               .children(rows)
               .when(rows.length === 0, (el) => el.child(div().p(10).text_size(12).text_color(t.dim).child(this.error || (this.loadingExplorer ? "Loading files…" : "No files")))),
           )
@@ -1556,6 +1750,12 @@ export default class IdeSidebar extends View {
           }))
 
           .child(section("EXPLORER"))
+          .child(row("set-autoreveal", "Auto Reveal Active File", cfg.autoReveal !== false ? "On" : "Off", (_e, cx) => {
+            const next = cfg.autoReveal === false;
+            updateIdeSettings({ autoReveal: next });
+            if (next && this.activeFile) this.revealFileInExplorer(this.activeFile, cx, { scroll: true, force: true });
+            else cx.notify();
+          }))
           .child(row("set-icons", "File Icon Theme", { material: "Material", emoji: "Emoji", minimal: "Minimal" }[cfg.iconTheme] ?? cfg.iconTheme, (_e, cx) => { updateIdeSettings({ iconTheme: cycle(cfg.iconTheme, ["material", "emoji", "minimal"]) }); cx.notify(); }))
           .child(row("set-hidden", "Show Hidden Files (.)", cfg.showHidden ? "On" : "Off", (_e, cx) => { updateIdeSettings({ showHidden: !cfg.showHidden }); this.refresh(cx); }))
           .child(row("set-gitdec", "Git Decorations", cfg.gitDecorations ? "On" : "Off", (_e, cx) => { updateIdeSettings({ gitDecorations: !cfg.gitDecorations }); cx.notify(); }))
@@ -1608,6 +1808,12 @@ export default class IdeSidebar extends View {
           } else {
             if (this.view !== "settings") this.prevView = this.view;
             this.view = id;
+          }
+          if (this.view === "explorer") {
+            if (getIdeSettings().autoReveal !== false && this.activeFile) {
+              this.revealFileInExplorer(this.activeFile, cx, { scroll: true, force: true });
+            }
+            this.probeFreshActiveFile(cx, getIdeSettings().autoReveal !== false);
           }
           this.refresh(cx);
           cx.notify();

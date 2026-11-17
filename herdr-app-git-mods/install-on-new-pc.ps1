@@ -68,6 +68,10 @@ foreach ($m in $mods) {
 # 6. Optionally connect WSL2
 if ($ConnectWsl -and (Test-Path $hcExe)) {
   & $hcExe machine add --via "wsl.exe -d $WslDistro -e sh -c" --name wsl --install
+  $freshNotify = Join-Path $assetsDir "fresh-plugins\active_file_notify.ts"
+  if (Test-Path $freshNotify) {
+    Get-Content -Raw $freshNotify | wsl.exe -d $WslDistro -e sh -c 'mkdir -p "$HOME/.config/fresh/plugins" && cat > "$HOME/.config/fresh/plugins/active_file_notify.ts"'
+  }
 }
 
 Write-Host "All Herdr IDE mods and configs installed successfully!"

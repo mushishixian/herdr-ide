@@ -352,6 +352,9 @@ export default class IdeEditor extends View {
                     .when(!isAct, (el) => el.text_color(t.muted).hover((s) => s.bg(t.hover)))
                     .on_click((_e, cx) => {
                       this.activeKey = tb.key;
+                      if (tb.kind === "file" && tb.file && tb.root) {
+                        publishActiveFile(tb.file, tb.root, tb.on ?? null);
+                      }
                       this.loadTab(tb, cx);
                     })
                     .when(tb.kind === "diff", (el) => el.child(div().text_size(10.5).text_color(t.accent).child("±")))
