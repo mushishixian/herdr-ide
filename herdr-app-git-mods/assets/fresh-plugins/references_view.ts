@@ -10,8 +10,9 @@
  *   - Rows: each hit line with CONTEXT_BEFORE / CONTEXT_AFTER lines around it.
  *     Ranges that overlap or touch merge into one block; blocks of the same
  *     file are separated by a dim "···" row. Lines are shown whole.
- *   - Hit lines are highlighted and the symbol is emphasised; context lines
- *     are dimmer. Code keeps its syntax colours (setSyntaxRegions).
+ *   - Hit lines get a soft background (ui.menu_hover_bg, a theme colour that
+ *     stays quiet) and the symbol is bold and underlined; context lines are
+ *     dimmer. Code keeps its syntax colours (setSyntaxRegions).
  *   - Moving the caret previews the location in the source split, through the
  *     preview tab. Enter or a double-click opens the row and closes the panel;
  *     Esc closes and drops the preview.
@@ -25,6 +26,11 @@
  * (virtual buffer, mode keys, preview debounce, syntax regions) follow
  * lib/finder.ts (Fresh 0.5.3, see lib/SOURCE.txt); each is marked "from
  * Finder". Hot reload: context_menu.ts reloads this file when it changes.
+ *
+ * Speed: the plugin runs in QuickJS, so per-row JS work and per-call host
+ * work both cost. Files are read in one batch (open buffers use their own
+ * text), each row's styles go in its entry as inline overlays, and ASCII rows
+ * skip the byte-offset arithmetic.
  */
 
 import { byteLength } from "./lib/text.ts";
@@ -44,6 +50,8 @@ const PANEL_ID = "references_view";
 const PANEL_MODE = "references_view-results";
 const PANEL_NAMESPACE = "references_view";
 const PREVIEW_TICK = "references_view_preview_tick";
+/** Only ASCII text has byte offsets equal to its char offsets. */
+const ASCII_ONLY = /^[\x00-\x7f]*$/;
 
 type LspLocation = { file: string; line: number; column: number };
 
@@ -52,13 +60,14 @@ type CodeRow = { kind: "code"; hit: boolean; file: string; line: number; column:
 /** Title, header, separator, blank and help rows: no location. */
 type RowInfo = CodeRow | { kind: "other" };
 
-type Overlay = { start: number; end: number; style: Record<string, unknown> };
+/** A style over absolute byte offsets of the panel buffer (applied with addOverlay). */
+type Overlay = { start: number; end: number; style: Partial<OverlayOptions> };
 
 type Group = {
   file: string;
   rel: string;
   base: string;
-  /** File content, one entry per line, without the trailing CR. */
+  /** File content, one entry per line; a CR at a line's end is stripped when it is drawn. */
   lines: string[];
   /** 1-based hit line -> byte columns of the hits on it, ascending. */
   hits: Map<number, number[]>;
@@ -70,8 +79,8 @@ type Panel = {
   bufferId: number;
   splitId: number | null;
   sourceSplitId: number | null;
-  /** 1-based buffer line -> what that row is. */
-  rowAt: Map<number, RowInfo>;
+  /** 1-based buffer line -> what that row is (index 0 unused). */
+  rowAt: RowInfo[];
   cursorLine: number;
   previewNext: { file: string; line: number; column: number } | null;
   previewTimer: number | null;
@@ -82,10 +91,10 @@ type Panel = {
 
 type Rendered = {
   entries: TextPropertyEntry[];
-  /** Byte offsets, ready for addOverlay. */
   overlays: Overlay[];
   regions: TsSyntaxRegion[];
-  rowAt: Map<number, RowInfo>;
+  /** 1-based buffer line -> what that row is (index 0 unused). */
+  rowAt: RowInfo[];
   /** 1-based line and byte offset of the first hit row (0 / 0 when none). */
   firstHitLine: number;
   firstHitStart: number;
@@ -93,6 +102,22 @@ type Rendered = {
 
 const OTHER: RowInfo = { kind: "other" };
 const DIM = "editor.line_number_fg";
+const DIM_STYLE: Partial<OverlayOptions> = { fg: DIM };
+const BOLD_STYLE: Partial<OverlayOptions> = { bold: true };
+/**
+ * The hit row's background. ui.menu_hover_bg is a grey in every theme (DarkGray
+ * in builtin://terminal, where selection_bg is reverse video and
+ * current_line_bg is the terminal default, so neither can carry a tint).
+ * Syntax comments are DarkGray too, so fgOnCollisionOnly lifts a token that
+ * would vanish into the background to the editor's own foreground.
+ */
+const HIT_STYLE: Partial<OverlayOptions> = {
+  bg: "ui.menu_hover_bg",
+  fg: "editor.fg",
+  fgOnCollisionOnly: true,
+  extendToLineEnd: true,
+};
+const SYMBOL_STYLE: Partial<OverlayOptions> = { bold: true, underline: true };
 
 let panel: Panel | null = null;
 let regionStreams = 0;
@@ -134,13 +159,29 @@ function tabSize(): number {
   return DEFAULT_TAB_SIZE;
 }
 
-async function readLines(file: string): Promise<string[]> {
+/** Split file text into lines; a CR at a line's end is left for the renderer. */
+function linesOf(content: string): string[] {
+  return content ? content.split("\n") : [];
+}
+
+/** A file's lines, read whole from disk. */
+function readLines(file: string): string[] {
   try {
-    const content = await editor.readFile(editor.authorityPath(file));
-    return content ? content.split("\n").map((line) => line.replace(/\r$/, "")) : [];
+    return linesOf(editor.readFile(editor.authorityPath(file)) ?? "");
   } catch {
     return [];
   }
+}
+
+/** Open file buffers by path. */
+function openBufferIds(): Map<string, number> {
+  const ids = new Map<string, number>();
+  try {
+    for (const info of editor.listBuffers()) {
+      if (info.path && !ids.has(info.path)) ids.set(info.path, info.id);
+    }
+  } catch {}
+  return ids;
 }
 
 /** Context ranges of the hits, merged where they overlap or touch. */
@@ -179,10 +220,32 @@ async function buildGroups(locations: LspLocation[]): Promise<Group[]> {
     hits.set(loc.line, columns);
   }
 
+  for (const hits of byFile.values()) {
+    for (const columns of hits.values()) columns.sort((a, b) => a - b);
+  }
+
+  // An open buffer's text is asked for first, so its reply arrives while the
+  // other files are read. It includes unsaved edits.
+  const openIds = openBufferIds();
+  const buffered = new Map<string, Promise<string | null>>();
+  for (const file of byFile.keys()) {
+    const id = openIds.get(file);
+    if (id !== undefined) buffered.set(file, editor.getBufferText(id).catch(() => null));
+  }
+  // Other files: one readFile each. (Measured on drvfs, 62 files: readFile
+  // 111 ms, a single batched readFilePrefixes call 222 ms, so not that.)
+  const sources = new Map<string, string[]>();
+  for (const file of byFile.keys()) {
+    if (!buffered.has(file)) sources.set(file, readLines(file));
+  }
+  for (const [file, text] of buffered) {
+    const content = await text;
+    sources.set(file, content === null ? readLines(file) : linesOf(content));
+  }
+
   const groups: Group[] = [];
   for (const [file, hits] of byFile) {
-    for (const columns of hits.values()) columns.sort((a, b) => a - b);
-    const lines = await readLines(file);
+    const lines = sources.get(file) ?? [];
     groups.push({
       file,
       rel: relPath(file),
@@ -238,6 +301,7 @@ function charIndexOfByte(raw: string, byteOffset: number): number {
 /**
  * Lay out the panel as entries, with overlays and syntax regions. Each entry
  * is one buffer line, so the buffer line of a row is its entry's position.
+ * Overlays are absolute byte offsets in the panel buffer.
  */
 function renderPanel(
   kind: "references" | "implementations",
@@ -260,33 +324,35 @@ function renderPanel(
     entries: [],
     overlays: [],
     regions: [],
-    rowAt: new Map(),
+    rowAt: [OTHER],
     firstHitLine: 0,
     firstHitStart: 0,
   };
   let bytes = 0;
   let lineNo = 1;
 
-  const emit = (text: string, info: RowInfo, properties: Record<string, unknown>): number => {
+  /** Add a row (`text` with its newline). Returns the row's byte offset. */
+  const emit = (text: string, info: RowInfo, textBytes: number): number => {
     const start = bytes;
-    out.entries.push({ text, properties });
-    out.rowAt.set(lineNo, info);
-    bytes += byteLength(text);
+    out.entries.push({ text });
+    out.rowAt.push(info);
+    bytes += textBytes;
     lineNo++;
     return start;
   };
-  /** Style `text[from, to)` of the row that starts at byte `start`. */
-  const span = (
-    start: number,
+  /** Style chars [from, to) of `text`, a row that starts at byte `base`. */
+  const styleChars = (
+    base: number,
     text: string,
+    ascii: boolean,
     from: number,
     to: number,
-    style: Record<string, unknown>,
+    style: Partial<OverlayOptions>,
   ): void => {
     if (to <= from) return;
     out.overlays.push({
-      start: start + byteLength(text.slice(0, from)),
-      end: start + byteLength(text.slice(0, to)),
+      start: base + (ascii ? from : byteLength(text.slice(0, from))),
+      end: base + (ascii ? to : byteLength(text.slice(0, to))),
       style,
     });
   };
@@ -297,22 +363,36 @@ function renderPanel(
       ? `References to '${symbol}' (${hitCount})`
       : `Implementations of '${symbol}' (${hitCount})`;
   const titleText = `${title}\n`;
-  span(emit(titleText, OTHER, { type: "title" }), titleText, 0, titleText.length - 1, {
-    bold: true,
-  });
-  emit("\n", OTHER, { type: "blank" });
+  const titleAscii = ASCII_ONLY.test(titleText);
+  styleChars(
+    emit(titleText, OTHER, byteLength(titleText)),
+    titleText,
+    titleAscii,
+    0,
+    titleText.length - 1,
+    BOLD_STYLE,
+  );
+  emit("\n", OTHER, 1);
 
   for (const group of groups) {
     const headerText = `▾ ${group.base}  ${group.rel}  (${group.hits.size})\n`;
-    const header = emit(headerText, OTHER, { type: "header", file: group.file });
+    const headerAscii = ASCII_ONLY.test(headerText);
+    const headerBase = emit(headerText, OTHER, byteLength(headerText));
     const baseEnd = 2 + group.base.length;
-    span(header, headerText, 2, baseEnd, { bold: true });
-    span(header, headerText, baseEnd, headerText.length - 1, { fg: DIM });
+    styleChars(headerBase, headerText, headerAscii, 2, baseEnd, BOLD_STYLE);
+    styleChars(headerBase, headerText, headerAscii, baseEnd, headerText.length - 1, DIM_STYLE);
 
     group.blocks.forEach((block, index) => {
       if (index > 0) {
         const sepText = `${" ".repeat(width + 1)}···\n`;
-        span(emit(sepText, OTHER, { type: "sep" }), sepText, 0, sepText.length - 1, { fg: DIM });
+        styleChars(
+          emit(sepText, OTHER, byteLength(sepText)),
+          sepText,
+          true,
+          0,
+          sepText.length - 1,
+          DIM_STYLE,
+        );
       }
 
       const blockStart = bytes;
@@ -320,42 +400,47 @@ function renderPanel(
       for (const line of block) {
         const hitColumns = group.hits.get(line);
         const hit = hitColumns !== undefined;
-        const raw = group.lines[line - 1] ?? "";
-        const code = expandTabs(raw, size);
+        let raw = group.lines[line - 1] ?? "";
+        if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+        const rawAscii = ASCII_ONLY.test(raw);
+        const display = raw.indexOf("\t") >= 0 ? expandTabs(raw, size) : null;
+        const code = display ? display.text : raw;
         const gutter = gutterOf(line);
-        const text = `${gutter}${code.text}\n`;
+        const text = `${gutter}${code}\n`;
+        // The gutter's "│" is 3 bytes, so a row is not ASCII even when its code is.
+        // Char offsets in the code map to bytes by the gutter's byte length.
+        const gutterLen = gutter.length;
+        const gutterBytes = byteLength(gutter);
+        const byteAt = (index: number): number =>
+          index <= gutterLen
+            ? byteLength(gutter.slice(0, index))
+            : gutterBytes + (rawAscii ? index - gutterLen : byteLength(code.slice(0, index - gutterLen)));
         const column = hitColumns?.[0] ?? 1;
         const info: CodeRow = { kind: "code", hit, file: group.file, line, column };
-        const start = emit(text, info, {
-          type: "code",
-          hit,
-          file: group.file,
-          line,
-          column,
-        });
-        if (hit && out.firstHitLine === 0) {
-          out.firstHitLine = lineNo - 1;
-          out.firstHitStart = start;
-        }
-
-        const body = text.length - 1;
+        const textBytes = gutterBytes + (rawAscii ? code.length : byteLength(code)) + 1;
+        const base = emit(text, info, textBytes);
+        const styleRow = (from: number, to: number, style: Partial<OverlayOptions>): void => {
+          if (to > from) {
+            out.overlays.push({ start: base + byteAt(from), end: base + byteAt(to), style });
+          }
+        };
         if (hit) {
-          span(start, text, 0, body, { bg: "editor.selection_bg", extendToLineEnd: true });
-          span(start, text, 0, gutter.length, { bold: true });
-          for (const col of hitColumns ?? []) {
-            const at = charIndexOfByte(raw, col - 1);
+          styleRow(0, text.length - 1, HIT_STYLE);
+          styleRow(0, gutterLen, BOLD_STYLE);
+          for (const col of hitColumns) {
+            const at = rawAscii ? col - 1 : charIndexOfByte(raw, col - 1);
             if (symbol && raw.startsWith(symbol, at)) {
-              span(
-                start,
-                text,
-                gutter.length + code.map[at],
-                gutter.length + code.map[at + symbol.length],
-                { bold: true, underline: true },
-              );
+              const from = display ? display.map[at] : at;
+              const to = display ? display.map[at + symbol.length] : at + symbol.length;
+              styleRow(gutterLen + from, gutterLen + to, SYMBOL_STYLE);
             }
           }
+          if (out.firstHitLine === 0) {
+            out.firstHitLine = lineNo - 1;
+            out.firstHitStart = base;
+          }
         } else {
-          span(start, text, 0, gutter.length, { fg: DIM });
+          styleRow(0, gutterLen, DIM_STYLE);
         }
       }
       // One syntax region per block: its rows are consecutive source lines,
@@ -370,9 +455,16 @@ function renderPanel(
     });
   }
 
-  emit("\n", OTHER, { type: "blank" });
+  emit("\n", OTHER, 1);
   const helpText = "Enter / double-click: open  ·  Esc: close\n";
-  span(emit(helpText, OTHER, { type: "help" }), helpText, 0, helpText.length - 1, { fg: DIM });
+  styleChars(
+    emit(helpText, OTHER, byteLength(helpText)),
+    helpText,
+    ASCII_ONLY.test(helpText),
+    0,
+    helpText.length - 1,
+    DIM_STYLE,
+  );
 
   return out;
 }
@@ -439,7 +531,7 @@ function closePanel(): void {
 
 /** Enter or double-click on a row: open its location and close the panel. */
 function openRow(p: Panel, line: number): void {
-  const row = p.rowAt.get(line);
+  const row = p.rowAt[line];
   if (!row || row.kind !== "code") return;
   commitPreview(p);
   closePanel();
@@ -452,7 +544,9 @@ async function showLocations(
   symbol: string,
   locations: LspLocation[],
 ): Promise<void> {
+  const t0 = Date.now();
   const groups = locations.length === 0 ? [] : await buildGroups(locations);
+  const t1 = Date.now();
   if (groups.length === 0) {
     editor.setStatus(
       kind === "references"
@@ -467,6 +561,7 @@ async function showLocations(
   const sourceSplitId = panel?.sourceSplitId ?? editor.getActiveSplitId();
   closePanel();
   const rendered = renderPanel(kind, symbol, groups, tabSize());
+  const t2 = Date.now();
 
   const result = await editor.createVirtualBufferInSplit({
     name: kind === "references" ? "*References*" : "*Implementations*",
@@ -481,6 +576,7 @@ async function showLocations(
     showCursors: true,
     editingDisabled: true,
   });
+  const t3 = Date.now();
   if (result.bufferId === null) {
     editor.setStatus("Failed to open panel");
     return;
@@ -500,14 +596,19 @@ async function showLocations(
   };
   panel = p;
   editor.setSyntaxRegions(p.bufferId, rendered.regions);
+  // After the regions: the highlighter paints a row's gutter (the region's
+  // prefix) and would overwrite a style set on it through the entry.
   for (const o of rendered.overlays) {
     editor.addOverlay(p.bufferId, PANEL_NAMESPACE, o.start, o.end, o.style);
   }
 
-  const first = rendered.rowAt.get(rendered.firstHitLine);
+  const first = rendered.rowAt[rendered.firstHitLine];
   if (first && first.kind === "code") schedulePreview(p, first);
   const hits = groups.reduce((n, group) => n + group.hits.size, 0);
   editor.setStatus(`${hits} hit${hits !== 1 ? "s" : ""} in ${groups.length} file${groups.length !== 1 ? "s" : ""}`);
+  editor.debug(
+    `references_view: ${locations.length} locations in ${groups.length} files: read ${t1 - t0} ms, render ${t2 - t1} ms, panel ${t3 - t2} ms`,
+  );
 }
 
 registerHandler(
@@ -577,7 +678,7 @@ registerHandler(
       }
       return;
     }
-    const row = p.rowAt.get(data.line);
+    const row = p.rowAt[data.line];
     if (row && row.kind === "code") schedulePreview(p, row);
   },
 );
