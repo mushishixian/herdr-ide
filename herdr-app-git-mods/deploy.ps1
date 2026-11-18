@@ -1,3 +1,5 @@
+param([string]$WslDistro = "ubuntu")
+
 $ErrorActionPreference = "Stop"
 $herdrMods = "$env:USERPROFILE\.config\herdr-app\mods"
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -145,6 +147,13 @@ Deploy-Mod "ide-menu" @{
   place = "none"; title = "Menu"
 } $menuCode
 
+# 7b. Terminal right-click menu (layout root "terminal_menu"): Fresh items + herdr pane items
+$tmCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\ide-term-menu.js"), $utf8NoBom)
+Deploy-Mod "ide-term-menu" @{
+  place = "none"; title = "Terminal Menu"
+  overlay = @{ width = 260; height = 520 }
+} $tmCode
+
 # 8. Top bar for terminals-git layout & larger Toast notifications
 $tbCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\terminals-bar-git.js"), $utf8NoBom)
 Deploy-Mod "terminals-bar-git" $null $tbCode
@@ -185,3 +194,41 @@ Deploy-Mod "spaces-ide" $null $spCode
 # 11. Pane header with a per-agent icon (replaces the shipped terminals-pane)
 $phCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\ide-pane-header\main.js"), $utf8NoBom)
 Deploy-Mod "ide-pane-header" @{ place = "none"; title = "Pane Header" } $phCode
+
+# 12. Layout root "terminal_menu" (text edit, idempotent; no JSON rewrite)
+function Set-TerminalMenuKey($path, $mod) {
+  if (-not (Test-Path $path)) { return }
+  $text = [System.IO.File]::ReadAllText($path, $utf8NoBom)
+  if ($text -match '"terminal_menu"\s*:') { Write-Host "terminal_menu already set: $path"; return }
+  $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $rx = [regex]'(?m)^([ \t]*)"id": "root",(?=\r?$)'
+  if (-not $rx.IsMatch($text)) { Write-Warning "no root id line in $path"; return }
+  $new = $rx.Replace($text, { param($m) $m.Value + $nl + $m.Groups[1].Value + '"terminal_menu": "' + $mod + '",' }, 1)
+  [System.IO.File]::WriteAllText($path, $new, $utf8NoBom)
+  Write-Host "Added terminal_menu to $path"
+}
+$appHome = "$env:USERPROFILE\.config\herdr-app"
+# herdr-app hot-reloads a changed layout file and rebuilds its panes (closing running
+# terminals), so only edit layouts while the app is closed.
+$layoutsToFix = @("terminals-git.json", "ide.json") | ForEach-Object { Join-Path $appHome "layouts\$_" } |
+  Where-Object { (Test-Path $_) -and -not ([System.IO.File]::ReadAllText($_) -match '"terminal_menu"\s*:') }
+if ($layoutsToFix -and (Get-Process herdr-app -ErrorAction SilentlyContinue)) {
+  Write-Warning "herdr-app is running: terminal_menu not added to layouts (editing them would rebuild open panes). Close herdr-app and run deploy.ps1 again."
+} else {
+  foreach ($path in $layoutsToFix) { Set-TerminalMenuKey $path "ide-term-menu" }
+}
+
+# 13. Fresh plugins into WSL ~/.config/fresh/plugins (every assets\fresh-plugins\*.ts)
+$freshDir = Join-Path $repoRoot "assets\fresh-plugins"
+if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+  Write-Host "wsl.exe not found: Fresh plugins not copied (copy assets\fresh-plugins\*.ts to ~/.config/fresh/plugins/ in WSL)."
+} else {
+  $OutputEncoding = New-Object System.Text.UTF8Encoding $false  # pipe to wsl.exe as UTF-8, not ASCII
+  foreach ($plugin in Get-ChildItem -Path $freshDir -Filter *.ts -File -ErrorAction SilentlyContinue) {
+    # A symlink with the same name is someone's dotfiles link: leave it alone.
+    # No double quotes in the script: Windows PowerShell 5.1 mangles them in native args.
+    $cmd = 'd=$HOME/.config/fresh/plugins; f=$d/$1; mkdir -p $d && { [ -L $f ] && echo skip symlink $f >&2 || cat > $f; }'
+    Get-Content -Raw -Encoding UTF8 $plugin.FullName | wsl.exe -d $WslDistro -e sh -c $cmd sh $plugin.Name
+    Write-Host "Fresh plugin: $($plugin.Name)"
+  }
+}

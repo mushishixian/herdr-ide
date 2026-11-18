@@ -176,10 +176,7 @@ export default class IdeSidebar extends View {
             enforceTabEditorOrderAndMouse(activeTab, cfg);
           } else {
             for (const p of panes().filter((x) => x.tab === activeTab && x.terminal && isEditorPane(x, null))) {
-              const term = terminals().find((t) => t.address === p.terminal);
-              if (term && term.labels?.["herdr.right-click"] !== "program") {
-                run("terminal.right_click", { terminal: p.terminal, to: "program" });
-              }
+              syncEditorRightClick(p);
             }
           }
           const edRoot = this.root || this.cwd || space.folder;

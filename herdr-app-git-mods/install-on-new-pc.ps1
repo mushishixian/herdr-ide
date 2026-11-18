@@ -53,7 +53,7 @@ foreach ($f in $bundleFiles) {
 }
 
 # 4. Validate all deployed mods
-$mods = @("git-branch","git-merge","git-rename","git-new","git-pull","git-push","git-sync","git-undo","git-ai-commit","git-ai-sync","git-line-history","git-history","merge-editor","ide-pane-header","quick-open","content-search","replace-popup","symbol-search","ide-sidebar","ide-editor","ide-menu","ide-recent","ide-toast","spaces-ide","terminals-bar-git","git-status")
+$mods = @("git-branch","git-merge","git-rename","git-new","git-pull","git-push","git-sync","git-undo","git-ai-commit","git-ai-sync","git-line-history","git-history","merge-editor","ide-pane-header","quick-open","content-search","replace-popup","symbol-search","ide-sidebar","ide-editor","ide-menu","ide-term-menu","ide-recent","ide-toast","spaces-ide","terminals-bar-git","git-status")
 foreach ($m in $mods) {
   $dir = Join-Path $herdrHome "mods\$m"
   if (Test-Path $dir) {
@@ -68,9 +68,10 @@ foreach ($m in $mods) {
 # 6. Optionally connect WSL2
 if ($ConnectWsl -and (Test-Path $hcExe)) {
   & $hcExe machine add --via "wsl.exe -d $WslDistro -e sh -c" --name wsl --install
-  $freshNotify = Join-Path $assetsDir "fresh-plugins\active_file_notify.ts"
-  if (Test-Path $freshNotify) {
-    Get-Content -Raw $freshNotify | wsl.exe -d $WslDistro -e sh -c 'mkdir -p "$HOME/.config/fresh/plugins" && cat > "$HOME/.config/fresh/plugins/active_file_notify.ts"'
+  $OutputEncoding = New-Object System.Text.UTF8Encoding $false  # pipe to wsl.exe as UTF-8, not ASCII
+  # Every Fresh plugin in assets\fresh-plugins (the context menu and the explorer's reveal).
+  foreach ($plugin in Get-ChildItem -Path (Join-Path $assetsDir "fresh-plugins") -Filter *.ts -File -ErrorAction SilentlyContinue) {
+    Get-Content -Raw -Encoding UTF8 $plugin.FullName | wsl.exe -d $WslDistro -e sh -c 'd=$HOME/.config/fresh/plugins; mkdir -p $d && cat > $d/$1' sh $plugin.Name
   }
 }
 

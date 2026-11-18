@@ -203,13 +203,41 @@ function isEditorPane(p, trackedPaneId) {
   if (!p) return false;
   if (trackedPaneId && p.pane === trackedPaneId) return true;
   if (p.mod === "ide-editor") return true;
-  const prog = (p.program?.name || p.program?.id || "").toLowerCase();
-  const title = (p.title || "").toLowerCase();
-  return prog === "fresh" || prog === "nvim" || prog === "hx" || title.includes("fresh") || title.includes("nvim");
+  // Decide by the program when herdr knows it: an agent (Claude Code etc.) is never the
+  // editor, even if its title mentions "fresh" (closing it as a duplicate kills the agent).
+  if (p.program) return !p.program.agent && editorEngineOf(p) !== "";
+  // No program info: Fresh titles end with " — Fresh".
+  return / — fresh$/i.test(p.title || "");
+}
+
+// "fresh" | "nvim" | "hx" for a terminal editor pane, else "". Program.key is the table key
+// ("nvim", or "program" when unlisted); Program.name is the label or the process name.
+function editorEngineOf(p) {
+  for (const v of [p?.program?.key, p?.program?.name]) {
+    const s = String(v || "").toLowerCase();
+    if (s === "fresh") return "fresh";
+    if (s === "nvim" || s === "neovim") return "nvim";
+    if (s === "hx" || s === "helix") return "hx";
+  }
+  return "";
 }
 
 function findNonEditorTerminal(tabPanes, trackedId) {
   return tabPanes.find((p) => p.terminal && !isEditorPane(p, trackedId)) ?? tabPanes.find((p) => !isEditorPane(p, trackedId));
+}
+
+// Sets where an editor pane's right-clicks go: Fresh -> "menu" (ide-term-menu runs Fresh
+// actions through context_menu.ts), Nvim/Helix -> "program". Only runs the command when the
+// terminal's current mode differs, so calling it every tick is cheap and does not flap.
+function syncEditorRightClick(p) {
+  if (!p?.terminal) return;
+  const term = terminals().find((t) => t.address === p.terminal);
+  if (!term) return;
+  const engine = editorEngineOf(p) || String(term.foreground?.name || "").toLowerCase();
+  const to = engine === "fresh" ? "menu" : "program";
+  if ((term.labels?.["herdr.right-click"] ?? "menu") !== to) {
+    run("terminal.right_click", { terminal: p.terminal, to });
+  }
 }
 
 function enforceTabEditorOrderAndMouse(tabId, cfg) {
@@ -226,13 +254,11 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
     setShared("ide.editor.paneByTab", paneMap);
   }
 
-  // Automatically enable direct right-click context menu on terminal editors (Fresh / Nvim).
-  if (edPane.terminal) {
-    const term = terminals().find((t) => t.address === edPane.terminal);
-    if (term && term.labels?.["herdr.right-click"] !== "program") {
-      run("terminal.right_click", { terminal: edPane.terminal, to: "program" });
-    }
-  }
+  // Terminal editors take right-clicks themselves. The engine is the pane's program name
+  // (editorEngineOf: "fresh", "nvim", "hx"). Fresh goes to herdr's
+  // terminal menu ("menu": the ide-term-menu mod, layout root terminal_menu), so its items
+  // can run Fresh actions. Nvim/Helix keep "program", so the program gets the right-click.
+  syncEditorRightClick(edPane);
 
   // Keep Editor left/top of AI Agent & shell panes so AI Agent stays on the right.
   if (cfg.editorPlacement === "center-left" || cfg.editorPlacement === "center-top") {

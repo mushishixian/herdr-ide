@@ -1,5 +1,6 @@
 {
   "id": "root",
+  "terminal_menu": "ide-term-menu",
   "cloned_from": {
     "name": "terminals",
     "version": "0.1.16"
