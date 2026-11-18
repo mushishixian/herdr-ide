@@ -75,21 +75,18 @@ export default class GitQuickAction extends View {
       if (this.action === "undo") {
         this.status = "Undoing last commit (soft reset)…";
         cx.notify();
-        const head = await this.git(["rev-parse", "--short", "HEAD"], this.root, on);
-        const subj = await this.git(["log", "-1", "--pretty=%s"], this.root, on);
-        const r = await this.git(["reset", "--soft", "HEAD~1"], this.root, on);
-        if (r.ok) {
-          bumpGitDirty();
+        const res = await undoLastCommit(this.root, on);
+        if (res.ok) {
           notify({
             title: "Undo Last Commit",
-            body: `Reset ${head.out} (${subj.out}). Changes kept staged.\nRecover: git reset --soft ${head.out}`,
+            body: res.detail,
             level: "info",
             timeout: 4500,
           });
           this.done = true;
           this.close();
         } else {
-          this.error = r.err || r.out || "git reset --soft HEAD~1 failed";
+          this.error = res.error;
           notify({ title: "Undo Failed", body: this.error, level: "error", timeout: 4500 });
           cx.notify();
         }

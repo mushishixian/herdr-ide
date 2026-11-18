@@ -900,6 +900,30 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
   };
 }
 
+async function undoLastCommit(root, on) {
+  const git = async (args) => {
+    const r = await exec("git", args, { cwd: root, on });
+    return { ok: r.code === 0, out: (r.stdout ?? "").trim(), err: (r.stderr ?? "").trim() };
+  };
+  const head = await git(["rev-parse", "--short", "HEAD"]);
+  if (!head.ok || !head.out) {
+    return { ok: false, error: head.err || "Repository has no commits yet." };
+  }
+  const subj = await git(["log", "-1", "--pretty=%s"]);
+  const hasParent = await git(["rev-parse", "--verify", "-q", "HEAD~1"]);
+  const r = hasParent.ok
+    ? await git(["reset", "--soft", "HEAD~1"])
+    : await git(["update-ref", "-d", "HEAD"]);
+  if (!r.ok) {
+    return { ok: false, error: r.err || r.out || "git reset --soft HEAD~1 failed" };
+  }
+  bumpGitDirty();
+  const detail = hasParent.ok
+    ? `Reset ${head.out} (${subj.out}). Changes kept staged.\nRecover: git reset --soft ${head.out}`
+    : `Uncommitted initial commit ${head.out} (${subj.out}). Changes kept staged.`;
+  return { ok: true, hash: head.out, subj: subj.out, isInitial: !hasParent.ok, detail };
+}
+
 async function saveText(absPath, content, prevRaw, on) {
   if (!on) {
     await writeTextFile(absPath, content, prevRaw);

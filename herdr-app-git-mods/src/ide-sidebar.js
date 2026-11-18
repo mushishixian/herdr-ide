@@ -506,7 +506,7 @@ export default class IdeSidebar extends View {
     });
   }
 
-  refresh(cx) {
+  refresh(cx, opts = {}) {
     if (!checking()) this.syncWorkPane();
     const { cwd, on, space } = getContext();
     const k = locationKey();
@@ -535,6 +535,14 @@ export default class IdeSidebar extends View {
       this.loading = false;
       this.loadingExplorer = false;
       this.probing = false;
+    } else if (opts?.force) {
+      this.loadSeq += 1;
+      this.loading = false;
+      this.probing = false;
+      if (this.view === "explorer") {
+        this.explorerSeq += 1;
+        this.loadingExplorer = false;
+      }
     }
     if (!cwd) return;
     if (this.view === "explorer" && !this.loadingExplorer) {
@@ -1167,24 +1175,59 @@ export default class IdeSidebar extends View {
       : null;
     cx.notify();
     cx.spawn(async (cx) => {
-      if (args.length === 1 && (args[0] === "pull" || args[0] === "push" || args[0] === "sync")) {
-        const res = await runGitSyncWithUpstream(args[0], this.root, this.on);
+      try {
+        if (args.length === 1 && (args[0] === "pull" || args[0] === "push" || args[0] === "sync")) {
+          const res = await runGitSyncWithUpstream(args[0], this.root, this.on);
+          if (!res.ok) this.note = res.detail;
+          this.refresh(cx, { force: true });
+          return;
+        }
+        const r = await exec("git", args, { cwd: this.root, on: this.on });
+        if (r.code !== 0) {
+          this.note = (r.stderr || r.stdout || "git command failed").trim();
+          if (title) notify({ title: `${title} Failed`, body: this.note, level: "error", timeout: 4500 });
+        } else {
+          bumpGitDirty();
+          if (title) notify({ title, body: r.stdout.trim() || r.stderr.trim() || "Done", level: "success", timeout: 4500 });
+        }
+        this.refresh(cx, { force: true });
+      } catch (e) {
+        this.note = String(e?.message ?? e);
+        if (title) notify({ title: `${title} Failed`, body: this.note, level: "error", timeout: 4500 });
+        cx.notify();
+      } finally {
         this.busy = false;
         this.syncLabel = null;
-        if (!res.ok) this.note = res.detail;
-        this.refresh(cx);
-        return;
+        cx.notify();
       }
-      const r = await exec("git", args, { cwd: this.root, on: this.on });
-      this.busy = false;
-      this.syncLabel = null;
-      if (r.code !== 0) {
-        this.note = (r.stderr || r.stdout || "git command failed").trim();
-        if (title) notify({ title: `${title} Failed`, body: this.note, level: "error", timeout: 4500 });
-      } else if (title) {
-        notify({ title, body: r.stdout.trim() || r.stderr.trim() || "Done", level: "success", timeout: 4500 });
+    });
+  }
+
+  runUndoLastCommit(cx) {
+    if (!this.root || this.busy) return;
+    this.busy = true;
+    this.note = null;
+    this.syncLabel = "Undoing…";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await undoLastCommit(this.root, this.on);
+        if (res.ok) {
+          notify({ title: "Undo Last Commit", body: res.detail, level: "info", timeout: 4500 });
+        } else {
+          this.note = res.error;
+          notify({ title: "Undo Failed", body: this.note, level: "error", timeout: 4500 });
+        }
+        this.refresh(cx, { force: true });
+      } catch (e) {
+        this.note = String(e?.message ?? e);
+        notify({ title: "Undo Failed", body: this.note, level: "error", timeout: 4500 });
+        cx.notify();
+      } finally {
+        this.busy = false;
+        this.syncLabel = null;
+        cx.notify();
       }
-      this.refresh(cx);
     });
   }
 
@@ -1208,25 +1251,31 @@ export default class IdeSidebar extends View {
     this.note = null;
     cx.notify();
     cx.spawn(async (cx) => {
-      if (this.staged.length === 0) {
-        const add = await exec("git", ["add", "-A"], { cwd: this.root, on: this.on });
-        if (add.code !== 0) {
-          this.busy = false;
-          this.note = add.stderr;
-          cx.notify();
-          return;
+      try {
+        if (this.staged.length === 0) {
+          const add = await exec("git", ["add", "-A"], { cwd: this.root, on: this.on });
+          if (add.code !== 0) {
+            this.note = (add.stderr || add.stdout || "git add failed").trim();
+            cx.notify();
+            return;
+          }
         }
-      }
-      const r = await exec("git", ["commit", "-m", msg], { cwd: this.root, on: this.on });
-      this.busy = false;
-      if (r.code === 0) {
-        this.message = "";
-        this.commitInput.set_value("");
-        notify({ title: "Git Commit", body: msg, level: "success" });
-        this.refresh(cx);
-      } else {
-        this.note = (r.stderr || r.stdout).trim();
+        const r = await exec("git", ["commit", "-m", msg], { cwd: this.root, on: this.on });
+        if (r.code === 0) {
+          this.message = "";
+          this.commitInput.set_value("");
+          bumpGitDirty();
+          notify({ title: "Git Commit", body: msg, level: "success" });
+          this.refresh(cx, { force: true });
+        } else {
+          this.note = (r.stderr || r.stdout).trim();
+          cx.notify();
+        }
+      } catch (e) {
+        this.note = String(e?.message ?? e);
         cx.notify();
+      } finally {
+        this.busy = false;
       }
     });
   }
@@ -1493,7 +1542,7 @@ export default class IdeSidebar extends View {
     const cfg = getIdeSettings();
     const base = this.root || this.cwd;
     const miniBtn = (id, label, tip, onClick) =>
-      div().id(id).px(6).py(2).rounded(4).text_size(11).text_color(t.muted).cursor_pointer().tooltip(tip).hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
+      div().id(id).flex_none().h(20).px(6).flex().items_center().justify_center().rounded(4).text_size(11).text_color(t.muted).cursor_pointer().tooltip(tip).hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
 
     const fileRow = (f, kind, idx, labelOverride) => {
       const staged = kind === "staged";
@@ -1653,12 +1702,24 @@ export default class IdeSidebar extends View {
               .child(miniBtn("scm-pull", this.behind > 0 ? `↓${this.behind}` : "↓", "Pull (Ctrl+Alt+P)", (_e, cx) => this.runGit(["pull"], "Git Pull", cx)))
               .child(miniBtn("scm-push", this.ahead > 0 ? `↑${this.ahead}` : "↑", "Push (Ctrl+Alt+K)", (_e, cx) => this.runGit(["push"], "Git Push", cx))),
           )
-          .child(miniBtn("scm-undo", "↶", "Undo last commit (Ctrl+Alt+Z)", (_e, cx) => this.runGit(["reset", "--soft", "HEAD~1"], "Undo Commit", cx)))
-          .child(miniBtn("scm-ref", "↻", "Refresh", (_e, cx) => this.refresh(cx))),
+          .child(miniBtn("scm-undo", "↶", "Undo last commit (Ctrl+Alt+Z)", (_e, cx) => this.runUndoLastCommit(cx)))
+          .child(miniBtn("scm-ref", "↻", "Refresh", (_e, cx) => this.refresh(cx, { force: true }))),
       )
       .when(!this.root, (el) => el.child(div().p(12).text_color(t.dim).child("Not a git repository")))
       .when(Boolean(this.root), (el) =>
         el
+          .when(Boolean(this.confirmGit), (el2) =>
+            el2.child(
+              h_flex().mx(4).mt(4).p(7).gap(6).items_center().rounded(6).bg(t.raised).border_1().border_color(t.blocked)
+                .child(div().flex_1().truncate().text_size(11.5).child(this.confirmGit.prompt))
+                .child(miniBtn("scm-git-yes", "Confirm", "Run git action", (_e, cx) => {
+                  const g = this.confirmGit;
+                  this.confirmGit = null;
+                  this.runGit(g.args, g.title, cx);
+                }))
+                .child(miniBtn("scm-git-no", "Cancel", "Cancel", (_e, cx) => { this.confirmGit = null; cx.notify(); })),
+            ),
+          )
           .child(
             div().flex_1().min_h(0).relative().child(
               v_flex().id("scm-scroll").absolute().inset_0().overflow_y_scroll().p(4).gap(1)
@@ -1693,18 +1754,6 @@ export default class IdeSidebar extends View {
                         .child(miniBtn("scm-stash-all", "Stash", "Stash all changes (git stash push -u)", (_e, cx) => this.runGit(["stash", "push", "-u"], "Stashed All", cx)))
                         .child(miniBtn("scm-stage-all", "+ All", "Stage all (git add -A)", (_e, cx) => this.runGit(["add", "-A"], null, cx))),
                     ),
-                )
-                .when(Boolean(this.confirmGit), (el2) =>
-                  el2.child(
-                    h_flex().p(8).gap(6).items_center().rounded(6).bg(t.raised).border_1().border_color(t.blocked)
-                      .child(div().flex_1().truncate().text_size(11.5).child(this.confirmGit.prompt))
-                      .child(miniBtn("scm-git-yes", "Confirm", "Run git action", (_e, cx) => {
-                        const g = this.confirmGit;
-                        this.confirmGit = null;
-                        this.runGit(g.args, g.title, cx);
-                      }))
-                      .child(miniBtn("scm-git-no", "Cancel", "Cancel", (_e, cx) => { this.confirmGit = null; cx.notify(); })),
-                  ),
                 )
                 .children(renderGroup(this.unstaged, "unstaged"))
                 .child(
