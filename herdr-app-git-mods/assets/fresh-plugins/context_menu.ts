@@ -609,8 +609,11 @@ async function on_request(path: string): Promise<void> {
   } catch {}
 }
 
-async function on_path_changed(ev: { path: string }): Promise<void> {
+async function on_path_changed(ev: { path: string; kind?: string }): Promise<void> {
   try {
+    // Linux notify-rs watches emit IN_OPEN/IN_CLOSE ("other") whenever we read a
+    // watched file; skip those so readFile/readDir cannot re-trigger this hook.
+    if (ev.kind !== "modify" && ev.kind !== "create" && ev.kind !== "rename") return;
     if (ev.path === selfPath) {
       reloadIfChanged();
       return;
