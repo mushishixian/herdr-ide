@@ -234,6 +234,9 @@ function syncEditorRightClick(p) {
   const term = terminals().find((t) => t.address === p.terminal);
   if (!term) return;
   const engine = editorEngineOf(p) || String(term.foreground?.name || "").toLowerCase();
+  // context_menu.ts switches Fresh between "menu" (text area) and "program" (tab bar, menu
+  // bar, explorer) as the pointer moves, and marks the terminal ide.fresh-ctx: leave it be.
+  if (engine === "fresh" && term.labels?.["ide.fresh-ctx"]) return;
   const to = engine === "fresh" ? "menu" : "program";
   if ((term.labels?.["herdr.right-click"] ?? "menu") !== to) {
     run("terminal.right_click", { terminal: p.terminal, to });

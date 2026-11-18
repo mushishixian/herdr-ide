@@ -227,7 +227,8 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
   foreach ($plugin in Get-ChildItem -Path $freshDir -Filter *.ts -File -ErrorAction SilentlyContinue) {
     # A symlink with the same name is someone's dotfiles link: leave it alone.
     # No double quotes in the script: Windows PowerShell 5.1 mangles them in native args.
-    $cmd = 'd=$HOME/.config/fresh/plugins; f=$d/$1; mkdir -p $d && { [ -L $f ] && echo skip symlink $f >&2 || cat > $f; }'
+    # Written to a temp file, then renamed: context_menu.ts hot-reloads on change and must never see half a file.
+    $cmd = 'd=$HOME/.config/fresh/plugins; f=$d/$1; t=$d/.$1.tmp; mkdir -p $d && { [ -L $f ] && echo skip symlink $f >&2 || { cat > $t && mv -f $t $f; }; }'
     Get-Content -Raw -Encoding UTF8 $plugin.FullName | wsl.exe -d $WslDistro -e sh -c $cmd sh $plugin.Name
     Write-Host "Fresh plugin: $($plugin.Name)"
   }

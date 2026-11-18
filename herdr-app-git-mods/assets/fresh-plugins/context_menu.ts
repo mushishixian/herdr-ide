@@ -11,6 +11,16 @@
  *     inside the current selection, as in VS Code) and the action runs.
  *
  * Zero timers: a non-recursive directory watch wakes the plugin.
+ *
+ * Pointer routing: herdr sends a right-click to Fresh ("program") only where
+ * Fresh has its own menus (menu bar, tab bars, explorer, status bar, popups)
+ * and to herdr's menu ("menu") over a normal file's text. On every mouse move
+ * the plugin decides the region and, only when it changes, relabels the
+ * terminal with `hc label` (one process at a time, latest mode wins).
+ *
+ * Ctrl+click: go to definition, or references when the click is on the
+ * definition itself (LSP). Needs the mouse_click modifier "ctrl", which
+ * Fresh 0.5.3 does not report (only "shift" arrives), so it is inert there.
  */
 const editor = getEditor();
 
@@ -54,11 +64,27 @@ type Pointer = {
 
 type Calibration = { gutter: number; digits: number };
 
+type Mode = "menu" | "program";
+type Loc = {
+  uri: string;
+  range: LspRange;
+  jump: LspRange;
+};
+type LspPos = { line: number; character: number };
+type LspRange = { start: LspPos; end: LspPos };
+
 let daemonKey = "";
 let latestPointer: Pointer | null = null;
 const snapshots = new Map<string, Pointer>();
 const calibrations = new Map<number, Calibration>();
 let lastHandled = "";
+
+// Right-click routing state (see pumpMode).
+let desiredMode: Mode | null = null;
+let appliedMode: Mode | null = null;
+let hcBusy = false;
+let clientCache: { pid: string; terminal: string } | null = null;
+let navSeq = 0;
 
 /** Daemon name: FRESH_IDE_DAEMON, else --session-name from our cmdline. */
 function deriveKey(): string {
@@ -199,6 +225,146 @@ async function calibrateFromClick(ev: MouseClickHookArgs): Promise<void> {
   calibrations.set(ev.buffer_id, { gutter, digits: digitsOf(info.line_count) });
 }
 
+/** argv of a process from /proc, or null when it is gone or unreadable. */
+function argvOf(pid: string): string[] | null {
+  try {
+    const raw = editor.readFile(`/proc/${pid}/cmdline`);
+    if (!raw) return null;
+    return raw.split("\u0000").filter((s) => s.length > 0);
+  } catch {
+    return null;
+  }
+}
+
+/** A Fresh client attached to our daemon (`fresh ... -a <daemonKey> file`), not a server. */
+function isAttachedClient(argv: string[] | null): boolean {
+  if (!argv || argv.length === 0) return false;
+  if ((argv[0].split("/").pop() ?? "") !== "fresh") return false;
+  if (argv.includes("--server")) return false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === `--attach=${daemonKey}`) return true;
+    if ((argv[i] === "-a" || argv[i] === "--attach") && argv[i + 1] === daemonKey) return true;
+  }
+  return false;
+}
+
+function terminalOf(pid: string): string | null {
+  try {
+    const raw = editor.readFile(`/proc/${pid}/environ`);
+    if (!raw) return null;
+    for (const kv of raw.split("\u0000")) {
+      if (kv.startsWith("HC_TERMINAL_ID=")) {
+        const id = kv.slice("HC_TERMINAL_ID=".length);
+        return id || null;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * The herdr terminal this editor is shown in. The server's own HC_TERMINAL_ID
+ * can be stale (the server outlives the pane it was started from), so prefer
+ * the attached client's. Newest matching client wins when several exist.
+ */
+function attachedClientTerminal(): string | null {
+  if (clientCache) {
+    if (isAttachedClient(argvOf(clientCache.pid))) return clientCache.terminal;
+    clientCache = null;
+  }
+  let pids: string[] = [];
+  try {
+    pids = editor
+      .readDir("/proc")
+      .map((e) => e.name)
+      .filter((n) => /^\d+$/.test(n))
+      .sort((a, b) => Number(b) - Number(a));
+  } catch {
+    return null;
+  }
+  for (const pid of pids) {
+    if (!isAttachedClient(argvOf(pid))) continue;
+    const terminal = terminalOf(pid);
+    if (terminal) {
+      clientCache = { pid, terminal };
+      return terminal;
+    }
+  }
+  return null;
+}
+
+function terminalId(): string | null {
+  const fromClient = attachedClientTerminal();
+  if (fromClient) return fromClient;
+  try {
+    return editor.getEnv("HC_TERMINAL_ID") || null;
+  } catch {
+    return null;
+  }
+}
+
+function hcPath(): string {
+  try {
+    const home = editor.getEnv("HOME");
+    if (home) return `${home}/.local/bin/hc`;
+  } catch {}
+  return "hc";
+}
+
+/**
+ * Apply desiredMode with `hc label` when it differs from the mode last sent.
+ * One process at a time: a change during a run is applied when it finishes.
+ */
+function pumpMode(): void {
+  if (hcBusy || desiredMode === null || desiredMode === appliedMode) return;
+  const terminal = terminalId();
+  if (!terminal) return;
+  const mode = desiredMode;
+  appliedMode = mode;
+  hcBusy = true;
+  const done = (): void => {
+    hcBusy = false;
+    pumpMode();
+  };
+  try {
+    const handle = editor.spawnProcess(hcPath(), [
+      "label",
+      terminal,
+      mode === "program" ? "herdr.right-click=program" : "herdr.right-click=",
+      "ide.fresh-ctx=1",
+    ]);
+    handle.result.then(done, done);
+  } catch {
+    done();
+  }
+}
+
+/** Screen cell → split whose text area (below its tab bar) holds it, else null. */
+function splitAtText(ev: Pointer): SplitSnapshot | null {
+  // The hook gives content_x/content_y = the text origin of the pane under the
+  // pointer (tab bar row excluded, scrollbar excluded), or 0/0 outside any pane.
+  if (ev.content_y < 1) return null;
+  for (const s of editor.listSplits()) {
+    if (s.x !== ev.content_x) continue;
+    if (ev.content_y <= s.y || ev.content_y > s.y + s.height) continue;
+    return ev.column - ev.content_x < s.viewport.width ? s : null;
+  }
+  return null;
+}
+
+/** "menu" over a normal file's text, "program" everywhere else. */
+function wantedMode(ev: Pointer): Mode {
+  try {
+    const split = splitAtText(ev);
+    if (!split) return "program";
+    const info = editor.getBufferInfo(split.bufferId);
+    if (!info || info.is_virtual || info.is_terminal) return "program";
+    return "menu";
+  } catch {
+    return "program";
+  }
+}
+
 function on_mouse_move(ev: Pointer): void {
   try {
     latestPointer = {
@@ -207,7 +373,16 @@ function on_mouse_move(ev: Pointer): void {
       content_x: ev.content_x,
       content_y: ev.content_y,
     };
+    const mode = wantedMode(ev);
+    if (mode !== desiredMode) {
+      desiredMode = mode;
+      pumpMode();
+    }
   } catch {}
+}
+
+function hasCtrl(ev: MouseClickHookArgs): boolean {
+  return typeof ev.modifiers === "string" && /ctrl|control/i.test(ev.modifiers);
 }
 
 function on_mouse_click(ev: MouseClickHookArgs): void {
@@ -221,6 +396,7 @@ function on_mouse_click(ev: MouseClickHookArgs): void {
       };
     }
     void calibrateFromClick(ev).catch(() => {});
+    if (ev.button === "left" && hasCtrl(ev)) void ctrlNavigate(ev);
   } catch {}
 }
 
@@ -256,6 +432,119 @@ async function placeCursor(p: Pointer | null): Promise<void> {
     if (pos >= lo && pos <= hi) return;
   }
   editor.setBufferCursor(bufferId, pos);
+}
+
+/** Byte offset within `line` of the UTF-16 index `units` (LSP character). */
+function byteColForUtf16(line: string, units: number): number {
+  let u = 0;
+  let bytes = 0;
+  for (const ch of line) {
+    if (u >= units) break;
+    const cp = ch.codePointAt(0) ?? 0;
+    u += cp > 0xffff ? 2 : 1;
+    bytes += utf8Len(cp);
+  }
+  return bytes;
+}
+
+/** Location | Location[] | LocationLink[] | null → plain locations. */
+function normalizeLocations(res: unknown): Loc[] {
+  if (!res) return [];
+  const out: Loc[] = [];
+  for (const r of Array.isArray(res) ? res : [res]) {
+    if (!r || typeof r !== "object") continue;
+    const o = r as Record<string, unknown>;
+    if (typeof o.targetUri === "string") {
+      const range = (o.targetRange ?? o.targetSelectionRange) as LspRange | undefined;
+      const jump = (o.targetSelectionRange ?? o.targetRange) as LspRange | undefined;
+      if (range && jump) out.push({ uri: o.targetUri, range, jump });
+    } else if (typeof o.uri === "string" && o.range) {
+      const range = o.range as LspRange;
+      out.push({ uri: o.uri, range, jump: range });
+    }
+  }
+  return out;
+}
+
+function posLeq(a: LspPos, b: LspPos): boolean {
+  return a.line < b.line || (a.line === b.line && a.character <= b.character);
+}
+
+function rangeHas(r: LspRange, p: LspPos): boolean {
+  return posLeq(r.start, p) && posLeq(p, r.end);
+}
+
+/** Open a location at its start (LSP line and UTF-16 character). */
+function jumpTo(loc: Loc): void {
+  const path = editor.fileUriToPath(loc.uri);
+  const line = loc.jump.start.line;
+  const text = editor.readFile(path) ?? "";
+  const lineText = stripEol(text.split("\n")[line] ?? "");
+  const col = byteColForUtf16(lineText, loc.jump.start.character);
+  editor.openFile(path, line + 1, col + 1);
+}
+
+/**
+ * Ctrl+click: definition elsewhere → lsp_goto_definition; on the definition
+ * (or none found) → references: one jumps, several open Fresh's list.
+ */
+async function ctrlNavigate(ev: MouseClickHookArgs): Promise<void> {
+  const seq = ++navSeq;
+  try {
+    if (ev.buffer_id == null || ev.buffer_row == null || ev.buffer_col == null) return;
+    const bufferId = ev.buffer_id;
+    const info = editor.getBufferInfo(bufferId);
+    if (!info || !info.path || info.is_virtual || info.is_terminal) return;
+    if (info.line_count == null || !info.language) return;
+
+    const start = await editor.getLineStartPosition(ev.buffer_row);
+    const end = await editor.getLineEndPosition(ev.buffer_row);
+    if (start == null || end == null) return;
+    const lineText = stripEol(await editor.getBufferText(bufferId, start, end));
+    if (ev.buffer_col > end - start) return;
+
+    // Fresh already moved the caret; make sure it is there and that no extra cursor remains.
+    if (editor.getAllCursors().length > 1) editor.executeAction("remove_secondary_cursors");
+    const bytePos = start + ev.buffer_col;
+    if (editor.getCursorPosition() !== bytePos) editor.setBufferCursor(bufferId, bytePos);
+
+    const uri = editor.pathToFileUri(info.path);
+    const position: LspPos = {
+      line: ev.buffer_row,
+      character: prefixByBytes(lineText, ev.buffer_col).length,
+    };
+    const defs = normalizeLocations(
+      await editor.sendLspRequest(info.language, "textDocument/definition", {
+        textDocument: { uri },
+        position,
+      }),
+    );
+    if (seq !== navSeq) return;
+
+    const onDefinition = defs.some(
+      (d) => editor.fileUriToPath(d.uri) === info.path && rangeHas(d.jump, position),
+    );
+    if (defs.length > 0 && !onDefinition) {
+      editor.executeAction("lsp_goto_definition");
+      return;
+    }
+
+    const refs = normalizeLocations(
+      await editor.sendLspRequest(info.language, "textDocument/references", {
+        textDocument: { uri },
+        position,
+        context: { includeDeclaration: false },
+      }),
+    );
+    if (seq !== navSeq) return;
+    if (refs.length === 0) editor.setStatus("No references");
+    else if (refs.length === 1) jumpTo(refs[0]);
+    else editor.executeAction("lsp_references");
+  } catch {
+    try {
+      editor.executeAction("lsp_goto_definition");
+    } catch {}
+  }
 }
 
 async function on_request(path: string): Promise<void> {
@@ -319,14 +608,49 @@ async function on_request(path: string): Promise<void> {
 
 async function on_path_changed(ev: { path: string }): Promise<void> {
   try {
+    if (ev.path === selfPath) {
+      reloadIfChanged();
+      return;
+    }
     await on_request(ev.path);
   } catch {}
+}
+
+/**
+ * Hot reload: a deploy that rewrites this file reloads the plugin in the
+ * running daemon, so no Fresh restart is needed. Content is compared to what
+ * was loaded, so the burst of events from one write reloads at most once.
+ */
+const selfPath = (() => {
+  try {
+    return `${editor.getConfigDir().replace(/\/+$/, "")}/plugins/context_menu.ts`;
+  } catch {
+    return "";
+  }
+})();
+let selfSource: string | null = null;
+let reloading = false;
+
+function reloadIfChanged(): void {
+  if (!selfPath || reloading || selfSource === null) return;
+  const now = editor.readFile(selfPath);
+  if (!now || now === selfSource) return;
+  reloading = true;
+  editor.reloadPlugin("context_menu").catch(() => {
+    reloading = false;
+  });
 }
 
 async function startWatch(): Promise<void> {
   try {
     await editor.spawnProcess("mkdir", ["-p", CTX_DIR]).result;
     await editor.watchPath(CTX_DIR);
+  } catch {}
+  try {
+    if (selfPath) {
+      selfSource = editor.readFile(selfPath);
+      await editor.watchPath(selfPath.slice(0, selfPath.lastIndexOf("/")));
+    }
   } catch {}
 }
 
