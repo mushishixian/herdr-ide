@@ -1,26 +1,30 @@
 // Recent files of the active tab's project (ide.ws.history, recorded by the
 // sidebar's openInCenterEditor on every open, any engine). Opened with
 // mod.open on ctrl-tab — top-centre, like every editor's switcher. Ctrl-tab
-// again cycles the selection via <mod>.<command>; Enter or a click reopens.
+// again cycles the selection via <mod>.<command>; releasing all modifiers
+// immediately jumps to the selected file (Enter or click also works).
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, props, theme, closeOverlay, checking, shared, setShared, nextCommand } from "herdr";
 
 export default class IdeRecent extends View {
   init(_p, cx) {
-    this.at = 0;
+    const { files, hasOpenEditor } = this.data();
+    this.at = hasOpenEditor && files.length > 1 ? 1 : 0;
     this.scroll = 0;
+    this.closed = false;
     this.handle = cx.focus_handle();
     if (checking()) return;
     this.handle.focus();
-    cx.timer.after(400, () => this.handle.focus());
+    cx.timer.after(40, () => { if (!this.closed) this.handle.focus(); });
+    cx.timer.after(400, () => { if (!this.closed) this.handle.focus(); });
     setShared("ide.recent.overlay", props()?.overlay ?? null);
     cx.spawn(async (cx2) => {
       for (;;) {
         const cmd = await nextCommand();
         if (cmd === "cycle") {
-          const files = this.data()?.files ?? [];
-          if (files.length) this.at = (this.at + 1) % files.length;
+          const curFiles = this.data()?.files ?? [];
+          if (curFiles.length) this.at = (this.at + 1) % curFiles.length;
         }
         cx2.notify();
       }
@@ -36,18 +40,28 @@ export default class IdeRecent extends View {
     const editorPane = tabPanes.find((p) => isEditorPane(p, shared("ide.editor.paneByTab")?.[tab?.id]));
     const root = editorPane?.cwd || space?.folder || "";
     const files = shared("ide.ws.history")?.[wsHistoryKey(space, root)]?.lastFiles ?? [];
-    return { files, root, on: space?.machine ?? null, title: root.split(/[\\/]/).filter(Boolean).pop() ?? "" };
+    return {
+      files,
+      root,
+      on: space?.machine ?? null,
+      title: root.split(/[\\/]/).filter(Boolean).pop() ?? "",
+      hasOpenEditor: Boolean(editorPane),
+    };
   }
 
   async close(_cx) {
+    if (this.closed) return;
+    this.closed = true;
     setShared("ide.recent.overlay", null);
     closeOverlay(props()?.overlay);
   }
 
   open(i, cx) {
+    if (this.closed) return;
     const { files, root, on } = this.data();
     const f = files[i];
-    if (!f) return;
+    if (!f) return this.close(cx);
+    this.closed = true;
     setShared("ide.recent.overlay", null);
     closeOverlay(props()?.overlay);
     openInCenterEditor({ file: f.file, root, on, line: f.line ?? 1, direct: true }, cx);
@@ -119,6 +133,22 @@ export default class IdeRecent extends View {
         cx.stop_propagation();
         cx.notify();
       })
+      .on_modifiers_changed((e, cx) => {
+        const m = e?.modifiers;
+        if (!m) return;
+        if (!m.control && !m.shift && !m.alt && !m.platform && !m.function) {
+          this.open(this.at, cx);
+        }
+      })
+      .on_key_up((e, cx) => {
+        const k = (e?.key || "").toLowerCase();
+        const m = e?.modifiers;
+        if (!m) return;
+        const isModKey = k === "control" || k === "shift" || k === "alt" || k === "super" || k === "meta" || k === "platform";
+        if (isModKey && !m.control && !m.shift && !m.alt && !m.platform && !m.function) {
+          this.open(this.at, cx);
+        }
+      })
       .child(
         h_flex()
           .items_center()
@@ -170,7 +200,7 @@ export default class IdeRecent extends View {
           .gap(8)
           .text_size(11)
           .text_color(t.dim)
-          .child(div().flex_1().truncate().child("↑↓ select · Enter open · Ctrl+Tab next · Esc close"))
+          .child(div().flex_1().truncate().child("Ctrl+Tab cycle · Release Ctrl to open · ↑↓ select · Esc close"))
           .when(files.length > 0, (el) => el.child(div().flex_none().child(`${files.length} file${files.length === 1 ? "" : "s"}`))),
       );
   }

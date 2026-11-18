@@ -249,19 +249,29 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
   if (!tabPanes.length) return false;
   const paneMap = { ...(shared("ide.editor.paneByTab") ?? {}) };
   const trackedId = paneMap[tabId] ?? null;
-  const edPane = tabPanes.find((p) => isEditorPane(p, trackedId));
+
+  const spawning = shared("ide.editor.spawning");
+  const spawningHere = spawning && spawning.tab === tabId && Date.now() - spawning.at < 4000 && Array.isArray(spawning.beforeIds);
+  const spawnedEd = spawningHere ? tabPanes.find((p) => !spawning.beforeIds.includes(p.pane)) : null;
+
+  const edPane = spawnedEd ?? tabPanes.find((p) => isEditorPane(p, trackedId));
   if (!edPane) return false;
 
   if (paneMap[tabId] !== edPane.pane) {
     paneMap[tabId] = edPane.pane;
     setShared("ide.editor.paneByTab", paneMap);
   }
+  if (spawnedEd) {
+    setShared("ide.editor.spawning", { tab: tabId, at: spawning.at });
+  }
 
   // Terminal editors take right-clicks themselves. The engine is the pane's program name
   // (editorEngineOf: "fresh", "nvim", "hx"). Fresh goes to herdr's
   // terminal menu ("menu": the ide-term-menu mod, layout root terminal_menu), so its items
   // can run Fresh actions. Nvim/Helix keep "program", so the program gets the right-click.
-  syncEditorRightClick(edPane);
+  if (!spawnedEd || editorEngineOf(edPane) !== "") {
+    syncEditorRightClick(edPane);
+  }
 
   // Keep Editor left/top of AI Agent & shell panes so AI Agent stays on the right.
   if (cfg.editorPlacement === "center-left" || cfg.editorPlacement === "center-top") {
@@ -278,17 +288,18 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
 function swapToCenter(cfg, cx, tabId) {
   const targetTab = tabId || spaces().find((s) => s.active)?.tabs?.find((t) => t.active)?.id;
   if (!targetTab) return;
-  enforceTabEditorOrderAndMouse(targetTab, cfg);
+  if (enforceTabEditorOrderAndMouse(targetTab, cfg)) return;
   if (cx?.spawn) {
     cx.spawn(async (asyncCx) => {
-      for (const waitMs of [120, 260, 550]) {
+      for (const waitMs of [16, 40, 80, 160, 350]) {
         await asyncCx.sleep(waitMs);
-        enforceTabEditorOrderAndMouse(targetTab, cfg);
+        if (enforceTabEditorOrderAndMouse(targetTab, cfg)) return;
       }
     });
   } else if (cx?.timer?.after) {
-    cx.timer.after(180, () => enforceTabEditorOrderAndMouse(targetTab, cfg));
-    cx.timer.after(550, () => enforceTabEditorOrderAndMouse(targetTab, cfg));
+    for (const waitMs of [20, 70, 180, 380]) {
+      cx.timer.after(waitMs, () => enforceTabEditorOrderAndMouse(targetTab, cfg));
+    }
   }
 }
 
@@ -523,7 +534,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
     }
     if (targetPane) {
       const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-      setShared("ide.editor.spawning", { tab: activeTab, at: Date.now() });
+      setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
       run("pane.split", {
         direction: dir,
         pane: targetPane.pane,
@@ -560,7 +571,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
     }
     if (targetPane) {
       const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-      setShared("ide.editor.spawning", { tab: activeTab, at: Date.now() });
+      setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
       run("pane.split", {
         direction: dir,
         pane: targetPane.pane,
@@ -593,11 +604,11 @@ function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd,
   }
   if (targetPane) {
     const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-    setShared("ide.editor.spawning", { tab: activeTab, at: Date.now() });
+    setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
     run("pane.split", { direction: dir, pane: targetPane.pane, mod: "ide-editor", props: payload });
     swapToCenter(cfg, cx);
   } else {
-    setShared("ide.editor.spawning", { tab: activeTab, at: Date.now() });
+    setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
     run("pane.split", { direction: "right", mod: "ide-editor", props: payload });
   }
 }

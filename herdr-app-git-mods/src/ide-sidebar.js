@@ -356,6 +356,10 @@ export default class IdeSidebar extends View {
         }
       }
     }
+    const spawning = shared("ide.editor.spawning");
+    if (spawning?.beforeIds && Date.now() - spawning.at < 3000) {
+      enforceTabEditorOrderAndMouse(spawning.tab, getIdeSettings());
+    }
     const now = Date.now();
     if (
       this.view === "explorer" &&
