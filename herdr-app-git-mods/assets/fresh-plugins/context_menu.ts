@@ -12,6 +12,9 @@
  *
  * Zero timers: a non-recursive directory watch wakes the plugin.
  *
+ * It also keeps references_view.ts (and its lib/*.ts) loaded and current: a
+ * deploy that writes them loads or reloads them in the running daemon.
+ *
  * Pointer routing: herdr sends a right-click to Fresh ("program") only where
  * Fresh has its own menus (menu bar, tab bars, explorer, status bar, popups)
  * and to herdr's menu ("menu") over a normal file's text. On every mouse move
@@ -612,6 +615,11 @@ async function on_path_changed(ev: { path: string }): Promise<void> {
       reloadIfChanged();
       return;
     }
+    if (isRefsEvent(ev.path)) {
+      await ensureLibWatch();
+      await syncRefs(false);
+      return;
+    }
     await on_request(ev.path);
   } catch {}
 }
@@ -621,13 +629,14 @@ async function on_path_changed(ev: { path: string }): Promise<void> {
  * running daemon, so no Fresh restart is needed. Content is compared to what
  * was loaded, so the burst of events from one write reloads at most once.
  */
-const selfPath = (() => {
+const pluginsDir = (() => {
   try {
-    return `${editor.getConfigDir().replace(/\/+$/, "")}/plugins/context_menu.ts`;
+    return `${editor.getConfigDir().replace(/\/+$/, "")}/plugins`;
   } catch {
     return "";
   }
 })();
+const selfPath = pluginsDir ? `${pluginsDir}/context_menu.ts` : "";
 let selfSource: string | null = null;
 let reloading = false;
 
@@ -641,6 +650,103 @@ function reloadIfChanged(): void {
   });
 }
 
+/**
+ * references_view.ts follows the same rule. Its fingerprint is its own text
+ * plus the lib/*.ts it imports, so one change to either coalesces into one
+ * reload. A reload is started only when the fingerprint differs from the last
+ * one applied, and never while another is in flight (the change is queued).
+ */
+const refsPath = pluginsDir ? `${pluginsDir}/references_view.ts` : "";
+const libDir = pluginsDir ? `${pluginsDir}/lib` : "";
+let refsSource: string | null = null;
+let refsBusy = false;
+let refsPending = false;
+let libWatched = false;
+
+function refsFingerprint(): string | null {
+  let main: string | null = null;
+  try {
+    main = editor.readFile(refsPath);
+  } catch {}
+  if (main === null || main === undefined) return null;
+  let names: string[] = [];
+  try {
+    names = editor
+      .readDir(libDir)
+      .map((e) => e.name)
+      .filter((n) => n.endsWith(".ts") && !n.startsWith("."))
+      .sort();
+  } catch {}
+  let out = main;
+  for (const name of names) {
+    let text: string | null = null;
+    try {
+      text = editor.readFile(`${libDir}/${name}`);
+    } catch {}
+    out += `\u0000${name}\u0000${text ?? ""}`;
+  }
+  return out;
+}
+
+function isRefsEvent(path: string): boolean {
+  if (!refsPath) return false;
+  if (path === refsPath || path === libDir) return true;
+  return path.endsWith(".ts") && path.slice(0, path.lastIndexOf("/")) === libDir;
+}
+
+async function ensureLibWatch(): Promise<void> {
+  if (libWatched || !libDir) return;
+  try {
+    await editor.watchPath(libDir);
+    libWatched = true;
+  } catch {}
+}
+
+async function refsLoaded(): Promise<boolean> {
+  const plugins = await editor.listPlugins();
+  return plugins.some((p) => p.name === "references_view");
+}
+
+/**
+ * Load references_view.ts if it is not loaded, else reload it, when its
+ * fingerprint differs from the last one applied. At startup (`startup`), a
+ * loaded copy is kept as it is and only a missing one is loaded.
+ */
+async function syncRefs(startup: boolean): Promise<void> {
+  if (!refsPath) return;
+  if (refsBusy) {
+    refsPending = true;
+    return;
+  }
+  refsBusy = true;
+  try {
+    do {
+      refsPending = false;
+      const fp = refsFingerprint();
+      if (fp === null) break;
+      const loaded = await refsLoaded();
+      if (startup && loaded) {
+        refsSource = fp;
+        break;
+      }
+      if (fp === refsSource) break;
+      refsSource = fp;
+      if (loaded) {
+        await editor.reloadPlugin("references_view");
+        editor.debug("context_menu: references_view reloaded");
+      } else {
+        await editor.loadPlugin(refsPath);
+        editor.debug("context_menu: references_view loaded");
+      }
+      startup = false;
+    } while (refsPending);
+  } catch (e) {
+    editor.debug(`context_menu: references_view sync failed: ${e}`);
+  } finally {
+    refsBusy = false;
+  }
+}
+
 async function startWatch(): Promise<void> {
   try {
     await editor.spawnProcess("mkdir", ["-p", CTX_DIR]).result;
@@ -649,16 +755,22 @@ async function startWatch(): Promise<void> {
   try {
     if (selfPath) {
       selfSource = editor.readFile(selfPath);
-      await editor.watchPath(selfPath.slice(0, selfPath.lastIndexOf("/")));
+      await editor.watchPath(pluginsDir);
     }
   } catch {}
+  await ensureLibWatch();
+  await syncRefs(true);
 }
 
 daemonKey = deriveKey();
 registerHandler("context_menu_mouse_move", on_mouse_move);
 registerHandler("context_menu_mouse_click", on_mouse_click);
 registerHandler("context_menu_path_changed", on_path_changed);
+registerHandler("context_menu_plugins_loaded", () => {
+  void syncRefs(true);
+});
 editor.on("mouse_move", "context_menu_mouse_move");
 editor.on("mouse_click", "context_menu_mouse_click");
 editor.on("path_changed", "context_menu_path_changed");
+editor.on("plugins_loaded", "context_menu_plugins_loaded");
 void startWatch();

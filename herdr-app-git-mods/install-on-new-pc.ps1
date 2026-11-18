@@ -69,6 +69,11 @@ foreach ($m in $mods) {
 if ($ConnectWsl -and (Test-Path $hcExe)) {
   & $hcExe machine add --via "wsl.exe -d $WslDistro -e sh -c" --name wsl --install
   $OutputEncoding = New-Object System.Text.UTF8Encoding $false  # pipe to wsl.exe as UTF-8, not ASCII
+  # lib\*.ts first: references_view.ts imports them. Same atomic copy as deploy.ps1 step 13.
+  $libCmd = 'd=$HOME/.config/fresh/plugins/lib; f=$d/$1; t=$d/.$1.tmp; mkdir -p $d && { [ -L $f ] && echo skip symlink $f >&2 || { cat > $t && mv -f $t $f; }; }'
+  foreach ($lib in Get-ChildItem -Path (Join-Path (Join-Path $assetsDir "fresh-plugins") "lib") -Filter *.ts -File -ErrorAction SilentlyContinue) {
+    Get-Content -Raw -Encoding UTF8 $lib.FullName | wsl.exe -d $WslDistro -e sh -c $libCmd sh $lib.Name
+  }
   # Every Fresh plugin in assets\fresh-plugins (the context menu and the explorer's reveal).
   foreach ($plugin in Get-ChildItem -Path (Join-Path $assetsDir "fresh-plugins") -Filter *.ts -File -ErrorAction SilentlyContinue) {
     Get-Content -Raw -Encoding UTF8 $plugin.FullName | wsl.exe -d $WslDistro -e sh -c 'd=$HOME/.config/fresh/plugins; mkdir -p $d && cat > $d/$1' sh $plugin.Name

@@ -1,0 +1,1 @@
+copied from Fresh 0.5.3 embedded-plugins/lib; refresh on Fresh upgrade

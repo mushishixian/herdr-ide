@@ -224,6 +224,12 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
   Write-Host "wsl.exe not found: Fresh plugins not copied (copy assets\fresh-plugins\*.ts to ~/.config/fresh/plugins/ in WSL)."
 } else {
   $OutputEncoding = New-Object System.Text.UTF8Encoding $false  # pipe to wsl.exe as UTF-8, not ASCII
+  # lib\*.ts first: references_view.ts imports them, so it must never load without them.
+  $libCmd = 'd=$HOME/.config/fresh/plugins/lib; f=$d/$1; t=$d/.$1.tmp; mkdir -p $d && { [ -L $f ] && echo skip symlink $f >&2 || { cat > $t && mv -f $t $f; }; }'
+  foreach ($lib in Get-ChildItem -Path (Join-Path $freshDir "lib") -Filter *.ts -File -ErrorAction SilentlyContinue) {
+    Get-Content -Raw -Encoding UTF8 $lib.FullName | wsl.exe -d $WslDistro -e sh -c $libCmd sh $lib.Name
+    Write-Host "Fresh plugin lib: $($lib.Name)"
+  }
   foreach ($plugin in Get-ChildItem -Path $freshDir -Filter *.ts -File -ErrorAction SilentlyContinue) {
     # A symlink with the same name is someone's dotfiles link: leave it alone.
     # No double quotes in the script: Windows PowerShell 5.1 mangles them in native args.
