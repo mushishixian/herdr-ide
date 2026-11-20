@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, agents, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, agents, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, playSound, notify, settings } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -93,17 +93,17 @@ function detectAgentLabel(tabPanes, spaceAgents) {
   return null;
 }
 
+const SPIN_CHARS = "\u2800-\u28FF\u25D0-\u25D3◐◓◑◒✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋";
+const SPIN_TITLE = new RegExp(`^\\s*[${SPIN_CHARS}]`, "u");
+
 function isKnownCliAgent(p) {
-  const prog = `${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
+  const prog = `${p.program?.key || ""} ${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
   const title = (p.title || "").toLowerCase();
   if (prog.includes("fresh") || prog.includes("nvim") || title.includes("— fresh") || title.includes(" - fresh")) return false;
   if (/cmdc|command[- ]?code|codebuddy|cbc|claude|codex|gemini|opencode|dsh|aider/.test(prog)) return true;
-  if (/command code|codebuddy|claude|codex|gemini|opencode|aider|^⌘\s|^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/.test(title)) return true;
+  if (/command code|codebuddy|\bcbc\b|claude|codex|gemini|opencode|aider|^⌘\s/.test(title) || SPIN_TITLE.test(p.title || "")) return true;
   return Boolean(p.program && !p.program.shell);
 }
-
-// Spinners are not just braille: CodeBuddy/Claude spin ✶ ✹ ✳ …, so match any of them.
-const SPIN_CHARS = "\u2800-\u28FF\u25D0-\u25D3◐◓◑◒✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋";
 const SPIN_LINE = new RegExp(`^\\s*[${SPIN_CHARS}]\\s*\\S.*(?:…|\\.\\.\\.)`, "u");
 // A live status line such as "✹ Tidying… (101s · running REPL · Task running for a while)".
 const WORKING_TEXT = /\(\s*\d+s\s*·|\b\d+s\s*·\s*(?:running|working|thinking|waiting)\b|Task running for a while|\brunning (?:REPL|command|tool|tools|task|tasks)\b/i;
@@ -116,8 +116,8 @@ function classifyAgentOutput(raw, prevInfo, now) {
 
   const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel/i.test(lines.slice(-8).join("\n"));
   const hasWorkingLine = lines.slice(-8).some((l) => SPIN_LINE.test(l) || WORKING_TEXT.test(l));
-  const promptLine = /^[❯›>]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|)[.…\s]*$/;
-  const atPrompt = lines.slice(-4).some((l) => promptLine.test(l)) && !hasWorkingLine && !hasInterruptHint;
+  const promptLine = /^[❯›>]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|输入.*|)[.…\s]*$/;
+  const atPrompt = lines.slice(-6).some((l) => promptLine.test(l)) && !hasWorkingLine && !hasInterruptHint;
   const isBlocked =
     !atPrompt &&
     /\b(allow once|allow for this session|do you want to|approve|reject|select an option|press enter to confirm)\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/i.test(lines.slice(-10).join("\n"));
@@ -187,15 +187,17 @@ export default class Spaces extends View {
     const targets = [];
     const tabToSpace = new Map();
     for (const s of sp) {
-      if (s.status) continue;
       for (const t of s.tabs ?? []) tabToSpace.set(t.id, s);
     }
     for (const p of ps) {
       if (!p.terminal || p.status) continue;
       const s = tabToSpace.get(p.tab);
       if (!s) continue;
-      if (isKnownCliAgent(p) || this.termAgent[p.terminal]) {
-        targets.push({ spaceId: s.id, active: s.active && p.focused, terminal: p.terminal });
+      if (isKnownCliAgent(p)) {
+        const label = p.program?.name || p.program?.key || "Agent";
+        targets.push({ spaceId: s.id, spaceName: s.name || base(s.folder || "") || "Space", active: s.active && p.focused, terminal: p.terminal, label });
+      } else {
+        delete this.termAgent[p.terminal];
       }
     }
     if (!targets.length) {
@@ -211,6 +213,8 @@ export default class Spaces extends View {
         const now = Date.now();
         const nextSpace = {};
         const rank = { blocked: 4, working: 3, done: 2, idle: 1 };
+        const winActive = Boolean(window()?.active);
+        const soundsOn = settings()?.sounds?.enabled !== false;
         await Promise.all(
           targets.slice(0, 12).map(async (tg) => {
             try {
@@ -218,8 +222,21 @@ export default class Spaces extends View {
               if (r.code !== 0) return;
               const prev = this.termAgent[tg.terminal];
               const info = classifyAgentOutput(r.stdout, prev, now);
-              if (tg.active && info.status === "done") info.status = "idle";
+              const becameDone = prev?.rawStatus === "working" && info.rawStatus === "idle" && info.status === "done";
+              const becameBlocked = prev?.rawStatus !== "blocked" && info.rawStatus === "blocked";
+              if (tg.active && winActive && info.status === "done") info.status = "idle";
               this.termAgent[tg.terminal] = info;
+              if (becameDone) {
+                if (soundsOn) playSound("done");
+                if (!tg.active || !winActive) {
+                  notify({ title: `${tg.label} 完成`, body: tg.spaceName, level: "success", timeout: 4000 });
+                }
+              } else if (becameBlocked) {
+                if (soundsOn) playSound("blocked");
+                if (!tg.active || !winActive) {
+                  notify({ title: `${tg.label} 等待确认`, body: tg.spaceName, level: "warning", timeout: 5000 });
+                }
+              }
               const cur = nextSpace[tg.spaceId];
               if (!cur || (rank[info.status] ?? 0) > (rank[cur] ?? 0)) {
                 nextSpace[tg.spaceId] = info.status;

@@ -854,7 +854,24 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
     run("pane.close", { pane: editorPanes[i].pane });
   }
   const existingEd = editorPanes[0] ?? null;
-  const targetPane = findNonEditorTerminal(tabPanes, trackedId, termsByAddr) ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
+  let replaceShell = null;
+  if (!existingEd && tabPanes.length >= 2) {
+    const rememberedWorkId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
+    const isIdleShell = (p) => {
+      if (!p.terminal || p.program?.agent) return false;
+      if (p.program && !p.program.shell) return false;
+      const lbl = termsByAddr.get(p.terminal)?.labels;
+      return !(lbl?.["ide.agent"] || lbl?.["ide.agent_session"] || lbl?.["ide.bottom-space"]);
+    };
+    const idleList = tabPanes.filter(isIdleShell);
+    replaceShell =
+      idleList.find((p) => p.pane !== rememberedWorkId && !p.focused) ??
+      idleList.find((p) => p.pane !== rememberedWorkId) ??
+      idleList[0] ??
+      null;
+  }
+  const remainingPanes = replaceShell ? tabPanes.filter((p) => p.pane !== replaceShell.pane) : tabPanes;
+  const targetPane = findNonEditorTerminal(remainingPanes, trackedId, termsByAddr) ?? remainingPanes[0] ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
 
   const absPath = file.startsWith("/") ? file : `${root.replace(/\/+$/, "")}/${file}`;
   const ln = line && line > 1 ? line : 1;
@@ -911,6 +928,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
         pane: targetPane.pane,
         argv: ["bash", "-lc", `cd '${sq(root)}' && rm -f '${sock}' && exec nvim --listen '${sock}' +${ln} '${sq(absPath)}'`],
       });
+      if (replaceShell) run("pane.close", { pane: replaceShell.pane });
       swapToCenter(cfg, cx, activeTab);
       return;
     }
@@ -948,6 +966,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
         pane: targetPane.pane,
         argv: ["bash", "-lc", freshLaunchBash(root, daemonName, target)],
       });
+      if (replaceShell) run("pane.close", { pane: replaceShell.pane });
       swapToCenter(cfg, cx, activeTab);
       return;
     }
@@ -956,7 +975,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
   // 3. Built-in GPUI ide-editor (strictly single instance per tab)
   const seq = (shared("ide.editor.open")?.seq ?? 0) + 1;
   const payload = { kind: "file", file, root, on: on ?? null, line: ln, seq };
-  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx);
+  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, targetPane, cx);
 }
 
 function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx) {
@@ -1022,7 +1041,24 @@ function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, 
     run("pane.close", { pane: editorPanes[i].pane });
   }
   const existingEd = editorPanes[0] ?? null;
-  const targetPane = findNonEditorTerminal(tabPanes, trackedId, termsByAddr) ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
+  let replaceShell = null;
+  if (!existingEd && tabPanes.length >= 2) {
+    const rememberedWorkId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
+    const isIdleShell = (p) => {
+      if (!p.terminal || p.program?.agent) return false;
+      if (p.program && !p.program.shell) return false;
+      const lbl = termsByAddr.get(p.terminal)?.labels;
+      return !(lbl?.["ide.agent"] || lbl?.["ide.agent_session"] || lbl?.["ide.bottom-space"]);
+    };
+    const idleList = tabPanes.filter(isIdleShell);
+    replaceShell =
+      idleList.find((p) => p.pane !== rememberedWorkId && !p.focused) ??
+      idleList.find((p) => p.pane !== rememberedWorkId) ??
+      idleList[0] ??
+      null;
+  }
+  const remainingPanes = replaceShell ? tabPanes.filter((p) => p.pane !== replaceShell.pane) : tabPanes;
+  const targetPane = findNonEditorTerminal(remainingPanes, trackedId, termsByAddr) ?? remainingPanes[0] ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
   openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx);
 }
 
