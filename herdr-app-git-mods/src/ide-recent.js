@@ -64,7 +64,7 @@ export default class IdeRecent extends View {
     this.closed = true;
     setShared("ide.recent.overlay", null);
     closeOverlay(props()?.overlay);
-    openInCenterEditor({ file: f.file, root, on, line: f.line ?? 1, direct: true }, cx);
+    openInCenterEditor({ file: f.file, root, on, line: f.line ?? 1 }, cx);
   }
 
   render(cx) {

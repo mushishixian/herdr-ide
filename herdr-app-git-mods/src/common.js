@@ -1,5 +1,5 @@
 import {
-  spaces, panes, terminals, focused, exec, readTextFile, writeTextFile,
+  spaces, panes, terminals, focused, exec, hc, readTextFile, writeTextFile,
   shared, setShared, run, appHome, notify, window as win, openOverlay, closeOverlay,
 } from "herdr";
 
@@ -106,6 +106,7 @@ function getContext() {
   const space = spaces().find((s) => s.active);
   const f = focused();
   const allPanes = panes();
+  const termsByAddr = terminalMap();
   const activeTab = space?.tabs?.find((t) => t.active)?.id;
   const tabPanes = activeTab ? allPanes.filter((p) => p.tab === activeTab) : [];
   const trackedEdId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
@@ -115,13 +116,13 @@ function getContext() {
     : (space?.machine ?? null);
 
   let rawCwd = null;
-  if (pane?.cwd && !isEditorPane(pane, trackedEdId)) {
+  if (pane?.cwd && !isEditorPane(pane, trackedEdId, termsByAddr)) {
     rawCwd = pane.cwd;
   } else if (f?.pane === null && f?.cwd) {
     rawCwd = f.cwd;
   } else {
     const rememberedId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
-    const isWorkPane = (p) => Boolean(p?.cwd) && !isEditorPane(p, trackedEdId);
+    const isWorkPane = (p) => Boolean(p?.cwd) && !isEditorPane(p, trackedEdId, termsByAddr);
     const workPane =
       (rememberedId && tabPanes.find((p) => p.pane === rememberedId && isWorkPane(p))) ||
       tabPanes.find((p) => p.focused && isWorkPane(p)) ||
@@ -131,7 +132,7 @@ function getContext() {
       (() => {
         const spaceTabs = new Set((space?.tabs ?? []).map((t) => t.id));
         const spacePanes = allPanes.filter((p) => spaceTabs.has(p.tab) && p.cwd);
-        return spacePanes.find((p) => !isEditorPane(p, shared("ide.editor.paneByTab")?.[p.tab])) ?? spacePanes[0] ?? null;
+        return spacePanes.find((p) => !isEditorPane(p, shared("ide.editor.paneByTab")?.[p.tab], termsByAddr)) ?? spacePanes[0] ?? null;
       })();
     rawCwd = workPane?.cwd || pane?.cwd || f?.cwd || space?.folder || null;
   }
@@ -199,15 +200,39 @@ function rememberOpenedFile(space, root, file, line) {
   setShared("ide.ws.history", all);
 }
 
-function isEditorPane(p, trackedPaneId) {
-  if (!p) return false;
-  if (trackedPaneId && p.pane === trackedPaneId) return true;
+const labeledEditorTerms = new Set();
+const jumpingByTab = new Map();
+
+function terminalMap() {
+  const map = new Map();
+  for (const t of terminals()) map.set(t.address, t);
+  return map;
+}
+
+function isLiveEditor(p) {
+  if (!p || p.program?.agent) return false;
   if (p.mod === "ide-editor") return true;
+  if (p.program && editorEngineOf(p) !== "") return true;
+  return / — fresh$/i.test(p.title || "");
+}
+
+function isDeadEditorShell(p, termsByAddr) {
+  if (!p || !p.terminal || p.program?.agent || isLiveEditor(p)) return false;
+  const term = termsByAddr ? termsByAddr.get(p.terminal) : terminals().find((t) => t.address === p.terminal);
+  if (term?.labels?.["ide.editor"] !== "1" && term?.labels?.["ide.fresh-ctx"] !== "1") return false;
+  return !p.program || Boolean(p.program.shell);
+}
+
+function isEditorPane(p, trackedPaneId, termsByAddr) {
+  if (!p) return false;
   // Decide by the program when herdr knows it: an agent (Claude Code etc.) is never the
   // editor, even if its title mentions "fresh" (closing it as a duplicate kills the agent).
-  if (p.program) return !p.program.agent && editorEngineOf(p) !== "";
-  // No program info: Fresh titles end with " — Fresh".
-  return / — fresh$/i.test(p.title || "");
+  if (p.program?.agent) return false;
+  if (trackedPaneId && p.pane === trackedPaneId) return true;
+  if (isLiveEditor(p)) return true;
+  // After herdr-core restarts, kept editor panes resurrect as shells and shared.json may be
+  // missing/corrupt; core terminal labels still identify them so we replace rather than duplicate.
+  return isDeadEditorShell(p, termsByAddr);
 }
 
 // "fresh" | "nvim" | "hx" for a terminal editor pane, else "". Program.key is the table key
@@ -222,16 +247,52 @@ function editorEngineOf(p) {
   return "";
 }
 
-function findNonEditorTerminal(tabPanes, trackedId) {
-  return tabPanes.find((p) => p.terminal && !isEditorPane(p, trackedId)) ?? tabPanes.find((p) => !isEditorPane(p, trackedId));
+function editorPaneScore(p, cfg, spawningHere, beforeIds, trackedId) {
+  if (!p) return -1;
+  const eng = editorEngineOf(p);
+  if (eng && eng === cfg?.editorEngine) return 5;
+  if (p.mod === "ide-editor" && cfg?.editorEngine === "builtin") return 5;
+  if (eng || / — fresh$/i.test(p.title || "")) return 4;
+  if (p.mod === "ide-editor") return 3;
+  if (spawningHere && Array.isArray(beforeIds) && !beforeIds.includes(p.pane)) return 2;
+  if (trackedId && p.pane === trackedId) return 1;
+  return 0;
+}
+
+function pickEditorPanes(tabPanes, trackedId, cfg, termsByAddr, spawning) {
+  const spawningHere = Boolean(spawning && Array.isArray(spawning.beforeIds) && Date.now() - spawning.at < 4000);
+  const beforeIds = spawningHere ? spawning.beforeIds : null;
+  return tabPanes
+    .filter((p) => isEditorPane(p, trackedId, termsByAddr))
+    .sort((a, b) => editorPaneScore(b, cfg, spawningHere, beforeIds, trackedId) - editorPaneScore(a, cfg, spawningHere, beforeIds, trackedId));
+}
+
+function findNonEditorTerminal(tabPanes, trackedId, termsByAddr) {
+  return (
+    tabPanes.find((p) => p.terminal && !isEditorPane(p, trackedId, termsByAddr)) ??
+    tabPanes.find((p) => !isEditorPane(p, trackedId, termsByAddr))
+  );
+}
+
+function ensureEditorTerminalLabel(edPane, termsByAddr) {
+  if (!edPane?.terminal || labeledEditorTerms.has(edPane.terminal)) return;
+  const term = termsByAddr ? termsByAddr.get(edPane.terminal) : terminals().find((t) => t.address === edPane.terminal);
+  if (term?.labels?.["ide.editor"] === "1") {
+    labeledEditorTerms.add(edPane.terminal);
+    return;
+  }
+  labeledEditorTerms.add(edPane.terminal);
+  hc(["label", edPane.terminal, "ide.editor=1"]).catch(() => {
+    labeledEditorTerms.delete(edPane.terminal);
+  });
 }
 
 // Sets where an editor pane's right-clicks go: Fresh -> "menu" (ide-term-menu runs Fresh
 // actions through context_menu.ts), Nvim/Helix -> "program". Only runs the command when the
 // terminal's current mode differs, so calling it every tick is cheap and does not flap.
-function syncEditorRightClick(p) {
+function syncEditorRightClick(p, termsByAddr) {
   if (!p?.terminal) return;
-  const term = terminals().find((t) => t.address === p.terminal);
+  const term = termsByAddr ? termsByAddr.get(p.terminal) : terminals().find((t) => t.address === p.terminal);
   if (!term) return;
   const engine = editorEngineOf(p) || String(term.foreground?.name || "").toLowerCase();
   // context_menu.ts switches Fresh between "menu" (text area) and "program" (tab bar, menu
@@ -247,6 +308,7 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
   if (!tabId) return false;
   const tabPanes = panes().filter((p) => p.tab === tabId);
   if (!tabPanes.length) return false;
+  const termsByAddr = terminalMap();
   const paneMap = { ...(shared("ide.editor.paneByTab") ?? {}) };
   const trackedId = paneMap[tabId] ?? null;
 
@@ -254,7 +316,8 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
   const spawningHere = spawning && spawning.tab === tabId && Date.now() - spawning.at < 4000 && Array.isArray(spawning.beforeIds);
   const spawnedEd = spawningHere ? tabPanes.find((p) => !spawning.beforeIds.includes(p.pane)) : null;
 
-  const edPane = spawnedEd ?? tabPanes.find((p) => isEditorPane(p, trackedId));
+  const ranked = pickEditorPanes(tabPanes, trackedId, cfg, termsByAddr, spawningHere ? spawning : null);
+  const edPane = spawnedEd ?? ranked[0] ?? null;
   if (!edPane) return false;
 
   if (paneMap[tabId] !== edPane.pane) {
@@ -262,7 +325,21 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
     setShared("ide.editor.paneByTab", paneMap);
   }
   if (spawnedEd) {
-    setShared("ide.editor.spawning", { tab: tabId, at: spawning.at });
+    setShared("ide.editor.spawning", { tab: tabId, at: spawning.at, pane: spawnedEd.pane });
+  }
+
+  // Persist editor identity in herdr-core terminal labels so it survives shared.json resets.
+  if (spawnedEd || isLiveEditor(edPane) || edPane.pane === trackedId) {
+    ensureEditorTerminalLabel(edPane, termsByAddr);
+  }
+
+  // Clean up any leftover dead editor shells once a live editor pane exists in the tab.
+  if (!spawningHere && isLiveEditor(edPane)) {
+    for (const extra of ranked) {
+      if (extra.pane !== edPane.pane && isDeadEditorShell(extra, termsByAddr)) {
+        run("pane.close", { pane: extra.pane });
+      }
+    }
   }
 
   // Terminal editors take right-clicks themselves. The engine is the pane's program name
@@ -270,13 +347,13 @@ function enforceTabEditorOrderAndMouse(tabId, cfg) {
   // terminal menu ("menu": the ide-term-menu mod, layout root terminal_menu), so its items
   // can run Fresh actions. Nvim/Helix keep "program", so the program gets the right-click.
   if (!spawnedEd || editorEngineOf(edPane) !== "") {
-    syncEditorRightClick(edPane);
+    syncEditorRightClick(edPane, termsByAddr);
   }
 
   // Keep Editor left/top of AI Agent & shell panes so AI Agent stays on the right.
   if (cfg.editorPlacement === "center-left" || cfg.editorPlacement === "center-top") {
     const edIdx = tabPanes.findIndex((p) => p.pane === edPane.pane);
-    const nonEdIdx = tabPanes.findIndex((p) => p.pane !== edPane.pane && !isEditorPane(p, trackedId));
+    const nonEdIdx = tabPanes.findIndex((p) => p.pane !== edPane.pane && !isEditorPane(p, trackedId, termsByAddr));
     if (edIdx > nonEdIdx && nonEdIdx >= 0) {
       run("pane.swap", { pane: edPane.pane, target: tabPanes[nonEdIdx].pane });
       return true;
@@ -419,24 +496,127 @@ async function syncFreshCooling(activeDaemonName, enableCooling, on) {
   await exec("bash", ["-c", script, "fresh-cool", activeDaemonName || "", enableCooling ? "1" : "0"], { on }).catch(() => {});
 }
 
+function enqueueTerminalEditorJump(job, cx) {
+  if (!cx?.spawn) {
+    execTerminalEditorJump(job, cx);
+    return;
+  }
+  const tabKey = job.activeTab || "__default__";
+  let slot = jumpingByTab.get(tabKey);
+  if (!slot) {
+    slot = { running: false, pending: null };
+    jumpingByTab.set(tabKey, slot);
+  }
+  if (slot.running) {
+    slot.pending = job;
+    return;
+  }
+  slot.running = true;
+  cx.spawn(async (cx2) => {
+    try {
+      let current = job;
+      while (current) {
+        slot.pending = null;
+        await execTerminalEditorJump(current, cx2);
+        current = slot.pending;
+      }
+    } finally {
+      slot.running = false;
+      if (slot.pending) {
+        const next = slot.pending;
+        slot.pending = null;
+        enqueueTerminalEditorJump(next, cx2);
+      }
+    }
+  });
+}
+
+async function respawnEditorPane(job, deadPane, cfg, cx) {
+  const tabPanes = panes().filter((p) => !job.activeTab || p.tab === job.activeTab);
+  const termsByAddr = terminalMap();
+  const trackedId = job.activeTab ? shared("ide.editor.paneByTab")?.[job.activeTab] : null;
+  const dead = deadPane && tabPanes.some((p) => p.pane === deadPane.pane) ? deadPane : null;
+  const otherPanes = dead ? tabPanes.filter((p) => p.pane !== dead.pane) : tabPanes;
+  const tp = findNonEditorTerminal(otherPanes, trackedId, termsByAddr) ?? otherPanes[0] ?? dead;
+  if (!tp) return;
+  const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
+  const beforeIds = tabPanes.map((p) => p.pane);
+  const launchCmd = job.kind === "nvim"
+    ? `cd '${sq(job.root)}' && rm -f '${job.sock}' && exec nvim --listen '${job.sock}' +${job.line} '${sq(job.absPath)}'`
+    : freshLaunchBash(job.root, job.daemonName, job.target);
+  setShared("ide.editor.spawning", { tab: job.activeTab, at: Date.now(), beforeIds });
+  run("pane.split", { direction: dir, pane: tp.pane, argv: ["bash", "-lc", launchCmd] });
+  // Close the old dead pane AFTER splitting so a 1-pane tab can split first and tp stays valid.
+  if (dead) run("pane.close", { pane: dead.pane });
+  swapToCenter(cfg, cx, job.activeTab);
+  if (cx?.sleep) {
+    for (const waitMs of [40, 60, 100, 150, 250]) {
+      await cx.sleep(waitMs);
+      const after = panes().filter((p) => !job.activeTab || p.tab === job.activeTab);
+      if (after.some((p) => !beforeIds.includes(p.pane))) {
+        enforceTabEditorOrderAndMouse(job.activeTab, cfg);
+        break;
+      }
+    }
+  }
+}
+
 async function execTerminalEditorJump(job, cx) {
   const cfg = getIdeSettings();
-  run("pane.focus", { pane: job.pane });
+  const resolveEditorPane = () => {
+    const tabPanes = panes().filter((p) => !job.activeTab || p.tab === job.activeTab);
+    const termsByAddr = terminalMap();
+    const trackedId = job.activeTab ? shared("ide.editor.paneByTab")?.[job.activeTab] : null;
+    const sp = shared("ide.editor.spawning");
+    const spHere = sp && sp.tab === job.activeTab && Date.now() - sp.at < 3500 ? sp : null;
+    const spawned = spHere && Array.isArray(spHere.beforeIds)
+      ? tabPanes.find((p) => !spHere.beforeIds.includes(p.pane))
+      : null;
+    const ranked = pickEditorPanes(tabPanes, trackedId, cfg, termsByAddr, spHere);
+    return {
+      pane: spawned ?? ranked[0] ?? (job.pane ? tabPanes.find((p) => p.pane === job.pane) : null),
+      termsByAddr,
+      spHere,
+      spawned: Boolean(spawned || (spHere?.pane && ranked[0]?.pane === spHere.pane)),
+    };
+  };
+
+  let cur = resolveEditorPane();
+  // If a split was just triggered and the new pane hasn't materialized in panes() yet, wait briefly.
+  if (!cur.pane && cur.spHere && cx?.sleep) {
+    for (const waitMs of [40, 60, 100, 160, 240]) {
+      await cx.sleep(waitMs);
+      cur = resolveEditorPane();
+      if (cur.pane) break;
+    }
+  }
+
+  const edPane = cur.pane;
+  if (!edPane || !edPane.terminal) {
+    await respawnEditorPane(job, edPane, cfg, cx);
+    return;
+  }
+
+  run("pane.focus", { pane: edPane.pane });
+
+  // A resurrected shell from a closed herdr-core session cannot hold a live editor TUI.
+  if (!cur.spawned && isDeadEditorShell(edPane, cur.termsByAddr) && edPane.program?.shell) {
+    await respawnEditorPane(job, edPane, cfg, cx);
+    return;
+  }
 
   if (job.kind === "nvim") {
-    const res = await exec("nvim", ["--server", job.sock, "--remote-silent", `+${job.line}`, job.absPath], { cwd: job.root, on: job.on, timeout: 2500 }).catch(() => null);
+    const tryNvim = () => exec("nvim", ["--server", job.sock, "--remote-silent", `+${job.line}`, job.absPath], { cwd: job.root, on: job.on, timeout: 2500 }).catch(() => null);
+    let res = await tryNvim();
+    while ((!res || res.code !== 0) && cur.spHere && Date.now() - cur.spHere.at < 3000 && cx?.sleep) {
+      await cx.sleep(150);
+      res = await tryNvim();
+    }
     if (res && res.code === 0) {
       enforceTabEditorOrderAndMouse(job.activeTab, cfg);
       return;
     }
-    run("pane.close", { pane: job.pane });
-    const tp = findNonEditorTerminal(panes().filter((p) => !job.activeTab || p.tab === job.activeTab), null);
-    if (tp) {
-      const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-      setShared("ide.editor.spawning", { tab: job.activeTab, at: Date.now() });
-      run("pane.split", { direction: dir, pane: tp.pane, argv: ["bash", "-lc", `cd '${sq(job.root)}' && rm -f '${job.sock}' && exec nvim --listen '${job.sock}' +${job.line} '${sq(job.absPath)}'`] });
-      swapToCenter(cfg, cx, job.activeTab);
-    }
+    await respawnEditorPane(job, edPane, cfg, cx);
     return;
   }
 
@@ -445,6 +625,11 @@ async function execTerminalEditorJump(job, cx) {
   let res = await runFreshOpenAttached(job.daemonName, job.target, job.root, job.on);
   let out = `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`;
   const opened = () => res && res.code === 0 && !out.includes("Version mismatch");
+  while (!opened() && cur.spHere && Date.now() - cur.spHere.at < 3000 && cx?.sleep) {
+    await cx.sleep(150);
+    res = await runFreshOpenAttached(job.daemonName, job.target, job.root, job.on);
+    out = `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`;
+  }
   if (!opened() && res?.code !== 75) {
     // Slow fallback: wake if SIGSTOPped and retry once before respawning.
     await wakeFreshDaemon(job.daemonName, job.on);
@@ -456,14 +641,7 @@ async function execTerminalEditorJump(job, cx) {
     return;
   }
 
-  run("pane.close", { pane: job.pane });
-  const tp = findNonEditorTerminal(panes().filter((p) => !job.activeTab || p.tab === job.activeTab), null);
-  if (tp) {
-    const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-    setShared("ide.editor.spawning", { tab: job.activeTab, at: Date.now() });
-    run("pane.split", { direction: dir, pane: tp.pane, argv: ["bash", "-lc", freshLaunchBash(job.root, job.daemonName, job.target)] });
-    swapToCenter(cfg, cx, job.activeTab);
-  }
+  await respawnEditorPane(job, edPane, cfg, cx);
 }
 
 function openInCenterEditor({ file, root, on, line, direct }, cx) {
@@ -476,6 +654,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
   const space = spaces().find((s) => s.active);
   const activeTab = space?.tabs?.find((t) => t.active)?.id;
   const tabPanes = panes().filter((p) => !activeTab || p.tab === activeTab);
+  const termsByAddr = terminalMap();
 
   rememberOpenedFile(space, root, file, line);
   publishActiveFile(file, root, on ?? null);
@@ -487,25 +666,39 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
 
   const paneMap = { ...(shared("ide.editor.paneByTab") ?? {}) };
   const trackedId = activeTab ? paneMap[activeTab] : null;
-  const editorPanes = tabPanes.filter((p) => isEditorPane(p, trackedId));
+  const spawning = shared("ide.editor.spawning");
+  const spawningHere = Boolean(spawning && spawning.tab === activeTab && Date.now() - spawning.at < 3000);
+  const editorPanes = pickEditorPanes(tabPanes, trackedId, cfg, termsByAddr, spawningHere ? spawning : null);
 
-  // Enforce strictly ONE editor pane per tab: close any extra duplicates immediately.
+  // Enforce strictly ONE editor pane per tab: close any extra duplicates immediately,
+  // keeping the highest-ranked (live) editor pane.
   for (let i = 1; i < editorPanes.length; i++) {
     run("pane.close", { pane: editorPanes[i].pane });
   }
   const existingEd = editorPanes[0] ?? null;
-  const targetPane = findNonEditorTerminal(tabPanes, trackedId) ?? tabPanes[0];
-
-  const spawning = shared("ide.editor.spawning");
-  if (!existingEd && spawning && spawning.tab === activeTab && Date.now() - spawning.at < 1500) {
-    return;
-  }
+  const targetPane = findNonEditorTerminal(tabPanes, trackedId, termsByAddr) ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
 
   const absPath = file.startsWith("/") ? file : `${root.replace(/\/+$/, "")}/${file}`;
   const ln = line && line > 1 ? line : 1;
   const target = ln > 1 ? `${absPath}:${ln}` : absPath;
   const wantFresh = cfg.editorEngine === "fresh" && (on !== null || win()?.platform !== "windows");
   const wantNvim = cfg.editorEngine === "nvim" && (on !== null || win()?.platform !== "windows");
+
+  if (!existingEd && spawningHere) {
+    if (wantFresh || wantNvim) {
+      const daemonName = `ide-${shortHash(`${activeTab ?? "t"}:${root}`)}`;
+      const sock = `/tmp/herdr-nvim-${shortHash(`${activeTab ?? "t"}:${root}`)}.sock`;
+      const job = wantNvim
+        ? { seq: (shared("ide.terminalEditor.jump")?.seq ?? 0) + 1, kind: "nvim", sock, absPath, line: ln, root, on: on ?? null, activeTab, pane: null }
+        : { seq: (shared("ide.terminalEditor.jump")?.seq ?? 0) + 1, kind: "fresh", daemonName, target, root, on: on ?? null, activeTab, pane: null };
+      if (direct || !shared("ide.sidebar.alive")) {
+        enqueueTerminalEditorJump(job, cx);
+      } else {
+        setShared("ide.terminalEditor.jump", job);
+      }
+    }
+    return;
+  }
 
   // 1. Neovim (WSL2 / Linux + LSP via ~/.config/nvim)
   if (wantNvim) {
@@ -523,7 +716,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
         pane: existingEd.pane,
       };
       if (direct || !shared("ide.sidebar.alive")) {
-        cx?.spawn?.((cx2) => execTerminalEditorJump(job, cx2));
+        enqueueTerminalEditorJump(job, cx);
       } else {
         setShared("ide.terminalEditor.jump", job);
       }
@@ -560,7 +753,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
         pane: existingEd.pane,
       };
       if (direct || !shared("ide.sidebar.alive")) {
-        cx?.spawn?.((cx2) => execTerminalEditorJump(job, cx2));
+        enqueueTerminalEditorJump(job, cx);
       } else {
         setShared("ide.terminalEditor.jump", job);
       }
@@ -599,17 +792,20 @@ function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd,
     run("pane.focus", { pane: existingEd.pane });
     return;
   }
-  if (existingEd && existingEd.terminal) {
-    run("pane.close", { pane: existingEd.pane });
-  }
   if (targetPane) {
     const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
     setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
     run("pane.split", { direction: dir, pane: targetPane.pane, mod: "ide-editor", props: payload });
-    swapToCenter(cfg, cx);
+    if (existingEd && existingEd.terminal) {
+      run("pane.close", { pane: existingEd.pane });
+    }
+    swapToCenter(cfg, cx, activeTab);
   } else {
     setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
     run("pane.split", { direction: "right", mod: "ide-editor", props: payload });
+    if (existingEd && existingEd.terminal) {
+      run("pane.close", { pane: existingEd.pane });
+    }
   }
 }
 
@@ -640,14 +836,15 @@ function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, 
   const space = spaces().find((s) => s.active);
   const activeTab = space?.tabs?.find((t) => t.active)?.id;
   const tabPanes = panes().filter((p) => !activeTab || p.tab === activeTab);
+  const termsByAddr = terminalMap();
   const paneMap = { ...(shared("ide.editor.paneByTab") ?? {}) };
   const trackedId = activeTab ? paneMap[activeTab] : null;
-  const editorPanes = tabPanes.filter((p) => isEditorPane(p, trackedId));
+  const editorPanes = pickEditorPanes(tabPanes, trackedId, cfg, termsByAddr, null);
   for (let i = 1; i < editorPanes.length; i++) {
     run("pane.close", { pane: editorPanes[i].pane });
   }
   const existingEd = editorPanes[0] ?? null;
-  const targetPane = findNonEditorTerminal(tabPanes, trackedId) ?? tabPanes[0];
+  const targetPane = findNonEditorTerminal(tabPanes, trackedId, termsByAddr) ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
   openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx);
 }
 

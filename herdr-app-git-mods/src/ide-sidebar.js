@@ -175,7 +175,7 @@ export default class IdeSidebar extends View {
             this.seenTabPanes.set(activeTab, sig);
             enforceTabEditorOrderAndMouse(activeTab, cfg);
           } else {
-            for (const p of panes().filter((x) => x.tab === activeTab && x.terminal && isEditorPane(x, null))) {
+            for (const p of panes().filter((x) => x.tab === activeTab && x.terminal && editorEngineOf(x) !== "")) {
               syncEditorRightClick(p);
             }
           }
@@ -337,7 +337,7 @@ export default class IdeSidebar extends View {
     const jump = shared("ide.terminalEditor.jump");
     if (jump?.seq && jump.seq !== this.lastJumpSeq) {
       this.lastJumpSeq = jump.seq;
-      cx.spawn(async (cx2) => execTerminalEditorJump(jump, cx2));
+      enqueueTerminalEditorJump(jump, cx);
     }
     const rev = shared("ide.explorer.reveal");
     if (rev?.seq && rev.seq !== this.lastRevealSeq) {
@@ -619,8 +619,16 @@ export default class IdeSidebar extends View {
           this.autoTriedSpaces.add(space.id);
           if (snap?.lastView && this.view !== snap.lastView) this.view = snap.lastView;
           if (cfg.autoRestoreFiles && snap?.lastFiles?.length) {
-            const first = snap.lastFiles[0];
-            openInCenterEditor({ file: first.file, root: base, on, line: first.line ?? 1 }, cx);
+            const activeTab = space.tabs?.find((t) => t.active)?.id;
+            const sp = shared("ide.editor.spawning");
+            const alreadyActive = activeTab && (
+              (sp && sp.tab === activeTab && Date.now() - sp.at < 3000) ||
+              panes().some((p) => p.tab === activeTab && isLiveEditor(p))
+            );
+            if (!alreadyActive) {
+              const first = snap.lastFiles[0];
+              openInCenterEditor({ file: first.file, root: base, on, line: first.line ?? 1, direct: true }, cx);
+            }
           }
         }
         const lastFile = snap?.lastFiles?.[0]?.file;

@@ -451,7 +451,7 @@ export default class MergeEditor extends View {
     const root = this.root;
     const on = this.on ?? null;
     this.close();
-    openInCenterEditor({ file, root, on, line, direct: true }, cx);
+    openInCenterEditor({ file, root, on, line }, cx);
   }
 
   buildAlignedViews() {

@@ -381,8 +381,9 @@ export default class IdeEditor extends View {
             el
               .when(Boolean(active.file), (el2) =>
                 el2.child(btn("ed-open-src", "Edit File", true, (_e, cx) => {
-                  if (this.isOverlay) this.close(cx);
-                  openInCenterEditor({ file: active.file, root: active.root, on: active.on, line: 1, direct: true }, cx);
+                  const wasOverlay = this.isOverlay;
+                  if (wasOverlay) this.close(cx);
+                  openInCenterEditor({ file: active.file, root: active.root, on: active.on, line: 1, direct: !wasOverlay }, cx);
                 })),
               )
               .child(btn("ed-diff-ref", "↻ Refresh", false, (_e, cx) => this.loadDiffTab(active, cx))),
