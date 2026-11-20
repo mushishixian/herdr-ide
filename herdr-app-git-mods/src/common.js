@@ -715,7 +715,8 @@ async function respawnEditorPane(job, deadPane, cfg, cx) {
   const trackedId = job.activeTab ? shared("ide.editor.paneByTab")?.[job.activeTab] : null;
   const dead = deadPane && tabPanes.some((p) => p.pane === deadPane.pane) ? deadPane : null;
   const otherPanes = dead ? tabPanes.filter((p) => p.pane !== dead.pane) : tabPanes;
-  const tp = findNonEditorTerminal(otherPanes, trackedId, termsByAddr) ?? otherPanes[0] ?? dead;
+  // Split `dead` itself when present so closing `dead` merges its halves back to its original weight (e.g. 50/50 instead of 75/25).
+  const tp = dead ?? findNonEditorTerminal(otherPanes, trackedId, termsByAddr) ?? otherPanes[0];
   if (!tp) return;
   const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
   const beforeIds = tabPanes.map((p) => p.pane);
@@ -822,6 +823,28 @@ async function execTerminalEditorJump(job, cx) {
   await respawnEditorPane(job, edPane, cfg, cx);
 }
 
+function resolveReplaceAndTarget(tabPanes, activeTab, existingEd, trackedId, termsByAddr) {
+  let replaceShell = null;
+  if (!existingEd && tabPanes.length >= 2) {
+    const rememberedWorkId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
+    const isIdleShell = (p) => {
+      if (!p.terminal || p.program?.agent) return false;
+      if (p.program && !p.program.shell) return false;
+      const lbl = termsByAddr.get(p.terminal)?.labels;
+      return !(lbl?.["ide.agent"] || lbl?.["ide.agent_session"] || lbl?.["ide.bottom-space"]);
+    };
+    const idleList = tabPanes.filter(isIdleShell);
+    replaceShell =
+      idleList.find((p) => p.pane !== rememberedWorkId && !p.focused) ??
+      idleList.find((p) => p.pane !== rememberedWorkId) ??
+      idleList[0] ??
+      null;
+  }
+  const remainingPanes = replaceShell ? tabPanes.filter((p) => p.pane !== replaceShell.pane) : tabPanes;
+  const targetPane = findNonEditorTerminal(remainingPanes, trackedId, termsByAddr) ?? remainingPanes[0] ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
+  return { replaceShell, targetPane };
+}
+
 function openInCenterEditor({ file, root, on, line, direct }, cx) {
   const cfg = getIdeSettings();
   const diffOverlay = shared("ide.diff.overlay");
@@ -854,24 +877,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
     run("pane.close", { pane: editorPanes[i].pane });
   }
   const existingEd = editorPanes[0] ?? null;
-  let replaceShell = null;
-  if (!existingEd && tabPanes.length >= 2) {
-    const rememberedWorkId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
-    const isIdleShell = (p) => {
-      if (!p.terminal || p.program?.agent) return false;
-      if (p.program && !p.program.shell) return false;
-      const lbl = termsByAddr.get(p.terminal)?.labels;
-      return !(lbl?.["ide.agent"] || lbl?.["ide.agent_session"] || lbl?.["ide.bottom-space"]);
-    };
-    const idleList = tabPanes.filter(isIdleShell);
-    replaceShell =
-      idleList.find((p) => p.pane !== rememberedWorkId && !p.focused) ??
-      idleList.find((p) => p.pane !== rememberedWorkId) ??
-      idleList[0] ??
-      null;
-  }
-  const remainingPanes = replaceShell ? tabPanes.filter((p) => p.pane !== replaceShell.pane) : tabPanes;
-  const targetPane = findNonEditorTerminal(remainingPanes, trackedId, termsByAddr) ?? remainingPanes[0] ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
+  const { replaceShell, targetPane } = resolveReplaceAndTarget(tabPanes, activeTab, existingEd, trackedId, termsByAddr);
 
   const absPath = file.startsWith("/") ? file : `${root.replace(/\/+$/, "")}/${file}`;
   const ln = line && line > 1 ? line : 1;
@@ -917,18 +923,17 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
       }
       return;
     }
-    if (existingEd && existingEd.mod === "ide-editor") {
-      run("pane.close", { pane: existingEd.pane });
-    }
-    if (targetPane) {
+    const splitHost = (existingEd?.mod === "ide-editor" ? existingEd : null) ?? replaceShell ?? targetPane;
+    if (splitHost) {
       const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
       setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
       run("pane.split", {
         direction: dir,
-        pane: targetPane.pane,
+        pane: splitHost.pane,
         argv: ["bash", "-lc", `cd '${sq(root)}' && rm -f '${sock}' && exec nvim --listen '${sock}' +${ln} '${sq(absPath)}'`],
       });
-      if (replaceShell) run("pane.close", { pane: replaceShell.pane });
+      if (existingEd?.mod === "ide-editor") run("pane.close", { pane: existingEd.pane });
+      else if (replaceShell) run("pane.close", { pane: replaceShell.pane });
       swapToCenter(cfg, cx, activeTab);
       return;
     }
@@ -955,18 +960,17 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
       }
       return;
     }
-    if (existingEd && existingEd.mod === "ide-editor") {
-      run("pane.close", { pane: existingEd.pane });
-    }
-    if (targetPane) {
+    const splitHost = (existingEd?.mod === "ide-editor" ? existingEd : null) ?? replaceShell ?? targetPane;
+    if (splitHost) {
       const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
       setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
       run("pane.split", {
         direction: dir,
-        pane: targetPane.pane,
+        pane: splitHost.pane,
         argv: ["bash", "-lc", freshLaunchBash(root, daemonName, target)],
       });
-      if (replaceShell) run("pane.close", { pane: replaceShell.pane });
+      if (existingEd?.mod === "ide-editor") run("pane.close", { pane: existingEd.pane });
+      else if (replaceShell) run("pane.close", { pane: replaceShell.pane });
       swapToCenter(cfg, cx, activeTab);
       return;
     }
@@ -975,7 +979,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
   // 3. Built-in GPUI ide-editor (strictly single instance per tab)
   const seq = (shared("ide.editor.open")?.seq ?? 0) + 1;
   const payload = { kind: "file", file, root, on: on ?? null, line: ln, seq };
-  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, targetPane, cx);
+  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, replaceShell ?? targetPane, cx);
 }
 
 function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx) {
@@ -989,10 +993,11 @@ function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd,
     run("pane.focus", { pane: existingEd.pane });
     return;
   }
-  if (targetPane) {
+  const splitHost = (existingEd?.terminal ? existingEd : null) ?? targetPane;
+  if (splitHost) {
     const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
     setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
-    run("pane.split", { direction: dir, pane: targetPane.pane, mod: "ide-editor", props: payload });
+    run("pane.split", { direction: dir, pane: splitHost.pane, mod: "ide-editor", props: payload });
     if (existingEd && existingEd.terminal) {
       run("pane.close", { pane: existingEd.pane });
     }
@@ -1041,25 +1046,8 @@ function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, 
     run("pane.close", { pane: editorPanes[i].pane });
   }
   const existingEd = editorPanes[0] ?? null;
-  let replaceShell = null;
-  if (!existingEd && tabPanes.length >= 2) {
-    const rememberedWorkId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
-    const isIdleShell = (p) => {
-      if (!p.terminal || p.program?.agent) return false;
-      if (p.program && !p.program.shell) return false;
-      const lbl = termsByAddr.get(p.terminal)?.labels;
-      return !(lbl?.["ide.agent"] || lbl?.["ide.agent_session"] || lbl?.["ide.bottom-space"]);
-    };
-    const idleList = tabPanes.filter(isIdleShell);
-    replaceShell =
-      idleList.find((p) => p.pane !== rememberedWorkId && !p.focused) ??
-      idleList.find((p) => p.pane !== rememberedWorkId) ??
-      idleList[0] ??
-      null;
-  }
-  const remainingPanes = replaceShell ? tabPanes.filter((p) => p.pane !== replaceShell.pane) : tabPanes;
-  const targetPane = findNonEditorTerminal(remainingPanes, trackedId, termsByAddr) ?? remainingPanes[0] ?? tabPanes.find((p) => p.pane !== existingEd?.pane) ?? tabPanes[0];
-  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx);
+  const { replaceShell, targetPane } = resolveReplaceAndTarget(tabPanes, activeTab, existingEd, trackedId, termsByAddr);
+  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, replaceShell ?? targetPane, cx);
 }
 
 const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
