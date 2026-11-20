@@ -167,6 +167,8 @@ export default class GitLineHistory extends View {
     this.start = 0;
     this.end = 0;
     this.focusOnly = true;
+    this.wrapLines = true;
+    this.diffBoxW = 0;
     this.blameInfo = null;
     this.blameHashes = new Set();
     this.diffScroll = VirtualListScrollHandle.new();
@@ -206,6 +208,8 @@ export default class GitLineHistory extends View {
     this.start = start;
     this.end = end;
     this.focusOnly = true;
+    this.wrapLines = true;
+    this.diffBoxW = 0;
     this.blameInfo = null;
     this.blameHashes = new Set();
     this.lastScrolledKey = "";
@@ -360,6 +364,15 @@ export default class GitLineHistory extends View {
     const commits = this.commits;
     const cur = commits[this.at];
     const isLine = this.mode === "line";
+    const vp = cx?.viewport_size?.();
+    const vpW = vp?.width ?? 1600;
+    const vpH = vp?.height ?? 900;
+    const popupH = Math.max(540, Math.round(vpH * 0.88) - 12);
+    const bodyH = popupH - 94;
+    const leftW = Math.min(340, Math.max(250, Math.round(vpW * 0.19)));
+    const estRightW = Math.max(460, Math.round(vpW * 0.90) - leftW - 44);
+    const effW = this.diffBoxW > 120 ? this.diffBoxW : estRightW;
+    const maxCols = Math.max(42, Math.floor((effW - 94) / 7.3));
 
     const rows = commits.map((c, i) => {
       const on = i === this.at;
@@ -386,13 +399,14 @@ export default class GitLineHistory extends View {
     });
 
     const rawPatchRows = cur?.patch ? diffRows(cur.patch.split("\n").map((l) => l.replace(/\r$/, ""))) : [];
-    const { rows: patchRows, wasCompacted } = isLine
+    const { rows: focusedRows, wasCompacted } = isLine
       ? focusLinePatchRows(rawPatchRows, this.start, this.end, this.focusOnly)
       : { rows: rawPatchRows, wasCompacted: false };
+    const patchRows = this.wrapLines ? wrapDiffRows(focusedRows, maxCols) : focusedRows;
     const patchWidth = Math.max(300, ...patchRows.map((row) => (row.text.length + 1) * 7.5 + 110));
     const patchLine = (row) => renderDiffLine(div, h_flex, row, t, { h: 19, numW: 36, prefixW: 18, gap: 6 });
 
-    const scrollKey = `${cur?.hash ?? ""}:${this.focusOnly ? 1 : 0}:${patchRows.length}`;
+    const scrollKey = `${cur?.hash ?? ""}:${this.focusOnly ? 1 : 0}:${this.wrapLines ? maxCols : 0}:${patchRows.length}`;
     if (isLine && cur?.patch && patchRows.length > 0 && scrollKey !== this.lastScrolledKey) {
       this.lastScrolledKey = scrollKey;
       const focusIdx = findPatchFocusIndex(patchRows);
@@ -403,7 +417,7 @@ export default class GitLineHistory extends View {
       .id("git-line-history")
       .track_focus(this.handle)
       .w_full()
-      .h(560)
+      .h(popupH)
       .p(14)
       .gap(10)
       .bg(t.popover)
@@ -473,11 +487,11 @@ export default class GitLineHistory extends View {
           // vertical size here is explicit, horizontal fills stay flex_1.
           h_flex()
             .w_full()
-            .h(466)
+            .h(bodyH)
             .gap(10)
             .child(
               v_flex()
-                .w(320)
+                .w(leftW)
                 .h_full()
                 .flex_none()
                 .rounded(8)
@@ -521,6 +535,21 @@ export default class GitLineHistory extends View {
                     .border_color(t.border)
                     .child(div().flex_none().font_semibold().text_size(11.5).text_color(t.accent).child(cur?.short ?? ""))
                     .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(cur?.subject ?? "Diff"))
+                    .when(Boolean(cur?.patch), (el2) =>
+                      el2.child(
+                        div()
+                          .id("lh-wrap-toggle")
+                          .flex_none()
+                          .px(6).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted)
+                          .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_click((_e, cx) => {
+                            this.wrapLines = !this.wrapLines;
+                            this.lastScrolledKey = "";
+                            cx.notify();
+                          })
+                          .child(this.wrapLines ? "换行: 开" : "换行: 关"),
+                      ),
+                    )
                     .when(isLine && Boolean(cur?.patch) && (wasCompacted || !this.focusOnly), (el2) =>
                       el2.child(
                         div()
@@ -539,31 +568,44 @@ export default class GitLineHistory extends View {
                 )
                 .child(
                   div()
+                    .id("lh-diff-wrap")
                     .flex_1()
                     .min_h(0)
                     .w_full()
                     .relative()
                     .font_family(settings().font_family ?? "JetBrains Mono")
                     .text_size(11.5)
+                    .on_size_change((sz, cx2) => {
+                      if (sz?.width > 120 && Math.abs(sz.width - this.diffBoxW) > 10) {
+                        this.diffBoxW = sz.width;
+                        cx2.notify();
+                      }
+                    })
                     .child(
                       cur?.patch
-                        ? div()
-                            .id("lh-diff-x")
-                            .size_full()
-                            .overflow_x_scrollbar()
-                            .child(
-                              div()
-                                .w_full()
-                                .min_w(patchWidth)
-                                .h_full()
-                                .child(
-                                  v_virtual_list("lh-diff-list", patchRows.length, 19, (i) => String(i), (range) =>
-                                    patchRows.slice(range.start, range.end).map(patchLine),
-                                  )
-                                    .track_scroll(this.diffScroll)
-                                    .size_full(),
-                                ),
+                        ? this.wrapLines
+                          ? v_virtual_list("lh-diff-list", patchRows.length, 19, (i) => String(i), (range) =>
+                              patchRows.slice(range.start, range.end).map(patchLine),
                             )
+                              .track_scroll(this.diffScroll)
+                              .size_full()
+                          : div()
+                              .id("lh-diff-x")
+                              .size_full()
+                              .overflow_x_scrollbar()
+                              .child(
+                                div()
+                                  .w_full()
+                                  .min_w(patchWidth)
+                                  .h_full()
+                                  .child(
+                                    v_virtual_list("lh-diff-list", patchRows.length, 19, (i) => String(i), (range) =>
+                                      patchRows.slice(range.start, range.end).map(patchLine),
+                                    )
+                                      .track_scroll(this.diffScroll)
+                                      .size_full(),
+                                  ),
+                              )
                         : div().size_full().p(10).text_size(11.5).text_color(t.dim).child(this.patchLoading ? "Loading commit diff…" : "(no patch for this commit)"),
                     )
                     .when(Boolean(cur?.patch), (el2) => el2.child(Scrollbar.vertical("lh-diff-list").viewport_from_layout().absolute().inset_0())),

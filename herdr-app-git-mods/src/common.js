@@ -666,8 +666,25 @@ async function syncFreshCooling(activeDaemonName, enableCooling, on) {
         if [ "$pgid" = "$pid" ]; then kill -CONT -- "-$pid" 2>/dev/null || true
         else kill -CONT "$pid" 2>/dev/null || true; fi
       else
-        if [ "$pgid" = "$pid" ]; then kill -STOP -- "-$pid" 2>/dev/null || true
-        else kill -STOP "$pid" 2>/dev/null || true; fi
+        git_busy=0
+        if [ "$pgid" = "$pid" ]; then
+          for gp in /proc/[0-9]*/stat; do
+            read -r gpid grest < "$gp" 2>/dev/null || continue
+            grest=\${grest#*) }
+            gstate=\${grest%% *}
+            [ "$gstate" = "Z" ] && continue
+            set -- $grest
+            [ "$3" = "$pgid" ] || continue
+            gcomm=$(cat "/proc/$gpid/comm" 2>/dev/null || true)
+            [ "$gcomm" = "git" ] || continue
+            [ "$gstate" = "T" ] && kill -CONT "$gpid" 2>/dev/null || true
+            git_busy=1
+          done
+        fi
+        if [ "$git_busy" = "0" ]; then
+          if [ "$pgid" = "$pid" ]; then kill -STOP -- "-$pid" 2>/dev/null || true
+          else kill -STOP "$pid" 2>/dev/null || true; fi
+        fi
       fi
     done
   `;
@@ -715,18 +732,22 @@ async function respawnEditorPane(job, deadPane, cfg, cx) {
   const trackedId = job.activeTab ? shared("ide.editor.paneByTab")?.[job.activeTab] : null;
   const dead = deadPane && tabPanes.some((p) => p.pane === deadPane.pane) ? deadPane : null;
   const otherPanes = dead ? tabPanes.filter((p) => p.pane !== dead.pane) : tabPanes;
-  // Split `dead` itself when present so closing `dead` merges its halves back to its original weight (e.g. 50/50 instead of 75/25).
-  const tp = dead ?? findNonEditorTerminal(otherPanes, trackedId, termsByAddr) ?? otherPanes[0];
-  if (!tp) return;
+  const tp = findNonEditorTerminal(otherPanes, trackedId, termsByAddr) ?? otherPanes[0] ?? null;
+  if (!tp && !dead) return;
   const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
   const beforeIds = tabPanes.map((p) => p.pane);
   const launchCmd = job.kind === "nvim"
     ? `cd '${sq(job.root)}' && rm -f '${job.sock}' && exec nvim --listen '${job.sock}' +${job.line} '${sq(job.absPath)}'`
     : freshLaunchBash(job.root, job.daemonName, job.target);
   setShared("ide.editor.spawning", { tab: job.activeTab, at: Date.now(), beforeIds });
-  run("pane.split", { direction: dir, pane: tp.pane, argv: ["bash", "-lc", launchCmd] });
-  // Close the old dead pane AFTER splitting so a 1-pane tab can split first and tp stays valid.
-  if (dead) run("pane.close", { pane: dead.pane });
+  if (dead && tp && dead.pane !== tp.pane) {
+    run("pane.close", { pane: dead.pane });
+    run("pane.split", { direction: dir, pane: tp.pane, argv: ["bash", "-lc", launchCmd] });
+  } else {
+    const host = tp ?? dead;
+    run("pane.split", { direction: dir, pane: host.pane, argv: ["bash", "-lc", launchCmd] });
+    if (dead) run("pane.close", { pane: dead.pane });
+  }
   swapToCenter(cfg, cx, job.activeTab);
   if (cx?.sleep) {
     for (const waitMs of [40, 60, 100, 150, 250]) {
@@ -845,6 +866,22 @@ function resolveReplaceAndTarget(tabPanes, activeTab, existingEd, trackedId, ter
   return { replaceShell, targetPane };
 }
 
+function replacePaneAndSplit({ victim, survivor, dir, splitOpts, tabPanes, activeTab, cfg, cx }) {
+  setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
+  if (victim && survivor && victim.pane !== survivor.pane) {
+    // Close victim BEFORE splitting survivor so survivor returns to 1.0 first and splits cleanly 50/50.
+    run("pane.close", { pane: victim.pane });
+    run("pane.split", { direction: dir, pane: survivor.pane, ...splitOpts });
+  } else if (survivor || victim) {
+    const host = survivor ?? victim;
+    run("pane.split", { direction: dir, pane: host.pane, ...splitOpts });
+    if (victim) run("pane.close", { pane: victim.pane });
+  } else {
+    run("pane.split", { direction: "right", ...splitOpts });
+  }
+  swapToCenter(cfg, cx, activeTab);
+}
+
 function openInCenterEditor({ file, root, on, line, direct }, cx) {
   const cfg = getIdeSettings();
   const diffOverlay = shared("ide.diff.overlay");
@@ -923,18 +960,19 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
       }
       return;
     }
-    const splitHost = (existingEd?.mod === "ide-editor" ? existingEd : null) ?? replaceShell ?? targetPane;
-    if (splitHost) {
+    const victim = (existingEd?.mod === "ide-editor" ? existingEd : null) ?? replaceShell;
+    if (victim || targetPane) {
       const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-      setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
-      run("pane.split", {
-        direction: dir,
-        pane: splitHost.pane,
-        argv: ["bash", "-lc", `cd '${sq(root)}' && rm -f '${sock}' && exec nvim --listen '${sock}' +${ln} '${sq(absPath)}'`],
+      replacePaneAndSplit({
+        victim,
+        survivor: targetPane,
+        dir,
+        splitOpts: { argv: ["bash", "-lc", `cd '${sq(root)}' && rm -f '${sock}' && exec nvim --listen '${sock}' +${ln} '${sq(absPath)}'`] },
+        tabPanes,
+        activeTab,
+        cfg,
+        cx,
       });
-      if (existingEd?.mod === "ide-editor") run("pane.close", { pane: existingEd.pane });
-      else if (replaceShell) run("pane.close", { pane: replaceShell.pane });
-      swapToCenter(cfg, cx, activeTab);
       return;
     }
   }
@@ -960,18 +998,19 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
       }
       return;
     }
-    const splitHost = (existingEd?.mod === "ide-editor" ? existingEd : null) ?? replaceShell ?? targetPane;
-    if (splitHost) {
+    const victim = (existingEd?.mod === "ide-editor" ? existingEd : null) ?? replaceShell;
+    if (victim || targetPane) {
       const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-      setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
-      run("pane.split", {
-        direction: dir,
-        pane: splitHost.pane,
-        argv: ["bash", "-lc", freshLaunchBash(root, daemonName, target)],
+      replacePaneAndSplit({
+        victim,
+        survivor: targetPane,
+        dir,
+        splitOpts: { argv: ["bash", "-lc", freshLaunchBash(root, daemonName, target)] },
+        tabPanes,
+        activeTab,
+        cfg,
+        cx,
       });
-      if (existingEd?.mod === "ide-editor") run("pane.close", { pane: existingEd.pane });
-      else if (replaceShell) run("pane.close", { pane: replaceShell.pane });
-      swapToCenter(cfg, cx, activeTab);
       return;
     }
   }
@@ -979,7 +1018,7 @@ function openInCenterEditor({ file, root, on, line, direct }, cx) {
   // 3. Built-in GPUI ide-editor (strictly single instance per tab)
   const seq = (shared("ide.editor.open")?.seq ?? 0) + 1;
   const payload = { kind: "file", file, root, on: on ?? null, line: ln, seq };
-  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, replaceShell ?? targetPane, cx);
+  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, targetPane, cx);
 }
 
 function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd, targetPane, cx) {
@@ -993,22 +1032,18 @@ function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd,
     run("pane.focus", { pane: existingEd.pane });
     return;
   }
-  const splitHost = (existingEd?.terminal ? existingEd : null) ?? targetPane;
-  if (splitHost) {
-    const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
-    setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
-    run("pane.split", { direction: dir, pane: splitHost.pane, mod: "ide-editor", props: payload });
-    if (existingEd && existingEd.terminal) {
-      run("pane.close", { pane: existingEd.pane });
-    }
-    swapToCenter(cfg, cx, activeTab);
-  } else {
-    setShared("ide.editor.spawning", { tab: activeTab, at: Date.now(), beforeIds: tabPanes.map((p) => p.pane) });
-    run("pane.split", { direction: "right", mod: "ide-editor", props: payload });
-    if (existingEd && existingEd.terminal) {
-      run("pane.close", { pane: existingEd.pane });
-    }
-  }
+  const dir = cfg.editorPlacement === "center-top" ? "down" : "right";
+  const victim = existingEd?.terminal ? existingEd : null;
+  replacePaneAndSplit({
+    victim,
+    survivor: targetPane,
+    dir,
+    splitOpts: { mod: "ide-editor", props: payload },
+    tabPanes,
+    activeTab,
+    cfg,
+    cx,
+  });
 }
 
 function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, root, on }, cx) {
@@ -1031,7 +1066,7 @@ function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, 
   if (cfg.editorEngine !== "builtin") {
     setShared("ide.editor.open", payload);
     if (!shared("ide.diff.overlay")) {
-      openOverlay({ mod: "ide-editor", kind: "popup", at: "top", offset: 24, width: 0.78, height: 0.88, props: payload });
+      openOverlay({ mod: "ide-editor", kind: "popup", at: "top", offset: 24, width: 0.90, height: 0.88, props: payload });
     }
     return;
   }
@@ -1047,7 +1082,7 @@ function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, 
   }
   const existingEd = editorPanes[0] ?? null;
   const { replaceShell, targetPane } = resolveReplaceAndTarget(tabPanes, activeTab, existingEd, trackedId, termsByAddr);
-  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, replaceShell ?? targetPane, cx);
+  openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd ?? replaceShell, targetPane, cx);
 }
 
 const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
@@ -1124,6 +1159,88 @@ const DIFF_FILE_STATUS = {
   R: { tag: "R 重命名", key: "blocked" },
   M: { tag: "M 修改", key: "blocked" },
 };
+
+function charDisplayCols(cp) {
+  return cp > 0x2e7f ? 2 : 1;
+}
+
+function splitWrapText(text, maxCols) {
+  if (!text) return [" "];
+  const limit = Math.max(24, maxCols | 0);
+  const out = [];
+  let cur = "";
+  let cols = 0;
+  let lastBreakIdx = -1;
+  let lastBreakCols = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i);
+    const chLen = cp > 0xffff ? 2 : 1;
+    const ch = text.slice(i, i + chLen);
+    const cw = charDisplayCols(cp);
+    if (cols + cw > limit && cur.length > 0) {
+      if (lastBreakIdx > 0 && cols - lastBreakCols <= 18) {
+        const head = cur.slice(0, lastBreakIdx + 1);
+        const rest = cur.slice(lastBreakIdx + 1);
+        out.push(head);
+        cur = rest;
+        cols = 0;
+        for (const rch of cur) cols += charDisplayCols(rch.codePointAt(0));
+        lastBreakIdx = -1;
+        lastBreakCols = 0;
+        if (cols + cw <= limit) {
+          cur += ch;
+          cols += cw;
+          if (" ,.;:()[]{}/=-+>&|".includes(ch)) { lastBreakIdx = cur.length - 1; lastBreakCols = cols; }
+          i += chLen;
+          continue;
+        }
+      }
+      out.push(cur);
+      cur = "";
+      cols = 0;
+      lastBreakIdx = -1;
+      lastBreakCols = 0;
+    }
+    cur += ch;
+    cols += cw;
+    if (" ,.;:()[]{}/=-+>&|".includes(ch)) {
+      lastBreakIdx = cur.length - 1;
+      lastBreakCols = cols;
+    }
+    i += chLen;
+  }
+  if (cur) out.push(cur);
+  return out.length ? out : [" "];
+}
+
+function wrapDiffRows(rows, maxCols) {
+  const limit = Math.max(24, maxCols | 0);
+  const out = [];
+  for (const row of rows) {
+    if (!row || row.kind === "file") {
+      out.push(row);
+      continue;
+    }
+    const text = row.text ?? "";
+    let totalCols = 0;
+    for (let i = 0; i < text.length; ) {
+      const cp = text.codePointAt(i);
+      totalCols += charDisplayCols(cp);
+      i += cp > 0xffff ? 2 : 1;
+      if (totalCols > limit) break;
+    }
+    if (totalCols <= limit) {
+      out.push(row);
+      continue;
+    }
+    const parts = splitWrapText(text, limit);
+    for (let p = 0; p < parts.length; p++) {
+      if (p === 0) out.push({ ...row, text: parts[p] });
+      else out.push({ ...row, number: undefined, cont: true, text: parts[p] });
+    }
+  }
+  return out;
+}
 
 function renderDiffLine(divFn, hFlexFn, row, t, opts = {}) {
   const h = opts.h ?? 20;
@@ -1202,6 +1319,7 @@ function renderDiffLine(divFn, hFlexFn, row, t, opts = {}) {
     const isAdd = row.kind === "+";
     const col = isAdd ? t.ansi2 : t.ansi1;
     const foc = Boolean(row.focused);
+    const cont = Boolean(row.cont);
     let el = hFlexFn()
       .w_full()
       .h(h)
@@ -1212,14 +1330,15 @@ function renderDiffLine(divFn, hFlexFn, row, t, opts = {}) {
       .border_l(3)
       .border_color(foc ? t.accent : col);
     if (numW > 0) {
-      el = el.child(divFn().w(numW).flex_none().text_right().text_color(foc ? t.foreground : col + "cc").when(foc, (e) => e.font_bold()).child(row.number === undefined ? "" : String(row.number)));
+      el = el.child(divFn().w(numW).flex_none().text_right().text_color(foc ? t.foreground : col + "cc").when(foc && !cont, (e) => e.font_bold()).child(cont || row.number === undefined ? "" : String(row.number)));
     }
     return el
-      .child(divFn().w(prefixW).flex_none().text_center().font_bold().text_color(foc ? t.accent : col).child(foc ? `▶${row.kind}` : row.kind))
+      .child(divFn().w(prefixW).flex_none().text_center().font_bold().text_color(cont ? col + "99" : foc ? t.accent : col).child(cont ? "↳" : foc ? `▶${row.kind}` : row.kind))
       .child(divFn().flex_1().min_w(0).truncate().text_color(col).when(foc, (e) => e.font_semibold()).child(row.text));
   }
 
   const foc = Boolean(row.focused);
+  const cont = Boolean(row.cont);
   const isNote = row.kind === "note";
   let el = hFlexFn()
     .w_full()
@@ -1231,10 +1350,10 @@ function renderDiffLine(divFn, hFlexFn, row, t, opts = {}) {
     .border_l(3)
     .border_color(foc ? t.accent : "#00000000");
   if (numW > 0) {
-    el = el.child(divFn().w(numW).flex_none().text_right().text_color(foc ? t.accent : t.dim).when(foc, (e) => e.font_bold()).child(row.number === undefined ? "" : String(row.number)));
+    el = el.child(divFn().w(numW).flex_none().text_right().text_color(foc ? t.accent : t.dim).when(foc && !cont, (e) => e.font_bold()).child(cont || row.number === undefined ? "" : String(row.number)));
   }
   return el
-    .child(divFn().w(prefixW).flex_none().text_center().text_color(foc ? t.accent : isNote ? t.accent : t.dim).child(foc ? "▶" : isNote ? "•" : " "))
+    .child(divFn().w(prefixW).flex_none().text_center().text_color(cont ? t.dim : foc ? t.accent : isNote ? t.accent : t.dim).child(cont ? "↳" : foc ? "▶" : isNote ? "•" : " "))
     .child(divFn().flex_1().min_w(0).truncate().text_color(foc ? t.foreground : isNote ? t.dim : t.muted).when(foc, (e) => e.font_semibold()).child(row.text));
 }
 
@@ -1285,52 +1404,172 @@ function cleanAiCommitText(rawText) {
   return lines.slice(0, 6).join("\n").trim();
 }
 
-async function generateAiCommitMessage(stat, patch, root, on) {
+async function postAiCommitJson(url, apiKey, bodyObj) {
+  const isWin = win()?.platform === "windows";
+  const sep = isWin ? "\\" : "/";
+  const reqPath = `${appHome()}${sep}.ai-req-${Date.now()}-${Math.floor(Math.random() * 10000)}.json`;
+  const payload = JSON.stringify(bodyObj);
+  await writeTextFile(reqPath, payload, null);
   try {
-    const raw = await readTextFile(`${appHome()}/ai-commit.json`);
-    if (raw) {
+    const t0 = Date.now();
+    const resp = await exec(
+      "curl",
+      [
+        "-sS",
+        "-w", "\n__HTTP__%{http_code}",
+        "-X", "POST", url,
+        "-H", "Content-Type: application/json",
+        "-H", `Authorization: Bearer ${apiKey}`,
+        "--data-binary", `@${reqPath}`,
+      ],
+      { timeout: 35000 },
+    );
+    const ms = Date.now() - t0;
+    const rawOut = String(resp.stdout ?? "");
+    const markerIdx = rawOut.lastIndexOf("\n__HTTP__");
+    const httpCode = markerIdx >= 0 ? Number(rawOut.slice(markerIdx + 9).trim()) : 0;
+    const bodyText = markerIdx >= 0 ? rawOut.slice(0, markerIdx).trim() : rawOut.trim();
+    return { code: resp.code, stderr: (resp.stderr ?? "").trim(), httpCode, bodyText, bytes: payload.length, ms };
+  } finally {
+    if (isWin) exec("cmd", ["/c", "del", "/f", "/q", reqPath], {}).catch(() => {});
+    else exec("rm", ["-f", reqPath], {}).catch(() => {});
+  }
+}
+
+async function generateAiCommitMessage(stat, patch, root, on) {
+  const logs = [];
+  let apiReason = "";
+  let hasApiConfig = false;
+
+  try {
+    const cfgPath = `${appHome()}/ai-commit.json`;
+    const raw = await readTextFile(cfgPath);
+    if (!raw) {
+      logs.push(`[config] ${cfgPath} 不存在或为空`);
+    } else {
       const cfg = JSON.parse(raw);
-      if (cfg.api_key) {
+      if (!cfg.api_key) {
+        logs.push("[config] ai-commit.json 未配置 api_key，尝试 claude CLI…");
+      } else {
+        hasApiConfig = true;
         const base = (cfg.api_url || "https://api.openai.com/v1").replace(/\/+$/, "");
         const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
-        const payload = JSON.stringify({
-          model: cfg.model || "gpt-4o-mini",
-          messages: [
-            {
-              role: "system",
-              content: "Write a Conventional Commit message: 1 clear subject line (<=72 chars), optionally followed by a blank line and 1-3 short bullet points summarizing key changes. Plain text only, no markdown fences or quotes.",
-            },
-            { role: "user", content: `Stat:\n${stat}\n\nDiff:\n${patch}` },
-          ],
-        });
-        const resp = await exec("curl", [
-          "-sS", "-X", "POST", url,
-          "-H", "Content-Type: application/json",
-          "-H", `Authorization: Bearer ${cfg.api_key}`,
-          "-d", payload,
-        ], { timeout: 15000 });
-        if (resp.code === 0 && resp.stdout) {
-          const text = JSON.parse(resp.stdout)?.choices?.[0]?.message?.content?.trim();
-          const cleaned = cleanAiCommitText(text);
-          if (cleaned) return cleaned;
+        const model = cfg.model || "gpt-4o-mini";
+        const thinking = cfg.thinking ?? "off";
+        logs.push(`[config] url=${url} model=${model} thinking=${thinking}`);
+
+        const makeBody = (withThinkingFlag) => {
+          const body = {
+            model,
+            messages: [
+              {
+                role: "system",
+                content: "Write a Conventional Commit message: 1 clear subject line (<=72 chars), optionally followed by a blank line and 1-3 short bullet points summarizing key changes. Plain text only, no markdown fences or quotes.",
+              },
+              { role: "user", content: `Stat:\n${stat}\n\nDiff:\n${patch}` },
+            ],
+          };
+          if (withThinkingFlag && thinking === "off") body.enable_thinking = false;
+          return body;
+        };
+
+        let r = await postAiCommitJson(url, cfg.api_key, makeBody(true));
+        logs.push(`[api] curl exit=${r.code} http=${r.httpCode} bytes=${r.bytes} elapsed=${r.ms}ms`);
+        if (r.httpCode === 400 && /enable_thinking|unknown|extra/i.test(r.bodyText)) {
+          logs.push(`[api] 服务端不支持 enable_thinking 参数，回退重试…`);
+          r = await postAiCommitJson(url, cfg.api_key, makeBody(false));
+          logs.push(`[api retry] curl exit=${r.code} http=${r.httpCode} elapsed=${r.ms}ms`);
+        }
+
+        if (r.code !== 0) {
+          apiReason = `curl 失败 (exit=${r.code}): ${r.stderr || r.bodyText || "请求超时或网络错误"}`;
+          logs.push(`[api error] ${apiReason}`);
+        } else if (r.httpCode >= 400 || !r.bodyText) {
+          let apiErr = r.bodyText;
+          try {
+            const j = JSON.parse(r.bodyText);
+            apiErr = j?.error?.message || j?.message || r.bodyText;
+          } catch {}
+          apiReason = `HTTP ${r.httpCode}: ${apiErr || "(empty response)"}`;
+          logs.push(`[api error] ${apiReason.slice(0, 600)}`);
+        } else {
+          try {
+            const j = JSON.parse(r.bodyText);
+            if (j?.error) {
+              apiReason = `API Error: ${j.error.message || JSON.stringify(j.error)}`;
+              logs.push(`[api error] ${apiReason}`);
+            } else {
+              const text = j?.choices?.[0]?.message?.content?.trim();
+              const cleaned = cleanAiCommitText(text);
+              if (cleaned) {
+                logs.push(`[api ok] 生成成功: ${cleaned.split("\n")[0]}`);
+                return { ok: true, msg: cleaned, source: "api", logs };
+              }
+              apiReason = `API 返回内容为空或不可用: ${r.bodyText.slice(0, 300)}`;
+              logs.push(`[api error] ${apiReason}`);
+            }
+          } catch (pe) {
+            apiReason = `解析响应 JSON 失败: ${pe?.message ?? pe} | body=${r.bodyText.slice(0, 300)}`;
+            logs.push(`[api error] ${apiReason}`);
+          }
         }
       }
     }
-  } catch {}
+  } catch (e) {
+    apiReason = `AI 配置或请求异常: ${e?.message ?? e}`;
+    logs.push(`[api exception] ${apiReason}`);
+  }
 
   try {
+    const t0 = Date.now();
     const claude = await exec(
       "claude",
       ["-p", `Write a Conventional Commit message (1 subject line + optional 1-3 short bullet lines, plain text, no markdown):\n${stat}\n\n${patch.slice(0, 3500)}`],
-      { cwd: root, on, timeout: 15000 },
+      { cwd: root, on, timeout: 20000 },
     );
+    logs.push(`[claude] exit=${claude.code} elapsed=${Date.now() - t0}ms`);
     if (claude.code === 0 && claude.stdout.trim()) {
       const cleaned = cleanAiCommitText(claude.stdout);
-      if (cleaned) return cleaned;
+      if (cleaned) {
+        logs.push(`[claude ok] 生成成功: ${cleaned.split("\n")[0]}`);
+        return { ok: true, msg: cleaned, source: "claude", logs };
+      }
+    } else if (claude.stderr?.trim()) {
+      logs.push(`[claude stderr] ${claude.stderr.trim().slice(0, 300)}`);
     }
-  } catch {}
+  } catch (e) {
+    logs.push(`[claude skip] ${e?.message ?? e}`);
+  }
 
-  return summarizeDiffStatFallback(stat);
+  const fallback = summarizeDiffStatFallback(stat);
+  if (hasApiConfig) {
+    return {
+      ok: false,
+      error: apiReason || "AI Commit 生成失败",
+      msg: fallback,
+      logs,
+    };
+  }
+  logs.push(`[fallback] 使用 diff stat 兜底提交信息: ${fallback}`);
+  return { ok: true, msg: fallback, source: "fallback", logs };
+}
+
+function showAiCommitLogPopup({ title, status, error, logs, draft, needEdit, root, on }) {
+  const prev = shared("ide.aiCommitLog")?.seq ?? 0;
+  setShared("ide.aiCommitLog", {
+    seq: prev + 1,
+    title: title || "AI Commit 失败日志",
+    status: status || "AI Commit Failed",
+    error: error || "未知错误",
+    logs: Array.isArray(logs) ? logs : [],
+    draft: draft || "",
+    needEdit: Boolean(needEdit),
+    root: root || "",
+    on: on ?? null,
+  });
+  if (!shared("ide.aiLog.open")) {
+    openOverlay({ mod: "git-ai-log", kind: "popup", at: "top", offset: 40, width: 660, height: 480 });
+  }
 }
 
 function summarizeGitSyncText(rawText, fallback) {
@@ -1381,19 +1620,22 @@ async function runGitSyncWithUpstream(kind, root, on) {
 }
 
 async function runAiSyncPipeline({ action, root, on, onProgress }) {
+  const logs = [];
   const git = async (args) => {
     const r = await exec("git", args, { cwd: root, on });
-    return { ok: r.code === 0, out: (r.stdout ?? "").trim(), err: (r.stderr ?? "").trim() };
+    return { ok: r.code === 0, code: r.code, out: (r.stdout ?? "").trim(), err: (r.stderr ?? "").trim() };
   };
 
   if (action === "sync") {
     onProgress?.({ status: "Syncing (Pull → Push)…" });
     const res = await runGitSyncWithUpstream("sync", root, on);
+    logs.push(`[git sync] ok=${res.ok} detail=${res.detail}`);
     return {
       ok: res.ok,
       status: res.ok ? "Synced ✓" : "Git Sync Failed",
       detail: res.detail,
       error: res.ok ? null : res.detail,
+      logs,
     };
   }
 
@@ -1401,8 +1643,9 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
     const unmerged = await git(["ls-files", "--unmerged"]);
     if (unmerged.out) {
       const errMsg = "存在未解决的合并冲突，请先解决冲突后再执行 AI Commit & Sync。";
+      logs.push(`[git] ${errMsg}`);
       notify({ title: "AI Commit & Sync Blocked", body: errMsg, level: "error", timeout: 4500 });
-      return { ok: false, error: errMsg };
+      return { ok: false, error: errMsg, logs };
     }
   }
 
@@ -1412,38 +1655,47 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
   const stagedCheck = await git(["diff", "--cached", "--name-only"]);
   if (!stagedCheck.out) {
     const add = await git(["add", "-A"]);
+    logs.push(`[git add -A] exit=${add.code}${add.err ? ` stderr=${add.err}` : ""}`);
     if (!add.ok) {
-      const errMsg = add.err || "git add -A failed";
+      const errMsg = add.err || add.out || "git add -A failed";
       notify({ title: "AI Commit Failed", body: errMsg, level: "error", timeout: 4500 });
-      return { ok: false, error: errMsg };
+      return { ok: false, error: errMsg, logs };
     }
   }
   const diff = await git(["diff", "--cached", "--stat"]);
   if (!diff.out) {
+    logs.push("[git diff --cached --stat] (empty)");
     if (!allowClean) {
       const infoMsg = "Nothing to commit (working tree clean).";
       notify({ title: "AI Commit", body: infoMsg, level: "info", timeout: 3500 });
-      return { ok: false, clean: true, error: infoMsg };
+      return { ok: false, clean: true, error: infoMsg, logs };
     }
     onProgress?.({ detail: "工作区无新改动，继续检查远端同步…" });
   } else {
     const summary = diff.out.split("\n").pop()?.trim() || "";
     onProgress?.({ status: "Generating AI commit message…", detail: summary });
     const patch = await git(["diff", "--cached", "--no-color"]);
-    const msg = await generateAiCommitMessage(diff.out, patch.out.slice(0, 6000), root, on);
-    onProgress?.({ status: "Committing changes…", draft: msg });
+    const gen = await generateAiCommitMessage(diff.out, patch.out.slice(0, 6000), root, on);
+    logs.push(...(gen.logs ?? []));
+    if (!gen.ok) {
+      notify({ title: "AI Commit 失败", body: gen.error, level: "error", timeout: 5500 });
+      return { ok: false, error: gen.error, draft: gen.msg, needEdit: true, logs };
+    }
+    const msg = gen.msg;
+    onProgress?.({ status: "Committing changes…", draft: msg, logs });
     const c = await git(["commit", "-m", msg]);
+    logs.push(`[git commit] exit=${c.code}${c.err ? ` stderr=${c.err}` : ""}${c.out ? ` stdout=${c.out.slice(0, 300)}` : ""}`);
     if (!c.ok) {
       const errMsg = c.err || c.out || "git commit failed";
       notify({ title: "Git Commit Failed", body: errMsg, level: "error", timeout: 5500 });
-      return { ok: false, error: errMsg, draft: msg, needEdit: true };
+      return { ok: false, error: errMsg, draft: msg, needEdit: true, logs };
     }
     bumpGitDirty();
     committedMsg = msg;
     notify({ title: "AI Commit ✓", body: msg.split("\n")[0], level: "success", timeout: 6000 });
     onProgress?.({ status: "Committed ✓", committedMsg: msg });
     if (action === "ai-commit") {
-      return { ok: true, status: "Committed ✓", detail: summary, committedMsg: msg };
+      return { ok: true, status: "Committed ✓", detail: summary, committedMsg: msg, logs };
     }
   }
 
@@ -1457,6 +1709,7 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
       status: committedMsg ? "Committed locally ✓" : "Working tree clean ✓",
       detail: infoMsg,
       committedMsg,
+      logs,
     };
   }
 
@@ -1465,10 +1718,11 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
   if (upstream.ok && upstream.out) {
     onProgress?.({ status: "Checking remote changes…" });
     const fetched = await git(["fetch", "--quiet"]);
+    logs.push(`[git fetch] exit=${fetched.code}${fetched.err ? ` stderr=${fetched.err}` : ""}`);
     if (!fetched.ok) {
       const errMsg = fetched.err || fetched.out || "git fetch failed";
       notify({ title: "Git Sync Failed", body: errMsg, level: "error", timeout: 4500 });
-      return { ok: false, error: errMsg, committedMsg };
+      return { ok: false, error: errMsg, committedMsg, logs };
     }
     const counts = await git(["rev-list", "--left-right", "--count", "HEAD...@{u}"]);
     const parts = (counts.out || "").trim().split(/\s+/);
@@ -1477,8 +1731,9 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
     if (behind > 0) {
       onProgress?.({ status: `Pulling incoming changes (↓${behind})…` });
       const pullRes = await runGitSyncWithUpstream("pull", root, on);
+      logs.push(`[git pull] ok=${pullRes.ok} detail=${pullRes.detail}`);
       if (!pullRes.ok) {
-        return { ok: false, error: pullRes.detail, committedMsg };
+        return { ok: false, error: pullRes.detail, committedMsg, logs };
       }
       const afterCounts = await git(["rev-list", "--count", "@{u}..HEAD"]);
       ahead = afterCounts.ok ? Number(afterCounts.out || 0) : ahead;
@@ -1495,20 +1750,23 @@ async function runAiSyncPipeline({ action, root, on, onProgress }) {
         status: committedMsg ? "Committed & synced ✓" : "Already up to date ✓",
         detail: "No outgoing commits to push.",
         committedMsg,
+        logs,
       };
     }
   }
 
   onProgress?.({ status: ahead > 0 ? `Pushing to remote (↑${ahead})…` : "Pushing to remote…" });
   const pushRes = await runGitSyncWithUpstream("push", root, on);
+  logs.push(`[git push] ok=${pushRes.ok} detail=${pushRes.detail}`);
   if (!pushRes.ok) {
-    return { ok: false, error: pushRes.detail, committedMsg };
+    return { ok: false, error: pushRes.detail, committedMsg, logs };
   }
   return {
     ok: true,
     status: committedMsg ? "AI Commit + Sync Complete ✓" : "Pushed ✓",
     detail: pushRes.detail,
     committedMsg,
+    logs,
   };
 }
 

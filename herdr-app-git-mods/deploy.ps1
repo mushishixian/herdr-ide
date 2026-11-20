@@ -95,8 +95,9 @@ $actions = @(
   @{ name = "git-push";      action = "push";      title = "Git Push";         width = 480; height = 140 },
   @{ name = "git-sync";      action = "sync";      title = "Git Sync";         width = 480; height = 140 },
   @{ name = "git-undo";      action = "undo";      title = "Undo Commit";      width = 480; height = 140 },
-  @{ name = "git-ai-commit"; action = "ai-commit"; title = "AI Commit";       width = 560; height = 360 },
-  @{ name = "git-ai-sync";   action = "ai-sync";   title = "AI Commit & Sync"; width = 560; height = 380 }
+  @{ name = "git-ai-commit"; action = "ai-commit"; title = "AI Commit";       width = 660; height = 480 },
+  @{ name = "git-ai-sync";   action = "ai-sync";   title = "AI Commit & Sync"; width = 660; height = 480 },
+  @{ name = "git-ai-log";    action = "ai-log";    title = "AI Commit Log";   width = 660; height = 480 }
 )
 foreach ($a in $actions) {
   $code = Inline-ForcedMode $qaRaw "{ action: `"$($a.action)`" }"
@@ -171,13 +172,13 @@ $glhRaw = Bundle-WithCommon "src\git-line-history.js"
 $glhLineCode = Inline-ForcedMode $glhRaw '{ mode: "line" }'
 Deploy-Mod "git-line-history" @{
   place = "none"; title = "Line History"
-  overlay = @{ kind = "popup"; at = "top"; offset = 40; width = 860; height = 560 }
+  overlay = @{ kind = "popup"; at = "top"; offset = 24; width = 0.90; height = 0.88 }
 } $glhLineCode
 
 $glhRepoCode = Inline-ForcedMode $glhRaw '{ mode: "repo" }'
 Deploy-Mod "git-history" @{
   place = "none"; title = "Commit History"
-  overlay = @{ kind = "popup"; at = "top"; offset = 40; width = 860; height = 560 }
+  overlay = @{ kind = "popup"; at = "top"; offset = 24; width = 0.90; height = 0.88 }
 } $glhRepoCode
 
 # Recent-files list popup (ide-sidebar opens it on ctrl-tab)
@@ -198,6 +199,10 @@ Deploy-Mod "spaces-ide" $null $spCode
 # 11. Pane header with a per-agent icon (replaces the shipped terminals-pane)
 $phCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\ide-pane-header\main.js"), $utf8NoBom)
 Deploy-Mod "ide-pane-header" @{ place = "none"; title = "Pane Header" } $phCode
+
+# 11b. Custom Space context menu (closes a space without confirmation popup)
+$smCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\ide-space-menu\main.js"), $utf8NoBom)
+Deploy-Mod "ide-space-menu" @{ place = "none" } $smCode
 
 # 12. Layout root "terminal_menu" (text edit, idempotent; no JSON rewrite)
 function Set-TerminalMenuKey($path, $mod) {

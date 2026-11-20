@@ -249,7 +249,7 @@ export default class IdeSidebar extends View {
       }
       cx2.notify();
       try {
-        await runAiSyncPipeline({
+        const res = await runAiSyncPipeline({
           action,
           root: jobRoot,
           on,
@@ -264,6 +264,28 @@ export default class IdeSidebar extends View {
               cx2.notify();
             }
           },
+        });
+        if (!res?.ok && !res?.clean) {
+          showAiCommitLogPopup({
+            title: action === "ai-sync" ? "AI Commit & Sync 失败日志" : action === "ai-commit" ? "AI Commit 失败日志" : "Git Sync 失败日志",
+            status: res?.status || "Action Failed",
+            error: res?.error || "未知错误",
+            logs: res?.logs ?? [],
+            draft: res?.draft ?? "",
+            needEdit: Boolean(res?.needEdit),
+            root: jobRoot,
+            on,
+          });
+        }
+      } catch (e) {
+        const msg = String(e?.message ?? e);
+        showAiCommitLogPopup({
+          title: action === "ai-sync" ? "AI Commit & Sync 异常" : "AI Commit 异常",
+          status: "Exception",
+          error: msg,
+          logs: [`[exception] ${msg}`],
+          root: jobRoot,
+          on,
         });
       } finally {
         this.bgJobsByRepo.delete(jobKey);
@@ -1396,7 +1418,23 @@ export default class IdeSidebar extends View {
         }
         const summaryLine = diffStat.split("\n").pop()?.trim() || "";
         const patch = (await exec("git", [...READ, "diff", "--cached", "--no-color"], { cwd: this.root, on: this.on })).stdout.slice(0, 6000);
-        const msg = await generateAiCommitMessage(diffStat, patch, this.root, this.on);
+        const gen = await generateAiCommitMessage(diffStat, patch, this.root, this.on);
+        if (!gen.ok) {
+          this.aiNotice = null;
+          this.note = gen.error;
+          showAiCommitLogPopup({
+            title: "AI Commit 生成失败",
+            status: "AI Generate Failed",
+            error: gen.error,
+            logs: gen.logs,
+            draft: gen.msg,
+            needEdit: true,
+            root: this.root,
+            on: this.on,
+          });
+          return;
+        }
+        const msg = gen.msg;
         this.message = msg;
         this.commitInput.set_value(msg.split("\n")[0]);
         this.aiNotice = summaryLine ? `${msg}\n${summaryLine}` : msg;
@@ -1416,9 +1454,32 @@ export default class IdeSidebar extends View {
             }
           });
         } else {
-          this.note = (r.stderr || r.stdout || "git commit failed").trim();
-          notify({ title: "AI Commit Failed", body: this.note, level: "error", timeout: 5000 });
+          const errMsg = (r.stderr || r.stdout || "git commit failed").trim();
+          this.note = errMsg;
+          this.aiNotice = null;
+          showAiCommitLogPopup({
+            title: "Git Commit 失败日志",
+            status: "git commit failed",
+            error: errMsg,
+            logs: [...(gen.logs ?? []), `[git commit] exit=${r.code} stderr=${r.stderr ?? ""} stdout=${r.stdout ?? ""}`],
+            draft: msg,
+            needEdit: true,
+            root: this.root,
+            on: this.on,
+          });
         }
+      } catch (e) {
+        const errMsg = String(e?.message ?? e);
+        this.aiNotice = null;
+        this.note = errMsg;
+        showAiCommitLogPopup({
+          title: "AI Commit 异常日志",
+          status: "Exception",
+          error: errMsg,
+          logs: [`[exception] ${errMsg}`],
+          root: this.root,
+          on: this.on,
+        });
       } finally {
         this.busy = false;
         cx.notify();

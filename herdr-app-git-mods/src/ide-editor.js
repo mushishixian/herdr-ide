@@ -14,6 +14,8 @@ export default class IdeEditor extends View {
     this.code = null;
     this.error = null;
     this.loadingDiff = false;
+    this.wrapLines = true;
+    this.diffBoxW = 0;
     this.lastSeq = 0;
     this.handle = cx.focus_handle();
 
@@ -379,6 +381,10 @@ export default class IdeEditor extends View {
           )
           .when(Boolean(active && isDiff), (el) =>
             el
+              .child(btn("ed-wrap", this.wrapLines ? "换行: 开" : "换行: 关", false, (_e, cx) => {
+                this.wrapLines = !this.wrapLines;
+                cx.notify();
+              }))
               .when(Boolean(active.file), (el2) =>
                 el2.child(btn("ed-open-src", "Edit File", true, (_e, cx) => {
                   const wasOverlay = this.isOverlay;
@@ -428,40 +434,56 @@ export default class IdeEditor extends View {
         ),
       )
       .when(Boolean(this.error), (el) => el.child(div().p(16).text_color(t.blocked).child(this.error)))
-      .when(!this.error && isDiff, (el) =>
-        this.loadingDiff
-          ? el.child(div().p(20).text_color(t.dim).child("Loading git diff…"))
-          : active.diffLines?.length
-            ? el.child(
-                div()
-                  .flex_1()
-                  .min_h(0)
-                  .relative()
-                  .font_family(settings().font_family ?? "JetBrains Mono")
-                  .text_size(12)
-                  .child(
-                    div()
-                      .id("ed-diff-x")
-                      .size_full()
-                      .overflow_x_scrollbar()
-                      .child(
-                        div()
-                          .w_full()
-                          .min_w(active.diffWidth)
-                          .h_full()
-                          .child(
-                            v_virtual_list("ed-diff-list", active.diffLines.length, 20, (i) => String(i), (range) =>
-                              active.diffLines.slice(range.start, range.end).map((row) =>
-                                renderDiffLine(div, h_flex, row, t, { h: 20, numW: 36, prefixW: 14, gap: 8 }),
-                              ),
-                            ).size_full(),
-                          ),
-                      ),
-                  )
-                  .child(Scrollbar.vertical("ed-diff-list").viewport_from_layout().absolute().inset_0()),
-              )
-            : el.child(div().p(20).text_color(t.dim).child("No diff hunks for this item.")),
-      )
+      .when(!this.error && isDiff, (el) => {
+        if (this.loadingDiff) return el.child(div().p(20).text_color(t.dim).child("Loading git diff…"));
+        if (!active.diffLines?.length) return el.child(div().p(20).text_color(t.dim).child("No diff hunks for this item."));
+        const vpW = cx?.viewport_size?.()?.width ?? 1600;
+        const estW = this.isOverlay ? Math.round(vpW * 0.90) - 24 : Math.max(460, Math.round((vpW - 560) * 0.5));
+        const effW = this.diffBoxW > 120 ? this.diffBoxW : estW;
+        const maxCols = Math.max(42, Math.floor((effW - 96) / 7.6));
+        const rows = this.wrapLines ? wrapDiffRows(active.diffLines, maxCols) : active.diffLines;
+        return el.child(
+          div()
+            .id("ed-diff-wrap")
+            .flex_1()
+            .min_h(0)
+            .relative()
+            .font_family(settings().font_family ?? "JetBrains Mono")
+            .text_size(12)
+            .on_size_change((sz, cx2) => {
+              if (sz?.width > 120 && Math.abs(sz.width - this.diffBoxW) > 10) {
+                this.diffBoxW = sz.width;
+                cx2.notify();
+              }
+            })
+            .child(
+              this.wrapLines
+                ? v_virtual_list("ed-diff-list", rows.length, 20, (i) => String(i), (range) =>
+                    rows.slice(range.start, range.end).map((row) =>
+                      renderDiffLine(div, h_flex, row, t, { h: 20, numW: 36, prefixW: 16, gap: 8 }),
+                    ),
+                  ).size_full()
+                : div()
+                    .id("ed-diff-x")
+                    .size_full()
+                    .overflow_x_scrollbar()
+                    .child(
+                      div()
+                        .w_full()
+                        .min_w(active.diffWidth)
+                        .h_full()
+                        .child(
+                          v_virtual_list("ed-diff-list", rows.length, 20, (i) => String(i), (range) =>
+                            rows.slice(range.start, range.end).map((row) =>
+                              renderDiffLine(div, h_flex, row, t, { h: 20, numW: 36, prefixW: 16, gap: 8 }),
+                            ),
+                          ).size_full(),
+                        ),
+                    ),
+            )
+            .child(Scrollbar.vertical("ed-diff-list").viewport_from_layout().absolute().inset_0()),
+        );
+      })
       .when(!this.error && !isDiff && Boolean(this.code), (el) => el.child(Editor.new(this.code).flex_1().min_h(0)))
       .when(!this.error && !isDiff && !this.code, (el) =>
         el.child(div().p(20).text_color(t.dim).child(active ? "Loading file…" : "Select a file from Files / Ctrl+Q to open here.")),

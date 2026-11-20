@@ -11,6 +11,9 @@ export default class GitQuickAction extends View {
     this.status = "Running…";
     this.detail = "";
     this.error = null;
+    this.logs = [];
+    this.lastLogSeq = 0;
+    this.copiedLog = false;
     this.draft = "";
     this.committedMsg = null;
     this.done = false;
@@ -27,11 +30,34 @@ export default class GitQuickAction extends View {
       this.status = `Ready (${this.action})`;
       return;
     }
+    if (this.action === "ai-log") {
+      setShared("ide.aiLog.open", true);
+      this.loadSharedLog(cx);
+      return;
+    }
     this.runAction(cx);
   }
 
   close() {
+    if (this.action === "ai-log") setShared("ide.aiLog.open", null);
     closeOverlay(props().overlay);
+  }
+
+  loadSharedLog(cx) {
+    const q = shared("ide.aiCommitLog");
+    if (!q || q.seq === this.lastLogSeq) return;
+    this.lastLogSeq = q.seq ?? 0;
+    this.status = q.title || q.status || "AI Commit 失败日志";
+    this.error = q.error || "未知错误";
+    this.logs = Array.isArray(q.logs) ? q.logs : [];
+    this.draft = q.draft || "";
+    this.needEdit = Boolean(q.needEdit);
+    this.root = q.root || "";
+    this.on = q.on ?? null;
+    if (this.draft) this.input.set_value(this.draft.split("\n")[0]);
+    this.copiedLog = false;
+    this.done = false;
+    cx?.notify?.();
   }
 
   async git(args, cwd, on) {
@@ -98,34 +124,36 @@ export default class GitQuickAction extends View {
           action: this.action,
           root: this.root,
           on,
-          onProgress: (patch) => {
-            if (patch.status) this.status = patch.status;
-            if (patch.detail !== undefined) this.detail = patch.detail;
-            if (patch.draft !== undefined) {
-              this.draft = patch.draft;
-              this.input.set_value(patch.draft);
-            }
-            if (patch.committedMsg !== undefined) this.committedMsg = patch.committedMsg;
+            onProgress: (patch) => {
+              if (patch.status) this.status = patch.status;
+              if (patch.detail !== undefined) this.detail = patch.detail;
+              if (Array.isArray(patch.logs)) this.logs = patch.logs;
+              if (patch.draft !== undefined) {
+                this.draft = patch.draft;
+                this.input.set_value(patch.draft);
+              }
+              if (patch.committedMsg !== undefined) this.committedMsg = patch.committedMsg;
+              cx.notify();
+            },
+          });
+          if (Array.isArray(res.logs)) this.logs = res.logs;
+          if (res.ok) {
+            this.done = true;
+            this.status = res.status || "Done ✓";
+            if (res.detail !== undefined) this.detail = res.detail;
+            if (res.committedMsg !== undefined) this.committedMsg = res.committedMsg;
             cx.notify();
-          },
-        });
-        if (res.ok) {
-          this.done = true;
-          this.status = res.status || "Done ✓";
-          if (res.detail !== undefined) this.detail = res.detail;
-          if (res.committedMsg !== undefined) this.committedMsg = res.committedMsg;
-          cx.notify();
-          await cx.sleep(1800);
-          this.close();
-        } else {
-          this.error = res.error || "Action failed";
-          this.needEdit = Boolean(res.needEdit);
-          if (res.draft !== undefined) {
-            this.draft = res.draft;
-            this.input.set_value(res.draft);
+            await cx.sleep(1800);
+            this.close();
+          } else {
+            this.error = res.error || "Action failed";
+            this.needEdit = Boolean(res.needEdit);
+            if (res.draft !== undefined) {
+              this.draft = res.draft;
+              this.input.set_value(res.draft);
+            }
+            cx.notify();
           }
-          cx.notify();
-        }
       }
     });
   }
@@ -173,7 +201,8 @@ export default class GitQuickAction extends View {
     }
   }
 
-  render() {
+  render(cx) {
+    if (this.action === "ai-log") this.loadSharedLog(cx);
     const t = theme();
     return v_flex()
       .id("git-quick-action")
@@ -190,14 +219,30 @@ export default class GitQuickAction extends View {
         h_flex()
           .items_center()
           .gap(8)
-          .child(svg("mods/workspace-chrome/branch.svg").size(15).text_color(this.done ? t.ansi2 : t.accent))
+          .child(svg("mods/workspace-chrome/branch.svg").size(15).text_color(this.done ? t.ansi2 : this.error ? t.ansi1 : t.accent))
           .child(
             div()
               .flex_1()
               .text_size(13)
               .font_semibold()
-              .text_color(this.done ? t.ansi2 : t.foreground)
-              .child(this.error ? "Git Action Error" : this.status),
+              .text_color(this.done ? t.ansi2 : this.error ? t.ansi1 : t.foreground)
+              .child(this.error && this.action !== "ai-log" ? "Git Action Error" : this.status),
+          )
+          .when(Boolean(this.error || this.logs?.length), (el) =>
+            el.child(
+              div()
+                .id("gqa-copy-log")
+                .px(7).py(2).rounded(4).bg(t.raised).text_size(11)
+                .text_color(this.copiedLog ? t.ansi2 : t.muted)
+                .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_click((_e, cx2) => {
+                  const full = [this.status, this.error ? `Error: ${this.error}` : "", ...(this.logs ?? [])].filter(Boolean).join("\n");
+                  cx2.write_to_clipboard(full);
+                  this.copiedLog = true;
+                  cx2.notify();
+                })
+                .child(this.copiedLog ? "已复制日志" : "复制日志"),
+            ),
           )
           .child(
             div()
@@ -244,9 +289,33 @@ export default class GitQuickAction extends View {
             ),
         );
       })
-      .when(Boolean(this.error), (el) =>
-        el.child(div().text_size(12).text_color(t.blocked).child(this.error)),
-      )
+      .when(Boolean(this.error), (el) => {
+        const logLines = [this.error, ...(this.logs ?? [])].filter(Boolean);
+        const logText = logLines.join("\n");
+        const estH = Math.min(240, Math.max(90, logLines.length * 18 + 16));
+        return el.child(
+          v_flex()
+            .p(10)
+            .gap(6)
+            .rounded(7)
+            .bg(t.background)
+            .border_1()
+            .border_color(t.ansi1)
+            .child(div().text_size(10.5).font_semibold().text_color(t.ansi1).child("FAILURE LOG"))
+            .child(
+              div()
+                .relative()
+                .h(estH)
+                .child(
+                  div()
+                    .absolute()
+                    .inset_0()
+                    .overflow_y_scroll()
+                    .child(div().text_size(11.5).text_color(t.foreground).child(logText)),
+                ),
+            ),
+        );
+      })
       .when(this.needEdit, (el) =>
         el
           .child(
