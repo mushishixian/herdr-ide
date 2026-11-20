@@ -219,10 +219,10 @@ export default class GitBranch extends View {
     }
   }
 
-  syncBranchUi(newBranch) {
+  syncBranchUi(newBranch, isRemote = false) {
     const space = spaces().find((s) => s.active);
     const firstTab = space?.tabs?.[0];
-    const clean = newBranch?.replace(/^[^/]+\//, "");
+    const clean = isRemote ? newBranch?.replace(/^[^/]+\//, "") : newBranch;
     if (space?.id && clean) {
       setShared("ide.branchBySpace", { ...(shared("ide.branchBySpace") ?? {}), [space.id]: clean });
     }
@@ -304,7 +304,7 @@ export default class GitBranch extends View {
       const res = await this.git(args);
       this.busy = false;
       if (res.ok) {
-        this.syncBranchUi(branch.name);
+        this.syncBranchUi(branch.name, branch.remote);
         notify({ title: "Git Branch", body: `Switched to ${branch.name}`, level: "success" });
         this.close();
       } else if (isLocalChangesError(res.stderr || res.stdout)) {
@@ -341,8 +341,8 @@ export default class GitBranch extends View {
       }
       const pop = await this.git(["stash", "pop"]);
       this.busy = false;
+      this.syncBranchUi(branch.name, branch.remote);
       if (pop.ok) {
-        this.syncBranchUi(branch.name);
         notify({ title: "Git Branch", body: `Switched to ${branch.name} (stashed changes restored)`, level: "success" });
         this.close();
       } else {
@@ -374,6 +374,7 @@ export default class GitBranch extends View {
           cx.notify();
           return;
         }
+        this.syncBranchUi(branch.name, branch.remote);
         res = await this.git(["merge", src]);
       } else {
         res = await this.git(["merge", branch.name]);

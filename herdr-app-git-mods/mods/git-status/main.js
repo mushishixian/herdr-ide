@@ -1,8 +1,22 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, agents, theme, run, window, keys, openOverlay } from "herdr";
+import { spaces, agents, theme, run, window, keys, openOverlay, shared } from "herdr";
 
 export default class GitStatus extends View {
+  init(_p, cx) {
+    this.lastBranchSig = "";
+    cx.timer.every(250, (cx2) => {
+      const space = spaces().find((s) => s.active);
+      if (!space) return;
+      const b = shared("ide.branchBySpace")?.[space.id] || space.branch || "";
+      const sig = `${space.id}|${b}|${shared("ide.git.dirtySeq") ?? 0}`;
+      if (sig !== this.lastBranchSig) {
+        this.lastBranchSig = sig;
+        cx2.notify();
+      }
+    });
+  }
+
   hint() {
     const mac = window()?.platform === "macos";
     const mod = { cmd: mac ? "⌘" : "Ctrl+", ctrl: mac ? "⌃" : "Ctrl+", shift: mac ? "⇧" : "Shift+", alt: mac ? "⌥" : "Alt+", option: mac ? "⌥" : "Alt+" };
@@ -27,6 +41,7 @@ export default class GitStatus extends View {
   render() {
     const t = theme();
     const space = spaces().find((s) => s.active);
+    const curBranch = (space?.id && shared("ide.branchBySpace")?.[space.id]) || space?.branch || null;
     const list = agents();
     const needs = list.filter((a) => a.status === "blocked").length;
     const label = (icon, text) => h_flex().gap(6).items_center().child(svg(`mods/workspace-chrome/${icon}.svg`).size(13)).child(text);
@@ -55,7 +70,7 @@ export default class GitStatus extends View {
       .text_size(11.8)
       .text_color(t.muted)
       .child(label(space?.machine ? "server" : "monitor", space?.machine ?? "This computer"))
-      .when(Boolean(space?.branch), (el) =>
+      .when(Boolean(curBranch), (el) =>
         el
           .child(
             h_flex()
@@ -71,7 +86,7 @@ export default class GitStatus extends View {
               .hover((s) => s.bg(t.hover))
               .on_click(() => this.openGit("switch"))
               .child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.accent))
-              .child(space.branch),
+              .child(curBranch),
           )
           .child(
             h_flex()

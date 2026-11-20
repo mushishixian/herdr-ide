@@ -332,7 +332,7 @@ export default class IdeSidebar extends View {
     const dirtySeq = shared("ide.git.dirtySeq") ?? 0;
     if (dirtySeq !== this.lastDirtySeq) {
       this.lastDirtySeq = dirtySeq;
-      this.refresh(cx);
+      this.refresh(cx, { force: true });
     }
     const jump = shared("ide.terminalEditor.jump");
     if (jump?.seq && jump.seq !== this.lastJumpSeq) {
@@ -380,12 +380,13 @@ export default class IdeSidebar extends View {
     const on = this.on;
     const targetContext = this.context;
     const myLoadSeq = this.loadSeq;
+    const seqAtStart = shared("ide.git.dirtySeq") ?? 0;
     cx.spawn(async (cx) => {
       try {
         const st = await exec("git", [...READ, "status", "--porcelain=v1", "--branch", "-z", "--no-renames", "--untracked-files=all"], { cwd: root, on });
         if (this.context !== targetContext || myLoadSeq !== this.loadSeq || this.root !== root) return;
         if (st.code === 0 && st.stdout !== this.lastStatusRaw) {
-          this.applyStatusOutput(st.stdout);
+          this.applyStatusOutput(st.stdout, { seqAtStart });
           cx.notify();
         }
       } catch {}
@@ -408,15 +409,25 @@ export default class IdeSidebar extends View {
     }
   }
 
-  applyStatusOutput(raw) {
+  applyStatusOutput(raw, opts = {}) {
     this.lastStatusRaw = raw;
     const conflicts = [], staged = [], unstaged = [], marks = {};
     let ahead = 0, behind = 0, hasUpstream = false;
+    let headerBranch = null;
     for (const entry of (raw ?? "").split("\0").filter(Boolean)) {
       if (entry.startsWith("## ")) {
         hasUpstream = entry.includes("...");
         ahead = Number(/ahead (\d+)/.exec(entry)?.[1] ?? 0);
         behind = Number(/behind (\d+)/.exec(entry)?.[1] ?? 0);
+        const hdr = entry.slice(3).trim();
+        if (hdr.startsWith("HEAD (")) {
+          headerBranch = "HEAD";
+        } else if (hdr.startsWith("No commits yet on ") || hdr.startsWith("Initial commit on ")) {
+          headerBranch = hdr.replace(/^(?:No commits yet|Initial commit) on /, "").trim() || null;
+        } else if (hdr) {
+          const dotIdx = hdr.indexOf("...");
+          headerBranch = (dotIdx >= 0 ? hdr.slice(0, dotIdx) : hdr.replace(/ \[(?:ahead|behind|gone).*$/, "")).trim() || null;
+        }
         continue;
       }
       const x = entry[0], y = entry[1], path = entry.slice(3);
@@ -443,8 +454,16 @@ export default class IdeSidebar extends View {
     this.ahead = ahead;
     this.behind = behind;
     this.hasUpstream = hasUpstream;
+    if (headerBranch) this.branch = headerBranch;
     const activeSp = spaces().find((s) => s.active);
     if (activeSp?.id) {
+      if (headerBranch && headerBranch !== "HEAD" && (opts.seqAtStart == null || (shared("ide.git.dirtySeq") ?? 0) === opts.seqAtStart)) {
+        const bySpace = { ...(shared("ide.branchBySpace") ?? {}) };
+        if (bySpace[activeSp.id] !== headerBranch) {
+          bySpace[activeSp.id] = headerBranch;
+          setShared("ide.branchBySpace", bySpace);
+        }
+      }
       setShared("ide.gitSyncBySpace", {
         ...(shared("ide.gitSyncBySpace") ?? {}),
         [activeSp.id]: { ahead, behind, hasUpstream },
@@ -616,6 +635,7 @@ export default class IdeSidebar extends View {
         }
 
         if (this.root) {
+          const seqAtStart = shared("ide.git.dirtySeq") ?? 0;
           const git = (args) => exec("git", [...READ, ...args], { cwd: this.root, on });
           const [br, st, logR, stashR] = await Promise.all([
             git(["symbolic-ref", "--short", "HEAD"]),
@@ -626,14 +646,14 @@ export default class IdeSidebar extends View {
           if (this.context !== targetContext || myLoadSeq !== this.loadSeq) return;
           this.branch = br.code === 0 ? br.stdout.trim() : "HEAD";
           const activeSp = spaces().find((s) => s.active);
-          if (activeSp?.id && this.branch && this.branch !== "HEAD") {
+          if (activeSp?.id && this.branch && this.branch !== "HEAD" && (shared("ide.git.dirtySeq") ?? 0) === seqAtStart) {
             const bySpace = { ...(shared("ide.branchBySpace") ?? {}) };
             if (bySpace[activeSp.id] !== this.branch) {
               bySpace[activeSp.id] = this.branch;
               setShared("ide.branchBySpace", bySpace);
             }
           }
-          this.applyStatusOutput(st.stdout ?? "");
+          this.applyStatusOutput(st.stdout ?? "", { seqAtStart });
           this.commits = (logR.stdout ?? "").split("\n").filter(Boolean).map((l) => {
             const [hash, subject, rel] = l.split("\t");
             return { hash, subject, rel };

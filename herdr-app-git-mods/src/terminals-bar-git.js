@@ -109,12 +109,28 @@ function pillBtn(id, label, tip, onClick) {
 }
 
 export default class TerminalsBarGit extends View {
+  init(_p, cx) {
+    this.lastSyncSig = "";
+    cx.timer.every(250, (cx2) => {
+      const space = spaces().find((p) => p.active);
+      if (!space) return;
+      const curBranch = shared("ide.branchBySpace")?.[space.id] || space.branch || "";
+      const sync = shared("ide.gitSyncBySpace")?.[space.id] ?? { ahead: 0, behind: 0 };
+      const dirtySeq = shared("ide.git.dirtySeq") ?? 0;
+      const sig = `${space.id}|${curBranch}|${sync.ahead}|${sync.behind}|${dirtySeq}`;
+      if (sig !== this.lastSyncSig) {
+        this.lastSyncSig = sig;
+        cx2.notify();
+      }
+    });
+  }
+
   render() {
     const t = theme();
     refreshColors(t);
     const space = spaces().find((p) => p.active);
     if (!space) return div();
-    const curBranch = space.branch || shared("ide.branchBySpace")?.[space.id] || null;
+    const curBranch = shared("ide.branchBySpace")?.[space.id] || space.branch || null;
     const sync = shared("ide.gitSyncBySpace")?.[space.id] ?? { ahead: 0, behind: 0 };
     const firstTab = space.tabs?.[0];
     if (firstTab && curBranch) {

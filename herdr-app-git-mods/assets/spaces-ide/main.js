@@ -390,6 +390,7 @@ export default class Spaces extends View {
     const [on, cwd] = JSON.parse(key);
     this.checked[key] = Date.now();
     this.unsure.delete(key);
+    const seqAtStart = shared("ide.git.dirtySeq") ?? 0;
     try {
       // Ref-only reads avoid scanning the worktree or waking its index watch.
       // Two reads: a folder name may itself contain a newline.
@@ -415,6 +416,19 @@ export default class Spaces extends View {
       const [ahead, behind] = counts.code === 0 ? counts.stdout.trim().split(/\s+/).map(Number) : [0, 0];
       const info = { name, branch: branch.code === 0 ? branch.stdout.trim().replace(/^refs\/heads\//, "") : "(detached)", ahead, behind, repo: JSON.stringify([on, repo]), linked: repo !== `${top}/.git` };
       this.git[key] = info;
+      if (info.branch !== "(detached)" && (shared("ide.git.dirtySeq") ?? 0) === seqAtStart) {
+        const sp = spaces();
+        const ps = panes();
+        const bySpace = { ...(shared("ide.branchBySpace") ?? {}) };
+        let branchChanged = false;
+        for (const s of sp) {
+          if (where(s, ps) === key && bySpace[s.id] !== info.branch) {
+            bySpace[s.id] = info.branch;
+            branchChanged = true;
+          }
+        }
+        if (branchChanged) setShared("ide.branchBySpace", bySpace);
+      }
       if (!on) this.watch(repo, cx);
     } catch {
       // Couldn't ask (the machine is away): keep what it showed, look again later.
