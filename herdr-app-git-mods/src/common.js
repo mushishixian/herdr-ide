@@ -1213,37 +1213,41 @@ function renderDiffLine(divFn, hFlexFn, row, t, opts = {}) {
   if (row.kind === "+" || row.kind === "-") {
     const isAdd = row.kind === "+";
     const col = isAdd ? t.ansi2 : t.ansi1;
+    const foc = Boolean(row.focused);
     let el = hFlexFn()
       .w_full()
       .h(h)
       .flex_none()
       .items_center()
       .gap(gap)
-      .bg(col + "38")
+      .bg(col + (foc ? "4c" : "38"))
       .border_l(3)
-      .border_color(col);
+      .border_color(foc ? t.accent : col);
     if (numW > 0) {
-      el = el.child(divFn().w(numW).flex_none().text_right().text_color(col + "cc").child(row.number === undefined ? "" : String(row.number)));
+      el = el.child(divFn().w(numW).flex_none().text_right().text_color(foc ? t.foreground : col + "cc").when(foc, (e) => e.font_bold()).child(row.number === undefined ? "" : String(row.number)));
     }
     return el
-      .child(divFn().w(prefixW).flex_none().text_center().font_bold().text_color(col).child(row.kind))
-      .child(divFn().flex_1().min_w(0).truncate().text_color(col).child(row.text));
+      .child(divFn().w(prefixW).flex_none().text_center().font_bold().text_color(foc ? t.accent : col).child(foc ? `▶${row.kind}` : row.kind))
+      .child(divFn().flex_1().min_w(0).truncate().text_color(col).when(foc, (e) => e.font_semibold()).child(row.text));
   }
 
+  const foc = Boolean(row.focused);
+  const isNote = row.kind === "note";
   let el = hFlexFn()
     .w_full()
     .h(h)
     .flex_none()
     .items_center()
     .gap(gap)
+    .when(foc, (e) => e.bg(t.accent + "24"))
     .border_l(3)
-    .border_color("#00000000");
+    .border_color(foc ? t.accent : "#00000000");
   if (numW > 0) {
-    el = el.child(divFn().w(numW).flex_none().text_right().text_color(t.dim).child(row.number === undefined ? "" : String(row.number)));
+    el = el.child(divFn().w(numW).flex_none().text_right().text_color(foc ? t.accent : t.dim).when(foc, (e) => e.font_bold()).child(row.number === undefined ? "" : String(row.number)));
   }
   return el
-    .child(divFn().w(prefixW).flex_none().text_center().text_color(t.dim).child(row.kind === "note" ? "\\" : " "))
-    .child(divFn().flex_1().min_w(0).truncate().text_color(row.kind === "note" ? t.dim : t.muted).child(row.text));
+    .child(divFn().w(prefixW).flex_none().text_center().text_color(foc ? t.accent : isNote ? t.accent : t.dim).child(foc ? "▶" : isNote ? "•" : " "))
+    .child(divFn().flex_1().min_w(0).truncate().text_color(foc ? t.foreground : isNote ? t.dim : t.muted).when(foc, (e) => e.font_semibold()).child(row.text));
 }
 
 function toBase64Utf8(str) {

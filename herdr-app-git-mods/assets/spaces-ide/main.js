@@ -108,35 +108,39 @@ const SPIN_LINE = new RegExp(`^\\s*[${SPIN_CHARS}]\\s*\\S.*(?:…|\\.\\.\\.)`, "
 // A live status line such as "✹ Tidying… (101s · running REPL · Task running for a while)".
 const WORKING_TEXT = /\(\s*\d+s\s*·|\b\d+s\s*·\s*(?:running|working|thinking|waiting)\b|Task running for a while|\brunning (?:REPL|command|tool|tools|task|tasks)\b/i;
 
-function classifyAgentOutput(raw, prevInfo, now) {
+function classifyAgentOutput(raw, prevInfo, now, opts = {}) {
   const lines = (raw || "").split("\n").map((l) => l.replace(/\r$/, "").trim()).filter(Boolean);
   const tail = lines.slice(-14).join("\n");
   const bottom = lines.slice(-6).join("\n");
-  const changed = prevInfo && prevInfo.tail !== tail;
+  const spinTitle = Boolean(opts.spinTitle);
 
-  const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel/i.test(lines.slice(-8).join("\n"));
+  const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel|esc\s*(?:取消|中断)/i.test(lines.slice(-8).join("\n"));
   const hasWorkingLine = lines.slice(-8).some((l) => SPIN_LINE.test(l) || WORKING_TEXT.test(l));
-  const promptLine = /^[❯›>]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|输入.*|)[.…\s]*$/;
-  const atPrompt = lines.slice(-6).some((l) => promptLine.test(l)) && !hasWorkingLine && !hasInterruptHint;
+  const promptLine = /^[❯›>$%]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|输入.*|.*)?$/i;
+  const hasPromptGlyph = lines.slice(-5).some((l) => /^[❯›>](?:\s|$)/.test(l));
+  const atPrompt = (lines.slice(-6).some((l) => promptLine.test(l)) || hasPromptGlyph) && !hasWorkingLine && !hasInterruptHint && !spinTitle;
   const isBlocked =
     !atPrompt &&
     /\b(allow once|allow for this session|do you want to|approve|reject|select an option|press enter to confirm)\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/i.test(lines.slice(-10).join("\n"));
-  const hasWorkingSignal =
-    hasInterruptHint ||
-    hasWorkingLine ||
-    (!atPrompt &&
-      (lines.slice(-4).some((l) => SPIN_LINE.test(l)) ||
-        /^(?:Thinking|Generating|Searching|Running|Executing|Reading|Writing|Editing|Working|Repairing|Tidying)\b/im.test(bottom)));
+  const hasWorkingVerb =
+    !atPrompt &&
+    /^(?:Thinking|Generating|Searching|Running|Executing|Reading|Writing|Editing|Working|Repairing|Tidying|Planning|Calling)\b/im.test(bottom);
+  const hasWorkingSignal = spinTitle || hasInterruptHint || hasWorkingLine || hasWorkingVerb;
+  const rawStatus = hasWorkingSignal ? "working" : isBlocked ? "blocked" : "idle";
+  const workingSince = rawStatus === "working" ? (prevInfo?.rawStatus === "working" ? prevInfo.workingSince : now) : 0;
+  const wasWorking = prevInfo?.rawStatus === "working" && (prevInfo.hasStrongWorking || now - (prevInfo.workingSince ?? now) >= 1200);
 
   let status = "idle";
   if (isBlocked) status = "blocked";
-  else if (hasWorkingSignal || (changed && !atPrompt)) status = "working";
-  else if (prevInfo && prevInfo.rawStatus === "working" && atPrompt) status = "done";
+  else if (hasWorkingSignal) status = "working";
+  else if (wasWorking && (atPrompt || rawStatus === "idle")) status = "done";
   else if (prevInfo && prevInfo.status === "done" && now - (prevInfo.doneAt ?? 0) < 15000) status = "done";
 
   return {
     status,
-    rawStatus: hasWorkingSignal || (changed && !atPrompt) ? "working" : isBlocked ? "blocked" : "idle",
+    rawStatus,
+    hasStrongWorking: spinTitle || hasInterruptHint || hasWorkingLine || Boolean(prevInfo?.rawStatus === "working" && prevInfo?.hasStrongWorking && rawStatus === "working"),
+    workingSince,
     tail,
     doneAt: status === "done" ? (prevInfo?.doneAt || now) : 0,
   };
@@ -195,7 +199,7 @@ export default class Spaces extends View {
       if (!s) continue;
       if (isKnownCliAgent(p)) {
         const label = p.program?.name || p.program?.key || "Agent";
-        targets.push({ spaceId: s.id, spaceName: s.name || base(s.folder || "") || "Space", active: s.active && p.focused, terminal: p.terminal, label });
+        targets.push({ spaceId: s.id, spaceName: s.name || base(s.folder || "") || "Space", active: s.active && p.focused, terminal: p.terminal, label, spinTitle: SPIN_TITLE.test(p.title || "") });
       } else {
         delete this.termAgent[p.terminal];
       }
@@ -221,7 +225,7 @@ export default class Spaces extends View {
               const r = await hc(["read", tg.terminal, "--lines", "18"]);
               if (r.code !== 0) return;
               const prev = this.termAgent[tg.terminal];
-              const info = classifyAgentOutput(r.stdout, prev, now);
+              const info = classifyAgentOutput(r.stdout, prev, now, { spinTitle: tg.spinTitle });
               const becameDone = prev?.rawStatus === "working" && info.rawStatus === "idle" && info.status === "done";
               const becameBlocked = prev?.rawStatus !== "blocked" && info.rawStatus === "blocked";
               if (tg.active && winActive && info.status === "done") info.status = "idle";

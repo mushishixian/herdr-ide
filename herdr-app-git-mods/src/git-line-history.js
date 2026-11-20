@@ -2,11 +2,137 @@
 // ide-editor Ctrl+Alt+O or relayed from Fresh via ide-sidebar) or repository
 // commit history ("repo" mode, opened globally via Ctrl+Alt+H).
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { exec, props, shared, setShared, theme, settings, closeOverlay, checking } from "herdr";
 
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 const FORMAT = "--format=%x1e%H%x1f%h%x1f%an%x1f%ad%x1f%s";
+
+function parseBlameFirstCommit(out) {
+  const lines = (out ?? "").split("\n");
+  if (!lines.length) return null;
+  const hashes = new Set();
+  let primary = null;
+  let curHash = "";
+  let author = "";
+  let ts = 0;
+  let summary = "";
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, "");
+    const m = /^([0-9a-f]{40})\s+\d+\s+\d+/.exec(line);
+    if (m) {
+      curHash = m[1];
+      if (!/^0+$/.test(curHash)) hashes.add(curHash);
+      if (!primary && !/^0+$/.test(curHash)) {
+        primary = { hash: curHash, short: curHash.slice(0, 9), author: "", date: "", subject: "" };
+      }
+      continue;
+    }
+    if (!primary || curHash !== primary.hash) continue;
+    if (line.startsWith("author ")) author = line.slice(7);
+    else if (line.startsWith("author-time ")) ts = Number(line.slice(12)) || 0;
+    else if (line.startsWith("summary ")) summary = line.slice(8);
+  }
+  if (primary) {
+    primary.author = author;
+    primary.date = ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "";
+    primary.subject = summary;
+  }
+  return { hashes, primary };
+}
+
+// Mark rows falling in [start, end] as focused; when in line mode with an
+// oversized hunk (e.g. CRLF line-ending conversion dumping the whole file),
+// window each large hunk around the selected lines so the view opens there.
+function focusLinePatchRows(rows, start, end, compact) {
+  const out = [];
+  const smallSelection = start >= 1 && end >= start && end - start + 1 <= 25;
+  const markRange = (r) => {
+    if (r.number === undefined || start < 1 || end < start) return false;
+    return r.number >= start && r.number <= end;
+  };
+
+  let i = 0;
+  let wasCompacted = false;
+  while (i < rows.length) {
+    const row = rows[i];
+    if (row.kind !== "@") {
+      out.push(row);
+      i++;
+      continue;
+    }
+    out.push(row);
+    i++;
+    const hunkStart = i;
+    while (i < rows.length && rows[i].kind !== "@" && rows[i].kind !== "file") i++;
+    const hunk = rows.slice(hunkStart, i).map((r) => ({ ...r, focused: markRange(r) }));
+
+    if (!compact || !smallSelection || hunk.length <= 45) {
+      for (const r of hunk) out.push(r);
+      continue;
+    }
+
+    const addRows = hunk.filter((r) => r.kind === "+");
+    const delRows = hunk.filter((r) => r.kind === "-");
+    const delTextSet = new Set(delRows.map((r) => r.text.trim()));
+    const crlfLike = delRows.length > 35 && addRows.length > 0 && addRows.every((r) => delTextSet.has(r.text.trim()));
+    if (crlfLike) {
+      out.push({
+        kind: "note",
+        text: `ⓘ 该提交主要是行尾/空白格式变更 (CRLF↔LF)，已自动聚焦至第 ${start}${end !== start ? `-${end}` : ""} 行上下文`,
+      });
+    }
+
+    const anchors = [];
+    for (let k = 0; k < hunk.length; k++) {
+      if (hunk[k].focused) anchors.push(k);
+    }
+    if (!anchors.length) {
+      for (let k = 0; k < hunk.length; k++) {
+        if (hunk[k].kind === "+" || hunk[k].kind === "-") anchors.push(k);
+      }
+    }
+    if (!anchors.length) {
+      for (const r of hunk) out.push(r);
+      continue;
+    }
+
+    const keep = new Uint8Array(hunk.length);
+    for (const a of anchors) {
+      const lo = Math.max(0, a - 10);
+      const hi = Math.min(hunk.length - 1, a + 10);
+      for (let k = lo; k <= hi; k++) keep[k] = 1;
+    }
+
+    let k = 0;
+    while (k < hunk.length) {
+      if (keep[k]) {
+        out.push(hunk[k]);
+        k++;
+        continue;
+      }
+      const skipStart = k;
+      while (k < hunk.length && !keep[k]) k++;
+      const skipped = k - skipStart;
+      if (skipped < 5) {
+        for (let m = skipStart; m < k; m++) out.push(hunk[m]);
+      } else {
+        wasCompacted = true;
+        out.push({ kind: "note", text: `⋯ 已折叠 ${skipped} 行非选定区内容（点击右上角「展开完整」可查看全部） ⋯` });
+      }
+    }
+  }
+  return { rows: out, wasCompacted };
+}
+
+function findPatchFocusIndex(rows) {
+  let idx = rows.findIndex((r) => r.focused && (r.kind === "+" || r.kind === "-"));
+  if (idx >= 0) return idx;
+  idx = rows.findIndex((r) => r.focused);
+  if (idx >= 0) return idx;
+  idx = rows.findIndex((r) => r.kind === "+" || r.kind === "-");
+  return idx >= 0 ? idx : 0;
+}
 
 // Parse `git log ... --format=%x1e%H%x1f%h%x1f%an%x1f%ad%x1f%s`: each record
 // starts with \x1e, its header is one line of \x1f-separated fields, the patch
@@ -37,6 +163,14 @@ export default class GitLineHistory extends View {
     this.lastSeq = 0;
     this.on = null;
     this.root = "";
+    this.file = "";
+    this.start = 0;
+    this.end = 0;
+    this.focusOnly = true;
+    this.blameInfo = null;
+    this.blameHashes = new Set();
+    this.diffScroll = VirtualListScrollHandle.new();
+    this.lastScrolledKey = "";
     this.range = "";
     this.patchCache = new Map();
     this.handle = cx.focus_handle();
@@ -66,8 +200,15 @@ export default class GitLineHistory extends View {
     this.lastSeq = q.seq ?? 0;
     this.on = q.on ?? null;
     this.root = q.root;
+    this.file = q.file;
     const start = q.start ?? 1;
     const end = q.end ?? start;
+    this.start = start;
+    this.end = end;
+    this.focusOnly = true;
+    this.blameInfo = null;
+    this.blameHashes = new Set();
+    this.lastScrolledKey = "";
     this.range = `${q.title || q.file}:${start}${end !== start ? `-${end}` : ""}`;
     this.loading = true;
     this.error = null;
@@ -75,17 +216,55 @@ export default class GitLineHistory extends View {
     this.at = 0;
     this.notice = null;
     cx.spawn(async (cx2) => {
-      const r = await exec(
-        "git",
-        [...READ, "-C", q.root, "log", "-L", `${start},${end}:${q.file}`, "-n", "200", "--date=short", FORMAT],
-        { on: this.on, timeout: 60000 },
-      ).catch(() => null);
+      const [r, br] = await Promise.all([
+        exec(
+          "git",
+          [...READ, "-C", q.root, "log", "-L", `${start},${end}:${q.file}`, "-n", "200", "--date=short", FORMAT],
+          { on: this.on, timeout: 60000 },
+        ).catch(() => null),
+        exec(
+          "git",
+          [...READ, "-C", q.root, "blame", "--porcelain", "-w", "-L", `${start},${end}`, "--", q.file],
+          { on: this.on, timeout: 10000 },
+        ).catch(() => null),
+      ]);
       this.loading = false;
+      const blame = br && br.code === 0 ? parseBlameFirstCommit(br.stdout) : null;
+      if (blame) {
+        this.blameHashes = blame.hashes;
+        this.blameInfo = blame.primary;
+      }
       if (!r || r.code !== 0) {
         this.error = (r?.stderr || r?.stdout || "git log -L failed").trim() || "git log -L failed";
       } else {
         this.commits = parseHistory(r.stdout ?? "");
       }
+      cx2.notify();
+    });
+  }
+
+  jumpToBlame(cx) {
+    const info = this.blameInfo;
+    if (!info || !this.root) return;
+    const existing = this.commits.findIndex((c) => c.hash === info.hash);
+    if (existing >= 0) {
+      this.select(existing, cx);
+      cx.notify();
+      return;
+    }
+    this.patchLoading = true;
+    cx.notify();
+    cx.spawn(async (cx2) => {
+      const r = await exec(
+        "git",
+        [...READ, "-C", this.root, "show", "-w", "--unified=8", "--format=", "--patch", "--no-color", info.hash, "--", this.file],
+        { on: this.on, timeout: 15000 },
+      ).catch(() => null);
+      this.patchLoading = false;
+      const patch = r && r.code === 0 ? (r.stdout ?? "").replace(/^\n+/, "").trimEnd() : "";
+      this.commits.push({ ...info, patch });
+      this.at = this.commits.length - 1;
+      this.lastScrolledKey = "";
       cx2.notify();
     });
   }
@@ -184,6 +363,7 @@ export default class GitLineHistory extends View {
 
     const rows = commits.map((c, i) => {
       const on = i === this.at;
+      const isSem = isLine && this.blameHashes.has(c.hash);
       return v_flex()
         .id(`lh-c-${i}`)
         .px(10)
@@ -196,17 +376,28 @@ export default class GitLineHistory extends View {
         .on_click((_e, cx) => this.select(i, cx))
         .child(
           h_flex()
-            .gap(8)
+            .gap(6)
             .items_center()
             .child(div().w(58).flex_none().font_semibold().text_size(11.5).text_color(t.accent).child(c.short))
-            .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).when(on, (d) => d.font_semibold()).child(c.subject)),
+            .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).when(on, (d) => d.font_semibold()).child(c.subject))
+            .when(isSem, (el) => el.child(div().flex_none().px(4).py(0.5).rounded(3).bg(t.ansi2 + "28").text_size(9.5).font_bold().text_color(t.ansi2).child("★ 实际修改"))),
         )
-        .child(div().pl(66).truncate().text_size(10.5).text_color(t.dim).child(`${c.date} · ${c.author}`));
+        .child(div().pl(64).truncate().text_size(10.5).text_color(t.dim).child(`${c.date} · ${c.author}`));
     });
 
-    const patchRows = cur?.patch ? diffRows(cur.patch.split("\n").map((l) => l.replace(/\r$/, ""))) : [];
-    const patchWidth = Math.max(300, ...patchRows.map((row) => (row.text.length + 1) * 7.5 + 72));
-    const patchLine = (row) => renderDiffLine(div, h_flex, row, t, { h: 19, numW: 0, prefixW: 14, gap: 4 });
+    const rawPatchRows = cur?.patch ? diffRows(cur.patch.split("\n").map((l) => l.replace(/\r$/, ""))) : [];
+    const { rows: patchRows, wasCompacted } = isLine
+      ? focusLinePatchRows(rawPatchRows, this.start, this.end, this.focusOnly)
+      : { rows: rawPatchRows, wasCompacted: false };
+    const patchWidth = Math.max(300, ...patchRows.map((row) => (row.text.length + 1) * 7.5 + 110));
+    const patchLine = (row) => renderDiffLine(div, h_flex, row, t, { h: 19, numW: 36, prefixW: 18, gap: 6 });
+
+    const scrollKey = `${cur?.hash ?? ""}:${this.focusOnly ? 1 : 0}:${patchRows.length}`;
+    if (isLine && cur?.patch && patchRows.length > 0 && scrollKey !== this.lastScrolledKey) {
+      this.lastScrolledKey = scrollKey;
+      const focusIdx = findPatchFocusIndex(patchRows);
+      this.diffScroll?.scroll_to_item(focusIdx, "center");
+    }
 
     return v_flex()
       .id("git-line-history")
@@ -242,6 +433,17 @@ export default class GitLineHistory extends View {
             el.child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(`${this.range} · ${commits.length} commit${commits.length === 1 ? "" : "s"}`)),
           )
           .when(!this.range, (el) => el.child(div().flex_1()))
+          .when(isLine && Boolean(this.blameInfo) && cur?.hash !== this.blameInfo.hash, (el) =>
+            el.child(
+              div()
+                .id("lh-blame-jump")
+                .px(7).py(2).rounded(5).bg(t.ansi2 + "28").text_size(11).font_semibold().text_color(t.ansi2)
+                .cursor_pointer().hover((s) => s.bg(t.ansi2 + "44"))
+                .tooltip(`跳转到语义上最后修改第 ${this.start}${this.end !== this.start ? `-${this.end}` : ""} 行的提交 (git blame -w)`)
+                .on_click((_e, cx) => this.jumpToBlame(cx))
+                .child(`★ 实际修改: ${this.blameInfo.short}`),
+            ),
+          )
           .when(Boolean(this.on), (el) =>
             el.child(div().px(6).py(2).rounded(4).bg(t.hover).text_size(11).text_color(t.muted).child(this.on)),
           )
@@ -318,7 +520,22 @@ export default class GitLineHistory extends View {
                     .border_b(1)
                     .border_color(t.border)
                     .child(div().flex_none().font_semibold().text_size(11.5).text_color(t.accent).child(cur?.short ?? ""))
-                    .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(cur?.subject ?? "Diff")),
+                    .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(cur?.subject ?? "Diff"))
+                    .when(isLine && Boolean(cur?.patch) && (wasCompacted || !this.focusOnly), (el2) =>
+                      el2.child(
+                        div()
+                          .id("lh-focus-toggle")
+                          .flex_none()
+                          .px(6).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted)
+                          .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_click((_e, cx) => {
+                            this.focusOnly = !this.focusOnly;
+                            this.lastScrolledKey = "";
+                            cx.notify();
+                          })
+                          .child(this.focusOnly ? "展开完整补丁" : "聚焦选定行"),
+                      ),
+                    ),
                 )
                 .child(
                   div()
@@ -342,7 +559,9 @@ export default class GitLineHistory extends View {
                                 .child(
                                   v_virtual_list("lh-diff-list", patchRows.length, 19, (i) => String(i), (range) =>
                                     patchRows.slice(range.start, range.end).map(patchLine),
-                                  ).size_full(),
+                                  )
+                                    .track_scroll(this.diffScroll)
+                                    .size_full(),
                                 ),
                             )
                         : div().size_full().p(10).text_size(11.5).text_color(t.dim).child(this.patchLoading ? "Loading commit diff…" : "(no patch for this commit)"),
