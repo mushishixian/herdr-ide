@@ -12,5 +12,6 @@
   "refreshSec": 10,
   "fetchSec": 60,
   "coolInactiveFresh": true,
-  "autoRestoreFiles": true
+  "autoRestoreFiles": true,
+  "autoResumeAgent": true
 }

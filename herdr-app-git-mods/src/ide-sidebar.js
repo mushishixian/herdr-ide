@@ -149,11 +149,15 @@ export default class IdeSidebar extends View {
         cx2.notify();
       }
     });
-    this.bootSettings(cx);
+    this.bootPromise = this.bootSettings(cx);
     this.refresh(cx);
+    cx.spawn(async (cx2) => syncAgentSessions(cx2));
     cx.timer.every(25, (cx2) => this.pollSharedSignals(cx2));
     cx.timer.every(1500, (cx) => {
-      if (!checking()) this.syncWorkPane();
+      if (!checking()) {
+        this.syncWorkPane();
+        cx.spawn(async (cx2) => syncAgentSessions(cx2));
+      }
       if (locationKey() !== this.context) {
         this.refresh(cx);
       } else if (this.view === "scm" && this.root && !this.loading && !this.probing) {
@@ -480,6 +484,22 @@ export default class IdeSidebar extends View {
       }
     } catch {}
     try {
+      const rawWs = await readTextFile(`${appHome()}/ws-history.json`);
+      if (rawWs) {
+        const disk = JSON.parse(rawWs);
+        if (disk && typeof disk === "object") {
+          const cur = shared("ide.ws.history") ?? {};
+          const merged = { ...disk, ...cur };
+          for (const [k, v] of Object.entries(disk)) {
+            if (!cur[k]?.lastFiles?.length && v?.lastFiles?.length) {
+              merged[k] = { ...(cur[k] ?? {}), ...v };
+            }
+          }
+          setShared("ide.ws.history", merged);
+        }
+      }
+    } catch {}
+    try {
       const raw = await readTextFile(`${appHome()}/ai-commit.json`);
       if (raw) {
         const cfg = JSON.parse(raw);
@@ -534,6 +554,7 @@ export default class IdeSidebar extends View {
     const switched = k !== this.context;
     if (switched) {
       this.context = k;
+      cx.spawn(async (cx2) => syncAgentSessions(cx2));
       this.cwd = cwd;
       this.on = on;
       this.root = null;
@@ -609,25 +630,54 @@ export default class IdeSidebar extends View {
     cx.spawn(async (cx) => {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
+        await this.bootPromise?.catch(() => {});
         if (this.context !== targetContext || myLoadSeq !== this.loadSeq) return;
+        const cfgNow = getIdeSettings();
         this.root = top?.code === 0 ? top.stdout.trim() : null;
         const base = this.root || cwd;
         this.watch(base, cx);
 
-        const snap = recordWorkspaceSnapshot(space, this.root, this.view);
-        if (switched && space && !this.autoTriedSpaces.has(space.id)) {
+        const prevSnap = shared("ide.ws.history")?.[wsHistoryKey(space, this.root)] ?? null;
+        let restoredExplorerView = false;
+        const firstVisit = Boolean(switched && space && !this.autoTriedSpaces.has(space.id));
+        if (firstVisit) {
           this.autoTriedSpaces.add(space.id);
-          if (snap?.lastView && this.view !== snap.lastView) this.view = snap.lastView;
-          if (cfg.autoRestoreFiles && snap?.lastFiles?.length) {
-            const activeTab = space.tabs?.find((t) => t.active)?.id;
-            const sp = shared("ide.editor.spawning");
-            const alreadyActive = activeTab && (
-              (sp && sp.tab === activeTab && Date.now() - sp.at < 3000) ||
-              panes().some((p) => p.tab === activeTab && isLiveEditor(p))
-            );
-            if (!alreadyActive) {
-              const first = snap.lastFiles[0];
+          if (prevSnap?.lastView && this.view !== prevSnap.lastView) {
+            this.view = prevSnap.lastView;
+            restoredExplorerView = this.view === "explorer";
+          }
+        }
+        const snap = recordWorkspaceSnapshot(space, this.root, this.view);
+        if (restoredExplorerView && !this.entries.size && !this.loadingExplorer) {
+          this.refresh(cx);
+        }
+        if (firstVisit && cfgNow.autoRestoreFiles) {
+          const activeTab = space?.tabs?.find((t) => t.active)?.id;
+          const sp = shared("ide.editor.spawning");
+          const tabPanes = activeTab ? panes().filter((p) => p.tab === activeTab) : [];
+          const alreadyActive = activeTab && (
+            (sp && sp.tab === activeTab && Date.now() - sp.at < 3000) ||
+            tabPanes.some((p) => isLiveEditor(p))
+          );
+          if (!alreadyActive) {
+            const first = snap?.lastFiles?.[0] ?? null;
+            if (first?.file) {
               openInCenterEditor({ file: first.file, root: base, on, line: first.line ?? 1, direct: true }, cx);
+            } else if (tabPanes.length) {
+              const termsByAddr = terminalMap();
+              const deadTerm = tabPanes
+                .map((p) => (p.terminal && isDeadEditorShell(p, termsByAddr) ? termsByAddr.get(p.terminal) : null))
+                .find(Boolean);
+              const lblFile = deadTerm?.labels?.["ide.editor_file"];
+              if (lblFile) {
+                openInCenterEditor({
+                  file: lblFile,
+                  root: deadTerm.labels["ide.editor_root"] || base,
+                  on,
+                  line: Number(deadTerm.labels["ide.editor_line"] || 1) || 1,
+                  direct: true,
+                }, cx);
+              }
             }
           }
         }
@@ -636,7 +686,7 @@ export default class IdeSidebar extends View {
           const rel = this.normalizeRelPath(lastFile, base);
           if (rel) {
             this.activeFile = rel;
-            if (cfg.autoReveal !== false) {
+            if (cfgNow.autoReveal !== false) {
               this.revealFileInExplorer(rel, cx, { scroll: this.view === "explorer", rootOverride: base });
             }
           }
@@ -769,6 +819,10 @@ export default class IdeSidebar extends View {
       const changed = rel !== this.lastFreshFile || rel !== this.activeFile;
       this.lastFreshFile = rel;
       this.activeFile = rel;
+      if (changed) {
+        const { space } = getContext();
+        rememberOpenedFile(space, base, rel, 1);
+      }
       if (getIdeSettings().autoReveal !== false && (changed || forceReveal)) {
         this.revealFileInExplorer(rel, cx, { scroll: this.view === "explorer", force: forceReveal });
       } else if (changed) {
@@ -1933,6 +1987,7 @@ export default class IdeSidebar extends View {
           .p(6)
           .gap(1)
           .child(section("WORKSPACE & AGENT MEMORY"))
+          .child(row("set-auto-res", "Auto-reconnect agent session", cfg.autoResumeAgent ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoResumeAgent: !cfg.autoResumeAgent }); cx.notify(); }))
           .child(row("set-auto-files", "Auto-restore open files", cfg.autoRestoreFiles ? "On" : "Off", (_e, cx) => { updateIdeSettings({ autoRestoreFiles: !cfg.autoRestoreFiles }); cx.notify(); }))
 
           .child(section("EDITOR & LAYOUT"))

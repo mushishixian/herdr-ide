@@ -19,7 +19,8 @@ const DEFAULT_IDE_SETTINGS = {
   refreshSec: 10,
   fetchSec: 60,
   coolInactiveFresh: true,
-  autoRestoreFiles: false,
+  autoRestoreFiles: true,
+  autoResumeAgent: true,
   autoReveal: true,
 };
 
@@ -157,12 +158,28 @@ function sq(s) {
   return String(s).replace(/'/g, "'\\''");
 }
 
+let wsHistoryWriteChain = Promise.resolve();
+const lastEditorFileLabel = new Map();
+
+function persistWsHistory(all) {
+  wsHistoryWriteChain = wsHistoryWriteChain
+    .then(async () => {
+      const path = `${appHome()}/ws-history.json`;
+      const prev = await readTextFile(path).catch(() => null);
+      const next = JSON.stringify(all, null, 2);
+      if (prev !== next) await writeTextFile(path, next, prev);
+    })
+    .catch(() => {});
+}
+
 function recordWorkspaceSnapshot(space, root, activeView) {
   if (!space) return null;
   const key = wsHistoryKey(space, root);
   const all = { ...(shared("ide.ws.history") ?? {}) };
   const prev = all[key] ?? {};
   const cwd = root || space.folder || prev.cwd || null;
+  const viewChanged = (activeView ?? prev.lastView ?? "scm") !== prev.lastView;
+  const metaChanged = !prev.key || prev.cwd !== cwd || prev.spaceName !== space.name;
 
   const next = {
     ...prev,
@@ -175,6 +192,7 @@ function recordWorkspaceSnapshot(space, root, activeView) {
   };
   all[key] = next;
   setShared("ide.ws.history", all);
+  if (viewChanged || metaChanged) persistWsHistory(all);
   return next;
 }
 
@@ -189,15 +207,38 @@ function publishActiveFile(file, root, on) {
   });
 }
 
+function labelEditorTerminalFile(space, root, file, line) {
+  const activeTab = space?.tabs?.find((t) => t.active)?.id;
+  if (!activeTab || !file) return;
+  const tabPanes = panes().filter((p) => p.tab === activeTab);
+  const trackedId = shared("ide.editor.paneByTab")?.[activeTab] ?? null;
+  const ed = tabPanes.find((p) => p.terminal && isEditorPane(p, trackedId));
+  if (!ed?.terminal) return;
+  const ln = String(line ?? 1);
+  const sig = `${file}\0${root || ""}\0${ln}`;
+  if (lastEditorFileLabel.get(ed.terminal) === sig) return;
+  lastEditorFileLabel.set(ed.terminal, sig);
+  const args = ["label", ed.terminal, `ide.editor_file=${file}`, `ide.editor_line=${ln}`];
+  if (root) args.push(`ide.editor_root=${root}`);
+  hc(args).catch(() => {
+    lastEditorFileLabel.delete(ed.terminal);
+  });
+}
+
 function rememberOpenedFile(space, root, file, line) {
   if (!space || !file) return;
   const key = wsHistoryKey(space, root);
   const all = { ...(shared("ide.ws.history") ?? {}) };
   const prev = all[key] ?? {};
+  const ln = line ?? 1;
+  const top = prev.lastFiles?.[0];
+  const sameTop = top && top.file === file && (top.line ?? 1) === ln;
   const files = (prev.lastFiles ?? []).filter((f) => f.file !== file);
-  files.unshift({ file, line: line ?? 1 });
-  all[key] = { ...prev, key, cwd: root || space.folder, lastFiles: files.slice(0, 8), updatedAt: Date.now() };
+  files.unshift({ file, line: ln });
+  all[key] = { ...prev, key, spaceName: space.name, machine: space.machine ?? null, cwd: root || space.folder, lastFiles: files.slice(0, 8), updatedAt: Date.now() };
   setShared("ide.ws.history", all);
+  if (!sameTop) persistWsHistory(all);
+  labelEditorTerminalFile(space, root || space.folder, file, ln);
 }
 
 const labeledEditorTerms = new Set();
@@ -219,8 +260,12 @@ function isLiveEditor(p) {
 function isDeadEditorShell(p, termsByAddr) {
   if (!p || !p.terminal || p.program?.agent || isLiveEditor(p)) return false;
   const term = termsByAddr ? termsByAddr.get(p.terminal) : terminals().find((t) => t.address === p.terminal);
-  if (term?.labels?.["ide.editor"] !== "1" && term?.labels?.["ide.fresh-ctx"] !== "1") return false;
-  return !p.program || Boolean(p.program.shell);
+  if (!term?.labels) return false;
+  if (term.labels["ide.editor"] === "1") return !p.program || Boolean(p.program.shell);
+  if (term.labels["ide.fresh-ctx"] === "1" && !term.labels["ide.agent"] && !term.labels["ide.agent_session"]) {
+    return !p.program || Boolean(p.program.shell);
+  }
+  return false;
 }
 
 function isEditorPane(p, trackedPaneId, termsByAddr) {
@@ -405,7 +450,8 @@ function openExternalEditor(engine, file, root, on, line) {
 }
 
 function freshLaunchBash(root, daemonName, target) {
-  return `cd '${sq(root)}' && export FRESH_IDE_DAEMON='${daemonName}' && F="$HOME/.local/share/fresh-editor/fresh"; [ -x "$F" ] || F=fresh; exec "$F" --no-upgrade-check -a '${daemonName}' '${sq(target)}'`;
+  const arg = target ? `'${sq(target)}'` : "--restore";
+  return `cd '${sq(root)}' && export FRESH_IDE_DAEMON='${daemonName}' && F="$HOME/.local/share/fresh-editor/fresh"; [ -x "$F" ] || F=fresh; exec "$F" --no-upgrade-check -a '${daemonName}' ${arg}`;
 }
 
 async function wakeFreshDaemon(daemonName, on) {
@@ -1170,4 +1216,402 @@ async function saveText(absPath, content, prevRaw, on) {
     if (res.code !== 0) throw new Error(res.stderr || "Failed to write file");
   }
   setShared("ide.git.dirtySeq", (shared("ide.git.dirtySeq") ?? 0) + 1);
+}
+
+// ── Agent Session Persistence & Auto-Reconnect ────────────────────────────────
+const AGENT_KIND_RULES = [
+  ["agy", /antigravity|\bagy\b/],
+  ["cmdc", /command[- ]?code|\bcmdc\b/],
+  ["codebuddy", /codebuddy|\bcbc\b/],
+  ["claude", /claude/],
+  ["codex", /codex/],
+  ["opencode", /opencode/],
+  ["omp", /oh-my-pi|\bomp\b/],
+  ["pi", /\bpi\b|pi-coding/],
+  ["gemini", /gemini/],
+];
+
+// Value-taking flags preserved when building a reconnect command; positional prompts & old session flags are stripped.
+const AGENT_VALUE_FLAGS = new Set([
+  "-m", "--model", "--models", "--effort", "--mode", "--agent", "-p", "--profile",
+  "--permission-mode", "--approval-mode", "--thinking", "--add-dir", "-s", "--sandbox",
+  "-a", "--ask-for-approval", "-c", "--config", "--theme", "--tools", "--tools-enable",
+  "--project", "--service-tier",
+]);
+
+const AGENT_STRIP_FLAGS = new Set([
+  "-c", "--continue", "-r", "--resume", "--conversation", "--session", "--session-id",
+  "--fork", "--fork-session", "--no-session", "--no-session-persistence",
+  "-p", "--print", "--prompt", "-i", "--prompt-interactive", "--last", "--all",
+]);
+
+const AGENT_SESSION_PROBE_PY = `
+import glob, json, os, re, sqlite3, sys
+
+def proc_ctime(pid):
+    try: return os.stat(f"/proc/{pid}").st_ctime
+    except Exception: return 0.0
+
+def proc_ppid(pid):
+    try:
+        s = open(f"/proc/{pid}/stat", encoding="utf-8", errors="ignore").read()
+        return s[s.rfind(")") + 2:].split()[1]
+    except Exception:
+        return None
+
+def child_pids(pid):
+    out, q = [str(pid)], [str(pid)]
+    while q:
+        cur = q.pop(0)
+        for p in glob.glob(f"/proc/{cur}/task/*/children"):
+            try:
+                for c in open(p).read().split():
+                    if c not in out:
+                        out.append(c); q.append(c)
+            except Exception: pass
+    return out
+
+def from_argv(kind, argv):
+    a = argv or []
+    for i, tok in enumerate(a):
+        if kind == "agy":
+            if tok == "--conversation" and i + 1 < len(a): return a[i + 1]
+            if tok.startswith("--conversation="): return tok.split("=", 1)[1]
+        elif kind in ("cmdc", "claude", "codebuddy"):
+            if tok in ("-r", "--resume", "--session", "--session-id") and i + 1 < len(a) and not a[i + 1].startswith("-"):
+                return a[i + 1]
+            for pfx in ("--resume=", "--session=", "--session-id="):
+                if tok.startswith(pfx): return tok.split("=", 1)[1]
+        elif kind == "codex":
+            if tok == "resume":
+                for nxt in a[i + 1:]:
+                    if not nxt.startswith("-"): return nxt
+        elif kind in ("opencode", "pi", "omp", "gemini"):
+            if tok in ("-s", "--session", "-r", "--resume") and i + 1 < len(a) and not a[i + 1].startswith("-"):
+                v = a[i + 1]
+                if v and v != "latest": return v
+            for pfx in ("--session=", "--resume="):
+                if tok.startswith(pfx):
+                    v = tok.split("=", 1)[1]
+                    if v and v != "latest": return v
+    return None
+
+def probe_one(item):
+    pid = str(item.get("pid") or "")
+    kind = item.get("kind") or ""
+    cwd = item.get("cwd") or ""
+    argv = item.get("argv") or []
+    sid = from_argv(kind, argv)
+    shell_pid = proc_ppid(pid) if pid else None
+    if sid: return {"sessionId": sid, "shellPid": shell_pid}
+    if not pid or not os.path.isdir(f"/proc/{pid}"): return {"sessionId": None, "shellPid": shell_pid}
+    start_ts = proc_ctime(pid)
+    pids = child_pids(pid)
+
+    if kind == "agy":
+        for p in pids:
+            for fd in glob.glob(f"/proc/{p}/fd/*"):
+                try:
+                    t = os.readlink(fd)
+                    m = re.search(r"/\\.gemini/antigravity-cli/presence/([^/]+)\\.lock$", t)
+                    if m: return {"sessionId": m.group(1), "shellPid": shell_pid}
+                except Exception: pass
+    elif kind in ("claude", "codebuddy"):
+        base = os.path.expanduser(f"~/.{kind}/sessions")
+        for p in pids:
+            f = os.path.join(base, f"{p}.json")
+            if os.path.isfile(f):
+                try:
+                    d = json.load(open(f, encoding="utf-8"))
+                    if d.get("sessionId"): return {"sessionId": d["sessionId"], "shellPid": shell_pid}
+                except Exception: pass
+    elif kind == "cmdc":
+        slug = re.sub(r"[/_]", "-", cwd.lstrip("/"))
+        d0 = os.path.expanduser(f"~/.commandcode/projects/{slug}")
+        dirs = [d0] if os.path.isdir(d0) else glob.glob(os.path.expanduser("~/.commandcode/projects/*"))
+        best = None
+        for d in dirs:
+            for f in glob.glob(os.path.join(d, "*.jsonl")):
+                if f.endswith(".checkpoints.jsonl"): continue
+                try:
+                    st = os.stat(f)
+                    if st.st_mtime < start_ts - 5: continue
+                    meta = json.loads(open(f, encoding="utf-8").readline())
+                    if cwd and meta.get("cwd") and meta.get("cwd") != cwd: continue
+                    cid = meta.get("id") or os.path.basename(f)[:-6]
+                    if best is None or st.st_mtime > best[0]: best = (st.st_mtime, cid)
+                except Exception: pass
+        if best: return {"sessionId": best[1], "shellPid": shell_pid}
+    elif kind == "codex":
+        for p in pids:
+            for fd in glob.glob(f"/proc/{p}/fd/*"):
+                try:
+                    t = os.readlink(fd)
+                    if "/.codex/sessions/" in t and t.endswith(".jsonl"):
+                        meta = json.loads(open(t, encoding="utf-8").readline())
+                        sid = (meta.get("payload") or {}).get("id") or (meta.get("payload") or {}).get("session_id")
+                        if sid: return {"sessionId": sid, "shellPid": shell_pid}
+                except Exception: pass
+        best = None
+        for f in glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/*.jsonl")):
+            try:
+                st = os.stat(f)
+                if st.st_mtime < start_ts - 5: continue
+                pl = (json.loads(open(f, encoding="utf-8").readline())).get("payload") or {}
+                if cwd and pl.get("cwd") and pl.get("cwd") != cwd: continue
+                sid = pl.get("id") or pl.get("session_id")
+                if sid and (best is None or st.st_mtime > best[0]): best = (st.st_mtime, sid)
+            except Exception: pass
+        if best: return {"sessionId": best[1], "shellPid": shell_pid}
+    elif kind in ("pi", "omp"):
+        root = os.path.expanduser("~/.pi/agent/sessions" if kind == "pi" else "~/.omp/agent/sessions")
+        slug = "--" + cwd.strip("/").replace("/", "-") + "--"
+        d0 = os.path.join(root, slug)
+        dirs = [d0] if os.path.isdir(d0) else glob.glob(os.path.join(root, "*"))
+        best = None
+        for dd in dirs:
+            for f in glob.glob(os.path.join(dd, "*.jsonl")):
+                try:
+                    st = os.stat(f)
+                    if st.st_mtime < start_ts - 5: continue
+                    meta = json.loads(open(f, encoding="utf-8").readline())
+                    if cwd and meta.get("cwd") and meta.get("cwd") != cwd: continue
+                    sid = meta.get("id")
+                    if sid and (best is None or st.st_mtime > best[0]): best = (st.st_mtime, sid)
+                except Exception: pass
+        if best: return {"sessionId": best[1], "shellPid": shell_pid}
+    elif kind == "opencode":
+        db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+        if os.path.isfile(db):
+            try:
+                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                row = conn.execute(
+                    "SELECT id FROM session WHERE directory = ? AND time_updated >= ? ORDER BY time_updated DESC LIMIT 1",
+                    (cwd, int((start_ts - 5) * 1000)),
+                ).fetchone()
+                conn.close()
+                if row: return {"sessionId": row[0], "shellPid": shell_pid}
+            except Exception: pass
+    return {"sessionId": None, "shellPid": shell_pid}
+
+items = json.loads(sys.argv[1])
+print(json.dumps({it["address"]: probe_one(it) for it in items}))
+`;
+
+const agentProbeCache = new Map(); // addr -> { fgPid, sessionId, shellPid, checkedAt }
+const reconnectedShells = new Set(); // `${addr}:${shellPid}`
+let agentSyncBusy = false;
+
+function detectAgentKindFromTerm(term, pane) {
+  const candidates = [
+    term?.foreground?.name,
+    String(term?.foreground?.argv?.[0] ?? "").split("/").pop(),
+    pane?.program?.key,
+    pane?.program?.name,
+    term?.app,
+    term?.status?.app,
+  ];
+  for (const raw of candidates) {
+    const s = String(raw || "").toLowerCase();
+    if (!s || s === "zsh" || s === "bash" || s === "sh" || s === "fish" || s === "fresh") continue;
+    for (const [kind, re] of AGENT_KIND_RULES) {
+      if (re.test(s)) return kind;
+    }
+  }
+  return null;
+}
+
+function buildAgentResumeCommand(kind, sessionId, origArgv) {
+  const rawArgv = Array.isArray(origArgv) && origArgv.length ? origArgv : [kind];
+  const bin = String(rawArgv[0] || kind).split("/").pop() || kind;
+  const kept = [];
+  for (let i = 1; i < rawArgv.length; i++) {
+    const tok = String(rawArgv[i] ?? "");
+    if (!tok) continue;
+    if (kind === "codex" && tok === "resume") {
+      if (i + 1 < rawArgv.length && !String(rawArgv[i + 1]).startsWith("-")) i++;
+      continue;
+    }
+    const eqIdx = tok.indexOf("=");
+    const flagName = eqIdx > 0 ? tok.slice(0, eqIdx) : tok;
+    if (AGENT_STRIP_FLAGS.has(flagName)) {
+      const needsVal = eqIdx < 0 && flagName !== "-c" && flagName !== "--continue" && flagName !== "--fork-session" && flagName !== "--no-session" && flagName !== "--no-session-persistence" && flagName !== "--last" && flagName !== "--all" && flagName !== "--print" && flagName !== "-p";
+      if (needsVal && i + 1 < rawArgv.length && !String(rawArgv[i + 1]).startsWith("-")) i++;
+      continue;
+    }
+    if (!tok.startsWith("-")) continue; // drop positional prompt
+    kept.push(tok);
+    if (eqIdx < 0 && AGENT_VALUE_FLAGS.has(tok) && i + 1 < rawArgv.length) {
+      kept.push(String(rawArgv[++i]));
+    }
+  }
+  let parts;
+  if (kind === "agy") parts = [bin, ...kept, "--conversation", sessionId];
+  else if (kind === "cmdc" || kind === "claude" || kind === "codebuddy") parts = [bin, ...kept, "--resume", sessionId];
+  else if (kind === "codex") parts = [bin, "resume", ...kept, sessionId];
+  else if (kind === "opencode") parts = [bin, "-s", sessionId, ...kept];
+  else if (kind === "pi") parts = [bin, "--session", sessionId, ...kept];
+  else if (kind === "omp" || kind === "gemini") parts = [bin, "--resume", sessionId, ...kept];
+  else parts = [bin, ...kept];
+
+  return parts.map((p) => (/^[A-Za-z0-9_./:=+-]+$/.test(p) ? p : `'${sq(p)}'`)).join(" ");
+}
+
+function saveAgentSessionBackup(entry) {
+  if (!entry?.spaceId || !entry?.kind || !entry?.sessionId) return;
+  const key = `${entry.spaceId}:${entry.cwd || ""}`;
+  const all = { ...(shared("ide.agent.sessions") ?? {}) };
+  const prev = all[key];
+  if (prev && prev.sessionId === entry.sessionId && prev.cmd === entry.cmd && prev.terminal === entry.terminal) return;
+  all[key] = entry;
+  setShared("ide.agent.sessions", all);
+  try {
+    const path = `${appHome()}/agent-sessions.json`;
+    readTextFile(path).then((old) => writeTextFile(path, JSON.stringify(all, null, 2), old)).catch(() => {});
+  } catch {}
+}
+
+async function syncAgentSessions(cx) {
+  if (agentSyncBusy) return;
+  const space = spaces().find((s) => s.active);
+  const activeTab = space?.tabs?.find((t) => t.active)?.id;
+  if (!space || !activeTab) return;
+  const tabPanes = panes().filter((p) => p.tab === activeTab);
+  if (!tabPanes.length) return;
+  const termsByAddr = terminalMap();
+  const cfg = getIdeSettings();
+  const on = space.machine ?? null;
+  const now = Date.now();
+
+  agentSyncBusy = true;
+  try {
+    const toProbe = [];
+    const toReconnect = [];
+
+    for (const p of tabPanes) {
+      if (!p.terminal) continue;
+      const t = termsByAddr.get(p.terminal);
+      if (!t || t.state !== "live") continue;
+
+      const kind = detectAgentKindFromTerm(t, p);
+      if (kind && t.foreground?.pid) {
+        const fgPid = String(t.foreground.pid);
+        const cached = agentProbeCache.get(t.address);
+        const needProbe =
+          !cached ||
+          cached.fgPid !== fgPid ||
+          (!cached.sessionId && now - cached.checkedAt >= 6000) ||
+          (cached.sessionId && t.labels?.["ide.agent_session"] !== cached.sessionId);
+        if (needProbe) {
+          toProbe.push({
+            pane: p,
+            term: t,
+            kind,
+            fgPid,
+            argv: t.foreground?.argv ?? [kind],
+            cwd: t.foreground?.cwd || t.cwd || space.folder || "",
+          });
+        }
+        continue;
+      }
+
+      // No live agent in this terminal: check if it previously held an active session.
+      const lbl = t.labels ?? {};
+      const fgName = String(t.foreground?.name || "").toLowerCase();
+      const fgIsShell = !fgName || /^(zsh|bash|sh|fish|dash)$/.test(fgName);
+      const isIdleShell = fgIsShell && (!p.program || Boolean(p.program.shell));
+      if (isIdleShell && lbl["ide.agent_active"] === "1" && lbl["ide.agent_cmd"]) {
+        toReconnect.push({ pane: p, term: t, lbl });
+      }
+    }
+
+    if (toProbe.length && (on !== null || win()?.platform !== "windows")) {
+      const payload = toProbe.map((x) => ({ address: x.term.address, pid: x.fgPid, kind: x.kind, cwd: x.cwd, argv: x.argv }));
+      const r = await exec("python3", ["-c", AGENT_SESSION_PROBE_PY, JSON.stringify(payload)], { on, timeout: 4000 }).catch(() => null);
+      let resMap = null;
+      if (r?.code === 0 && r.stdout) {
+        try { resMap = JSON.parse(r.stdout); } catch {}
+      }
+      for (const item of toProbe) {
+        const info = resMap?.[item.term.address];
+        const sessionId = info?.sessionId || null;
+        const shellPid = item.term.pid ?? info?.shellPid ?? null;
+        agentProbeCache.set(item.term.address, { fgPid: item.fgPid, sessionId, shellPid, checkedAt: Date.now() });
+        if (!sessionId) continue;
+
+        const cmd = buildAgentResumeCommand(item.kind, sessionId, item.argv);
+        const lbl = item.term.labels ?? {};
+        const updates = [];
+        if (lbl["ide.agent"] !== item.kind) updates.push(`ide.agent=${item.kind}`);
+        if (lbl["ide.agent_session"] !== sessionId) updates.push(`ide.agent_session=${sessionId}`);
+        if (lbl["ide.agent_cmd"] !== cmd) updates.push(`ide.agent_cmd=${cmd}`);
+        if (item.cwd && lbl["ide.agent_cwd"] !== item.cwd) updates.push(`ide.agent_cwd=${item.cwd}`);
+        if (shellPid && lbl["ide.agent_shell_pid"] !== String(shellPid)) updates.push(`ide.agent_shell_pid=${shellPid}`);
+        if (lbl["ide.agent_active"] !== "1") updates.push("ide.agent_active=1");
+        if (updates.length) {
+          await hc(["label", item.term.address, ...updates]).catch(() => {});
+        }
+        saveAgentSessionBackup({
+          spaceId: space.id,
+          tabId: activeTab,
+          terminal: item.term.address,
+          kind: item.kind,
+          sessionId,
+          cmd,
+          cwd: item.cwd,
+          updatedAt: Date.now(),
+        });
+      }
+    }
+
+    for (const item of toReconnect) {
+      let curPid = item.term.pid ?? null;
+      if (curPid == null) {
+        const gr = await hc(["get", item.term.address]).catch(() => null);
+        if (gr?.code === 0 && gr.stdout) {
+          try {
+            const g = JSON.parse(gr.stdout);
+            curPid = g?.pid ?? null;
+            if (g?.foreground?.name && g.foreground.name !== "zsh" && g.foreground.name !== "bash" && g.foreground.name !== "sh") {
+              continue; // something is already running in this pane
+            }
+          } catch {}
+        }
+      }
+      if (curPid == null) continue;
+      const oldPid = item.lbl["ide.agent_shell_pid"];
+      const key = `${item.term.address}:${curPid}`;
+      if (reconnectedShells.has(key)) continue;
+
+      if (oldPid && String(curPid) === String(oldPid)) {
+        // Same outer shell PID -> user manually exited the agent; clear auto-reconnect flag.
+        await hc(["label", item.term.address, "ide.agent_active=0"]).catch(() => {});
+        continue;
+      }
+
+      if (cfg.autoResumeAgent === false) continue;
+
+      // Different outer shell PID -> herdr-core restarted this pane; reconnect inside it.
+      reconnectedShells.add(key);
+      await hc(["label", item.term.address, `ide.agent_shell_pid=${curPid}`]).catch(() => {});
+      if (cx?.sleep && item.term.turn === 0) await cx.sleep(350);
+      const savedCwd = item.lbl["ide.agent_cwd"];
+      const cmd = item.lbl["ide.agent_cmd"];
+      const fullCmd = savedCwd && item.term.cwd && item.term.cwd !== savedCwd
+        ? `cd '${sq(savedCwd)}' && ${cmd}`
+        : cmd;
+      const sr = await hc(["send", item.term.address, fullCmd]).catch(() => null);
+      if (sr?.code === 0) {
+        const shortSid = (item.lbl["ide.agent_session"] || "").slice(0, 8);
+        notify({
+          title: "Agent 会话已重连",
+          body: `${item.lbl["ide.agent"] || "agent"}${shortSid ? ` (${shortSid}…)` : ""}`,
+          level: "info",
+          timeout: 3000,
+        });
+      }
+    }
+  } finally {
+    agentSyncBusy = false;
+  }
 }
