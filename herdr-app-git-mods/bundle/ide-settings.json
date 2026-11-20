@@ -4,6 +4,7 @@
   "iconTheme": "material",
   "sidebarWidth": 300,
   "spacesWidth": 210,
+  "bottomTermHeight": 160,
   "showHidden": true,
   "gitDecorations": true,
   "confirmDelete": true,

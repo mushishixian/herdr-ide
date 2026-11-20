@@ -1,5 +1,5 @@
 import {
-  spaces, panes, terminals, focused, exec, hc, readTextFile, writeTextFile,
+  spaces, panes, terminals, focused, exec, hc, layout, readTextFile, writeTextFile,
   shared, setShared, run, appHome, notify, window as win, openOverlay, closeOverlay,
 } from "herdr";
 
@@ -11,6 +11,7 @@ const DEFAULT_IDE_SETTINGS = {
   iconTheme: "material",          // "material" | "emoji" | "minimal"
   sidebarWidth: 300,
   spacesWidth: 210,
+  bottomTermHeight: 160,
   showHidden: false,
   gitDecorations: true,
   confirmDelete: true,
@@ -245,73 +246,129 @@ const labeledEditorTerms = new Set();
 const jumpingByTab = new Map();
 let bottomToggleBusy = false;
 
+function findLayoutNode(node, id) {
+  if (!node) return null;
+  if (node.id === id) return node;
+  for (const child of node.children ?? []) {
+    const hit = findLayoutNode(child, id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function ensureBottomTerminalForSpace(space, cwd, on) {
+  const bareSpaceId = String(space?.id || "default").split("/").pop();
+  const bySpace = { ...(shared("ide.bottomTerm.bySpace") ?? {}) };
+  const remembered = bySpace[space?.id] ?? null;
+  const terms = terminals();
+  const live = terms.find(
+    (t) =>
+      t.state === "live" &&
+      (t.labels?.["ide.bottom-space"] === bareSpaceId || (remembered && t.address === remembered)),
+  );
+  if (live) {
+    if (space?.id && bySpace[space.id] !== live.address) {
+      bySpace[space.id] = live.address;
+      setShared("ide.bottomTerm.bySpace", bySpace);
+    }
+    return live.address;
+  }
+  const args = ["run", "--json", "--bg", "--keep", "--no-parent", "--no-notify", "--outlive-parent"];
+  if (on) args.push("--on", on);
+  if (cwd) args.push("--cwd", cwd);
+  args.push("--label", `ide.bottom-space=${bareSpaceId}`);
+  const r = await hc(args).catch(() => null);
+  if (!r || r.code !== 0 || !r.stdout) return null;
+  let addr = null;
+  try { addr = JSON.parse(r.stdout)?.address ?? null; } catch {}
+  if (!addr) return null;
+  if (on && !addr.includes("/")) addr = `${on}/${addr}`;
+  if (space?.id) {
+    bySpace[space.id] = addr;
+    setShared("ide.bottomTerm.bySpace", bySpace);
+  }
+  return addr;
+}
+
+function computeEditorBottomRect(space, cfg) {
+  const heightPx = Number(cfg.bottomTermHeight) || 160;
+  const curLayout = layout();
+  const spacesNode = findLayoutNode(curLayout, "spaces-rail");
+  const sidebarNode = findLayoutNode(curLayout, "sidebar");
+  const winBarW = shared("ide.winSize")?.width ?? 0;
+  const sbSize = shared("ide.sidebarSize");
+  const spacesW = spacesNode && !spacesNode.hidden ? (spacesNode.size?.px ?? cfg.spacesWidth ?? 210) : 0;
+  const sidebarW = sidebarNode && !sidebarNode.hidden ? (sbSize?.width || sidebarNode.size?.px || cfg.sidebarWidth || 300) : 0;
+  const bodyH = sbSize?.height || 720;
+
+  const leftX = 6 + (spacesW > 0 ? spacesW + 8 : 0) + (sidebarW > 0 ? sidebarW + 8 : 0);
+  const fullWinW = winBarW > 0 ? winBarW + 12 : leftX + 960;
+  const mainW = Math.max(360, fullWinW - leftX - 6);
+
+  const activeTab = space?.tabs?.find((t) => t.active)?.id;
+  const tabPanes = activeTab ? panes().filter((p) => p.tab === activeTab) : [];
+  const termsByAddr = terminalMap();
+  const trackedId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
+  const hasRightPane = tabPanes.some((p) => !isEditorPane(p, trackedId, termsByAddr));
+  const edW = hasRightPane ? Math.max(320, Math.floor((mainW - 8) / 2)) : mainW;
+
+  const bodyTop = 6 + 38 + 8;
+  const y = Math.max(bodyTop + 40, bodyTop + bodyH - heightPx);
+  return { x: leftX, y, width: edW, height: heightPx };
+}
+
+async function openOrSyncBottomTerminal(cx, { focusTerm = true } = {}) {
+  const space = spaces().find((s) => s.active);
+  if (!space) return;
+  const cfg = getIdeSettings();
+  const { cwd, on } = getContext();
+  const targetCwd = cwd || space.folder;
+  const addr = await ensureBottomTerminalForSpace(space, targetCwd, on ?? space.machine ?? null);
+  if (!addr) return;
+
+  const prevOv = shared("ide.bottomTerm.overlay");
+  if (prevOv) {
+    closeOverlay(prevOv);
+    setShared("ide.bottomTerm.overlay", null);
+  }
+  const rect = computeEditorBottomRect(space, cfg);
+  const ovId = openOverlay({
+    kind: "window",
+    width: rect.width,
+    height: rect.height,
+    at: { x: rect.x, y: rect.y },
+    layout: {
+      type: "column",
+      children: [
+        { id: "ide-bot-hdr", type: "block", size: { px: 24 }, content: { mod: "ide-bottom-bar", props: { terminal: addr, cwd: targetCwd } } },
+        { id: "ide-bot-term", type: "block", content: { terminal: addr } },
+      ],
+    },
+  });
+  setShared("ide.bottomTerm.overlay", ovId);
+}
+
 async function toggleBottomTerminal(cx) {
   if (bottomToggleBusy) return;
   const space = spaces().find((s) => s.active);
-  const activeTab = space?.tabs?.find((t) => t.active)?.id;
-  if (!activeTab) return;
-  const bareTabId = String(activeTab).split("/").pop();
-  const tabPanes = panes().filter((p) => p.tab === activeTab);
-  if (!tabPanes.length) return;
-  const termsByAddr = terminalMap();
-  const trackedId = shared("ide.editor.paneByTab")?.[activeTab] ?? null;
-  const editorPane = pickEditorPanes(tabPanes, trackedId, getIdeSettings(), termsByAddr, null)[0] ?? null;
-  const bottomMap = { ...(shared("ide.bottomTerm.byTab") ?? {}) };
-  const rememberedAddr = bottomMap[activeTab] ?? null;
+  if (!space) return;
+  const cfg = getIdeSettings();
+  const existingOv = shared("ide.bottomTerm.overlay");
 
-  const isBottomTerm = (t) => Boolean(t && (t.labels?.["ide.bottom-for"] === bareTabId || (rememberedAddr && t.address === rememberedAddr)));
-
-  // 1. Currently visible in this tab -> park it (keeps shell/cwd/history alive) and return focus to editor.
-  const visibleBottom = tabPanes.find((p) => p.terminal && isBottomTerm(termsByAddr.get(p.terminal)));
-  if (visibleBottom) {
-    if (tabPanes.length <= 1) return;
-    run("terminal.park", { terminal: visibleBottom.terminal });
-    if (editorPane) run("pane.focus", { pane: editorPane.pane });
+  if (existingOv) {
+    setShared("ide.bottomTerm.overlay", null);
+    closeOverlay(existingOv);
+    const activeTab = space.tabs?.find((t) => t.active)?.id;
+    const tabPanes = activeTab ? panes().filter((p) => p.tab === activeTab) : [];
+    const trackedId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
+    const ed = pickEditorPanes(tabPanes, trackedId, cfg, terminalMap(), null)[0] ?? tabPanes[0];
+    if (ed) run("pane.focus", { pane: ed.pane });
     return;
   }
 
-  const anchorPane = editorPane ?? tabPanes.find((p) => p.focused) ?? tabPanes[0];
-  if (!anchorPane) return;
-
   bottomToggleBusy = true;
   try {
-    // 2. Parked in background -> bring it back below the editor pane.
-    const visibleAddrs = new Set(panes().map((p) => p.terminal).filter(Boolean));
-    const parkedBottom = [...termsByAddr.values()].find((t) => t.state === "live" && isBottomTerm(t) && !visibleAddrs.has(t.address));
-    if (parkedBottom) {
-      run("pane.focus", { pane: anchorPane.pane });
-      if (cx?.sleep) await cx.sleep(40);
-      run("terminal.keep", { terminal: parkedBottom.address, place: "down" });
-      if (cx?.sleep) {
-        for (const waitMs of [40, 80, 160]) {
-          await cx.sleep(waitMs);
-          if (panes().some((p) => p.tab === activeTab && p.terminal === parkedBottom.address)) {
-            run("pane.focus", { terminal: parkedBottom.address });
-            break;
-          }
-        }
-      }
-      return;
-    }
-
-    // 3. Not created yet -> split down under the editor pane and tag it.
-    const beforeIds = new Set(tabPanes.map((p) => p.pane));
-    run("pane.split", { direction: "down", pane: anchorPane.pane });
-    if (cx?.sleep) {
-      for (const waitMs of [40, 80, 140, 240, 400]) {
-        await cx.sleep(waitMs);
-        const created = panes().find((p) => p.tab === activeTab && !beforeIds.has(p.pane));
-        if (created) {
-          if (created.terminal) {
-            bottomMap[activeTab] = created.terminal;
-            setShared("ide.bottomTerm.byTab", bottomMap);
-            hc(["label", created.terminal, `ide.bottom-for=${bareTabId}`]).catch(() => {});
-          }
-          run("pane.focus", { pane: created.pane });
-          break;
-        }
-      }
-    }
+    await openOrSyncBottomTerminal(cx, { focusTerm: true });
   } finally {
     bottomToggleBusy = false;
   }

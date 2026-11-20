@@ -161,6 +161,10 @@ Deploy-Mod "terminals-bar-git" $null $tbCode
 $toastCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\ide-toast.js"), $utf8NoBom)
 Deploy-Mod "ide-toast" @{ place = "none" } $toastCode
 
+# 8b. Title bar for the Alt+F12 bottom terminal window
+$botBarCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "src\ide-bottom-bar.js"), $utf8NoBom)
+Deploy-Mod "ide-bottom-bar" @{ place = "none"; title = "Bottom Terminal Bar" } $botBarCode
+
 # Git history popups: selected-line history (opened by ide-editor Ctrl+Alt+O or
 # relayed from Fresh via ide-sidebar) and repository commit history (Ctrl+Alt+H).
 $glhRaw = Bundle-WithCommon "src\git-line-history.js"

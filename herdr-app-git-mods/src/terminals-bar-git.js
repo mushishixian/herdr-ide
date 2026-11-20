@@ -180,6 +180,13 @@ export default class TerminalsBarGit extends View {
     };
 
     return h_flex()
+      .id("terminals-bar-git")
+      .on_size_change((sz) => {
+        const prev = shared("ide.winSize");
+        if (!prev || prev.width !== sz.width) {
+          setShared("ide.winSize", { width: sz.width, height: prev?.height ?? 0 });
+        }
+      })
       .size_full()
       .gap(6)
       .items_center()

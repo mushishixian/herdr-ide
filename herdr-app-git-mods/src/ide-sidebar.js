@@ -2,7 +2,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list, ScrollHandle } from "gpui-base";
 import {
   spaces, panes, terminals, focused, exec, readTextFile, writeTextFile, watchFolder,
-  theme, settings, openOverlay, notify, checking, appHome, window as win,
+  theme, settings, layout, openOverlay, notify, checking, appHome, window as win,
   run, shared, setShared, nextCommand,
 } from "herdr";
 
@@ -134,6 +134,7 @@ export default class IdeSidebar extends View {
     setShared("ide.recent.overlay", null);
     setShared("ide.glh.open", null);
     setShared("ide.diff.overlay", null);
+    setShared("ide.bottomTerm.overlay", null);
     // Global keystrokes reach the sidebar (always shown) as <mod>.<command>
     // via keys.json: ctrl-tab switches recent files, and ctrl-alt-o relays the
     // Fresh editor's line-history request (git_line_history.ts writes it and
@@ -556,6 +557,9 @@ export default class IdeSidebar extends View {
     if (switched) {
       this.context = k;
       cx.spawn(async (cx2) => syncAgentSessions(cx2));
+      if (shared("ide.bottomTerm.overlay")) {
+        cx.spawn(async (cx2) => openOrSyncBottomTerminal(cx2, { focusTerm: false }));
+      }
       this.cwd = cwd;
       this.on = on;
       this.root = null;
@@ -2024,6 +2028,14 @@ export default class IdeSidebar extends View {
             run("layout.resize", { id: "spaces-rail", px: w });
             cx.notify();
           }))
+          .child(row("set-bot-h", "Bottom Terminal Height", `${cfg.bottomTermHeight}px`, (_e, cx) => {
+            const h = cycle(cfg.bottomTermHeight, [120, 160, 200, 240, 300, 360]);
+            updateIdeSettings({ bottomTermHeight: h });
+            if (shared("ide.bottomTerm.overlay")) {
+              cx.spawn(async (cx2) => openOrSyncBottomTerminal(cx2, { focusTerm: false }));
+            }
+            cx.notify();
+          }))
 
           .child(section("EXPLORER"))
           .child(row("set-autoreveal", "Auto Reveal Active File", cfg.autoReveal !== false ? "On" : "Off", (_e, cx) => {
@@ -2106,6 +2118,12 @@ export default class IdeSidebar extends View {
 
     return v_flex()
       .id("ide-sidebar")
+      .on_size_change((sz) => {
+        const prev = shared("ide.sidebarSize");
+        if (!prev || prev.width !== sz.width || prev.height !== sz.height) {
+          setShared("ide.sidebarSize", { width: sz.width, height: sz.height });
+        }
+      })
       .track_focus(this.handle)
       .size_full()
       .min_h(0)
