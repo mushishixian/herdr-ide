@@ -205,18 +205,8 @@ export default class GitLineHistory extends View {
     });
 
     const patchRows = cur?.patch ? diffRows(cur.patch.split("\n").map((l) => l.replace(/\r$/, ""))) : [];
-    const patchWidth = Math.max(300, ...patchRows.map((row) => (row.text.length + 1) * 7.5 + 40));
-    const patchLine = (row) =>
-      row.kind === "@"
-        ? div().w_full().px(10).h(19).flex_none().truncate().bg(t.raised).text_color(t.accent).child(row.text)
-        : h_flex()
-            .w_full()
-            .h(19)
-            .flex_none()
-            .when(row.kind === "+", (e) => e.bg(t.ansi2 + "18"))
-            .when(row.kind === "-", (e) => e.bg(t.ansi1 + "18"))
-            .child(div().w(14).flex_none().text_color(row.kind === "+" ? t.ansi2 : row.kind === "-" ? t.ansi1 : t.dim).child(row.kind || " "))
-            .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(row.text));
+    const patchWidth = Math.max(300, ...patchRows.map((row) => (row.text.length + 1) * 7.5 + 72));
+    const patchLine = (row) => renderDiffLine(div, h_flex, row, t, { h: 19, numW: 0, prefixW: 14, gap: 4 });
 
     return v_flex()
       .id("git-line-history")

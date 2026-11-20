@@ -1066,15 +1066,184 @@ const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((
 
 function diffRows(lines) {
   let old = 0, next = 0;
-  return lines.map((line) => {
+  let inFileHeader = false;
+  let seenDiff = false;
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("diff --git ")) {
+      seenDiff = true;
+      inFileHeader = true;
+      let status = "M";
+      for (let j = i + 1; j < Math.min(lines.length, i + 6); j++) {
+        const l = lines[j];
+        if (l.startsWith("@@") || l.startsWith("diff --git ")) break;
+        if (l.startsWith("new file mode ")) { status = "A"; break; }
+        if (l.startsWith("deleted file mode ")) { status = "D"; break; }
+        if (l.startsWith("rename from ") || l.startsWith("copy from ") || l.startsWith("similarity index ")) { status = "R"; break; }
+      }
+      const m = /^diff --git a\/.+ b\/(.+)$/.exec(line);
+      rows.push({ kind: "file", status, filePath: m ? m[1] : line.slice(11), text: untab(line) });
+      continue;
+    }
     const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
-    if (match) { old = +match[1]; next = +match[2]; return { kind: "@", text: line }; }
+    if (match) {
+      old = +match[1];
+      next = +match[2];
+      seenDiff = true;
+      inFileHeader = false;
+      rows.push({ kind: "@", text: untab(line) });
+      continue;
+    }
+    if (!seenDiff && (line.startsWith("--- ") || line.startsWith("+++ "))) {
+      inFileHeader = true;
+    }
+    if (inFileHeader) {
+      if (
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ") ||
+        line.startsWith("index ") ||
+        line.startsWith("new file mode ") ||
+        line.startsWith("deleted file mode ") ||
+        line.startsWith("old mode ") ||
+        line.startsWith("new mode ") ||
+        line.startsWith("rename ") ||
+        line.startsWith("copy ") ||
+        line.startsWith("similarity ") ||
+        line.startsWith("Binary files ")
+      ) {
+        rows.push({ kind: "hdr", text: untab(line) });
+        continue;
+      }
+    }
+    if (!seenDiff) {
+      rows.push({ kind: "meta", text: untab(line) });
+      continue;
+    }
     const kind = line[0];
-    if (kind === "-") return { kind, number: old++, text: untab(line.slice(1)) || " " };
-    if (kind === "+") return { kind, number: next++, text: untab(line.slice(1)) || " " };
-    if (kind === " ") { old++; return { kind, number: next++, text: untab(line.slice(1)) || " " }; }
-    return { kind: "", text: untab(line) };
-  });
+    if (kind === "-") { rows.push({ kind, number: old++, text: untab(line.slice(1)) || " " }); continue; }
+    if (kind === "+") { rows.push({ kind, number: next++, text: untab(line.slice(1)) || " " }); continue; }
+    if (kind === " ") { old++; rows.push({ kind, number: next++, text: untab(line.slice(1)) || " " }); continue; }
+    if (kind === "\\") { rows.push({ kind: "note", text: untab(line) }); continue; }
+    rows.push({ kind: "", text: untab(line) });
+  }
+  return rows;
+}
+
+const DIFF_FILE_STATUS = {
+  A: { tag: "A 新增", key: "ansi2" },
+  D: { tag: "D 删除", key: "ansi1" },
+  R: { tag: "R 重命名", key: "blocked" },
+  M: { tag: "M 修改", key: "blocked" },
+};
+
+function renderDiffLine(divFn, hFlexFn, row, t, opts = {}) {
+  const h = opts.h ?? 20;
+  const numW = opts.numW ?? 36;
+  const prefixW = opts.prefixW ?? 14;
+  const gap = opts.gap ?? 8;
+
+  if (row.kind === "file") {
+    const meta = DIFF_FILE_STATUS[row.status] ?? DIFF_FILE_STATUS.M;
+    const col = t[meta.key] ?? t.accent;
+    return hFlexFn()
+      .w_full()
+      .h(h + 3)
+      .flex_none()
+      .px(8)
+      .gap(8)
+      .items_center()
+      .bg(t.raised)
+      .border_l(3)
+      .border_color(col)
+      .child(divFn().px(5).py(0.5).rounded(3).bg(col + "30").text_size(10.5).font_bold().text_color(col).child(meta.tag))
+      .child(divFn().flex_1().min_w(0).truncate().font_semibold().text_color(t.foreground).child(row.filePath || row.text));
+  }
+  if (row.kind === "hdr") {
+    const txt = row.text;
+    const col = txt.startsWith("+++") || txt.startsWith("new file") || txt.startsWith("rename to")
+      ? t.ansi2
+      : txt.startsWith("---") || txt.startsWith("deleted file") || txt.startsWith("rename from")
+        ? t.ansi1
+        : t.dim;
+    return hFlexFn()
+      .w_full()
+      .h(h)
+      .flex_none()
+      .px(8)
+      .items_center()
+      .bg(t.surface)
+      .border_l(3)
+      .border_color(col + "80")
+      .child(divFn().flex_1().min_w(0).truncate().text_color(col).child(txt));
+  }
+  if (row.kind === "@") {
+    return hFlexFn()
+      .w_full()
+      .h(h)
+      .flex_none()
+      .px(8)
+      .items_center()
+      .bg(t.accent + "22")
+      .border_l(3)
+      .border_color(t.accent)
+      .child(divFn().flex_1().min_w(0).truncate().font_semibold().text_color(t.accent).child(row.text));
+  }
+  if (row.kind === "meta") {
+    const isCommitHdr = row.text.startsWith("commit ");
+    return hFlexFn()
+      .w_full()
+      .h(h)
+      .flex_none()
+      .px(8)
+      .items_center()
+      .border_l(3)
+      .border_color(isCommitHdr ? t.accent : "#00000000")
+      .when(isCommitHdr, (e) => e.bg(t.chrome))
+      .child(
+        divFn()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_color(isCommitHdr ? t.accent : t.foreground)
+          .when(isCommitHdr, (e) => e.font_semibold())
+          .child(row.text || " "),
+      );
+  }
+  if (row.kind === "+" || row.kind === "-") {
+    const isAdd = row.kind === "+";
+    const col = isAdd ? t.ansi2 : t.ansi1;
+    let el = hFlexFn()
+      .w_full()
+      .h(h)
+      .flex_none()
+      .items_center()
+      .gap(gap)
+      .bg(col + "38")
+      .border_l(3)
+      .border_color(col);
+    if (numW > 0) {
+      el = el.child(divFn().w(numW).flex_none().text_right().text_color(col + "cc").child(row.number === undefined ? "" : String(row.number)));
+    }
+    return el
+      .child(divFn().w(prefixW).flex_none().text_center().font_bold().text_color(col).child(row.kind))
+      .child(divFn().flex_1().min_w(0).truncate().text_color(col).child(row.text));
+  }
+
+  let el = hFlexFn()
+    .w_full()
+    .h(h)
+    .flex_none()
+    .items_center()
+    .gap(gap)
+    .border_l(3)
+    .border_color("#00000000");
+  if (numW > 0) {
+    el = el.child(divFn().w(numW).flex_none().text_right().text_color(t.dim).child(row.number === undefined ? "" : String(row.number)));
+  }
+  return el
+    .child(divFn().w(prefixW).flex_none().text_center().text_color(t.dim).child(row.kind === "note" ? "\\" : " "))
+    .child(divFn().flex_1().min_w(0).truncate().text_color(row.kind === "note" ? t.dim : t.muted).child(row.text));
 }
 
 function toBase64Utf8(str) {
@@ -1782,4 +1951,60 @@ async function syncAgentSessions(cx) {
   } finally {
     agentSyncBusy = false;
   }
+}
+
+async function sendSelectionToAgent(cx) {
+  const space = spaces().find((s) => s.active);
+  const on = space?.machine ?? null;
+  let req = null;
+  try {
+    const r = await exec(
+      "sh",
+      ["-c", 'p="${XDG_STATE_HOME:-$HOME/.local/state}/fresh-ide/send-to-agent-request.json"; [ -f "$p" ] && cat "$p"'],
+      { on, timeout: 5000 },
+    );
+    const raw = r.code === 0 ? r.stdout : null;
+    const q = raw ? JSON.parse(raw) : null;
+    const age = Date.now() - (q?.ts ?? 0);
+    if (q?.text && age >= -10000 && age < 60000) req = q;
+  } catch {}
+  if (!req) {
+    notify({ title: "Send to Agent", body: "No editor selection found.", level: "info", timeout: 2500 });
+    return;
+  }
+
+  const trackedEdId = space ? shared("ide.editor.paneByTab")?.[space.active_tab] : null;
+  const terms = terminals();
+  const termsByAddr = new Map(terms.map((t) => [t.address, t]));
+  const spacePanes = panes();
+  const activeTab = space?.active_tab ?? spacePanes.find((p) => p.focused)?.tab ?? spacePanes[0]?.tab;
+  const tabPanes = activeTab ? spacePanes.filter((p) => p.tab === activeTab) : spacePanes;
+  const nonEd = tabPanes.filter(
+    (p) => p.terminal && !isEditorPane(p, trackedEdId, termsByAddr) && !termsByAddr.get(p.terminal)?.labels?.["ide.bottom-for"],
+  );
+
+  let target = null;
+  for (const p of nonEd) {
+    const term = termsByAddr.get(p.terminal);
+    if (p.program?.agent || term?.labels?.["ide.agent_active"] === "1" || detectAgentKindFromTerm(term, p)) {
+      target = p;
+      break;
+    }
+  }
+  if (!target) {
+    const workId = activeTab ? shared("ide.workPaneByTab")?.[activeTab] : null;
+    if (workId) target = nonEd.find((p) => p.pane === workId) ?? null;
+  }
+  if (!target) target = findNonEditorTerminal(tabPanes, trackedEdId, termsByAddr) ?? nonEd[0] ?? null;
+
+  cx?.write_to_clipboard?.(req.text);
+  if (!target) {
+    notify({ title: "Send to Agent", body: "Copied to clipboard (no Agent pane found in this tab).", level: "warning", timeout: 3000 });
+    return;
+  }
+
+  run("pane.focus", { pane: target.pane });
+  if (cx?.sleep) await cx.sleep(80);
+  run("terminal.paste");
+  notify({ title: "Sent to Agent", body: req.label || "Selection pasted", level: "info", timeout: 2000 });
 }

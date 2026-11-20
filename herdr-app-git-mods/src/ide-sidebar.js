@@ -148,6 +148,7 @@ export default class IdeSidebar extends View {
         else if (cmd === "aiSync") this.startBgGitJob("ai-sync", cx2);
         else if (cmd === "sync") this.startBgGitJob("sync", cx2);
         else if (cmd === "toggleTerminal") toggleBottomTerminal(cx2);
+        else if (cmd === "sendToAgent") cx2.spawn(async (cx3) => { await sendSelectionToAgent(cx3); cx3.notify(); });
         cx2.notify();
       }
     });
@@ -1638,6 +1639,7 @@ export default class IdeSidebar extends View {
       const actBtn = (suffix, txt, tip, fn) =>
         div().id(`scm-${kind}-${suffix}-${idx}`).px(4).py(0.5).rounded(4).text_size(11).text_color(t.dim).tooltip(tip).hover((s) => s.bg(t.raised).text_color(t.foreground)).on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(fn).child(txt);
 
+      const statusColor = conflict || f.status === "D" ? t.ansi1 : f.status === "A" || f.status === "?" ? t.ansi2 : t.blocked;
       const fileName = f.path.split(/[\\/]/).pop() || f.path;
       return h_flex()
         .id(`scm-row-${kind}-${idx}`)
@@ -1658,9 +1660,9 @@ export default class IdeSidebar extends View {
             this.showDiff(f.path, staged, f.status === "?", cx);
           }
         })
-        .child(div().w(11).flex_none().text_size(10.5).font_semibold().text_color(conflict || f.status === "D" ? t.ansi1 : f.status === "A" || f.status === "?" ? t.ansi2 : t.blocked).child(f.status))
+        .child(div().w(15).h(15).flex_none().flex().items_center().justify_center().rounded(3).bg(statusColor + "28").text_size(10).font_bold().text_color(statusColor).child(f.status))
         .child(renderFileIcon(div, svg, fileName, false, false, cfg.iconTheme, t))
-        .child(div().flex_1().min_w(0).truncate().text_size(11.5).child(labelOverride ?? fileName))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(statusColor).child(labelOverride ?? fileName))
         .when(conflict, (el) => el.child(actBtn("res", "Resolve", "Open 3-way merge editor", () => openOverlay({ mod: "merge-editor", kind: "popup", at: "top", offset: 24, width: 0.76, height: 0.90, props: { file: f.path } }))))
         .when(staged, (el) =>
           el

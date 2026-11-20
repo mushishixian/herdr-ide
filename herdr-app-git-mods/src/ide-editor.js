@@ -190,7 +190,7 @@ export default class IdeEditor extends View {
         }
         tab.diffLines = rows;
         tab.diffStats = { add, del };
-        tab.diffWidth = Math.max(400, ...rows.map((row) => (row.text.length + 1) * 7.5 + 56));
+        tab.diffWidth = Math.max(400, ...rows.map((row) => (row.text.length + 1) * 7.5 + 84));
         this.error = null;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -422,8 +422,8 @@ export default class IdeEditor extends View {
             )
             .when(isDiff && Boolean(active.diffStats), (el2) =>
               el2
-                .child(div().text_color(t.ansi2).child(`+${active.diffStats.add}`))
-                .child(div().text_color(t.ansi1).child(`−${active.diffStats.del}`)),
+                .child(div().px(6).py(1).rounded(4).bg(t.ansi2 + "28").font_semibold().text_color(t.ansi2).child(`+${active.diffStats.add}`))
+                .child(div().px(6).py(1).rounded(4).bg(t.ansi1 + "28").font_semibold().text_color(t.ansi1).child(`−${active.diffStats.del}`)),
             ),
         ),
       )
@@ -452,18 +452,7 @@ export default class IdeEditor extends View {
                           .child(
                             v_virtual_list("ed-diff-list", active.diffLines.length, 20, (i) => String(i), (range) =>
                               active.diffLines.slice(range.start, range.end).map((row) =>
-                                row.kind === "@"
-                                  ? div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.accent).child(row.text)
-                                  : h_flex()
-                                      .w_full()
-                                      .h(20)
-                                      .flex_none()
-                                      .gap(10)
-                                      .when(row.kind === "+", (e) => e.bg(t.ansi2 + "18"))
-                                      .when(row.kind === "-", (e) => e.bg(t.ansi1 + "18"))
-                                      .child(div().w(36).flex_none().text_right().text_color(t.dim).child(row.number === undefined ? "" : String(row.number)))
-                                      .child(div().w(12).flex_none().text_color(row.kind === "+" ? t.ansi2 : row.kind === "-" ? t.ansi1 : t.dim).child(row.kind || " "))
-                                      .child(div().flex_1().min_w(0).truncate().child(row.text)),
+                                renderDiffLine(div, h_flex, row, t, { h: 20, numW: 36, prefixW: 14, gap: 8 }),
                               ),
                             ).size_full(),
                           ),

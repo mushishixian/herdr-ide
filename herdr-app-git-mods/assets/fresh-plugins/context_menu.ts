@@ -55,7 +55,6 @@ const BUILTIN_ACTIONS = new Set([
 const PLUGIN_COMMANDS = new Map<string, string>([
   ["git_line_history", "Git: Line History"],
   ["selection_copy_reference", "Selection: Copy as Reference"],
-  ["selection_send_to_agent", "Selection: Send to Agent"],
 ]);
 
 type Pointer = {
@@ -550,6 +549,89 @@ async function ctrlNavigate(ev: MouseClickHookArgs): Promise<void> {
   }
 }
 
+async function sendSelectionToAgent(): Promise<void> {
+  const bufferId = editor.getActiveBufferId();
+  const filePath = editor.getBufferPath(bufferId);
+  const cursor = editor.getPrimaryCursor();
+  if (!cursor) {
+    editor.setStatus("Send to Agent: no cursor");
+    return;
+  }
+  const cwd = editor.getCwd();
+  const text = await editor.getBufferText(bufferId);
+  const starts: number[] = [0];
+  let bytes = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (ch === "\n") starts.push(bytes);
+  }
+  const lineOf = (byte: number): number => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= byte) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  let startLine: number;
+  let endLine: number;
+  if (!cursor.selection || cursor.selection.start === cursor.selection.end) {
+    const l = lineOf(cursor.position) + 1;
+    startLine = l;
+    endLine = l;
+  } else {
+    const lo = Math.min(cursor.selection.start, cursor.selection.end);
+    const hi = Math.max(cursor.selection.start, cursor.selection.end);
+    const first = lineOf(lo);
+    let last = lineOf(hi);
+    if (last > first && hi === starts[last]) last -= 1;
+    startLine = first + 1;
+    endLine = last + 1;
+  }
+  const root = cwd.replace(/\/+$/, "");
+  const rawPath = filePath || "(unsaved)";
+  const rel = root && rawPath.startsWith(root + "/") ? rawPath.slice(root.length + 1) : rawPath;
+  const lineTag = startLine === endLine ? String(startLine) : `${startLine}-${endLine}`;
+  const label = `${rel}:${lineTag}`;
+  const body = text
+    .split("\n")
+    .slice(startLine - 1, endLine)
+    .map((l) => l.replace(/\r$/, ""))
+    .join("\n");
+  let longest = 0;
+  for (const run of body.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  const base = rawPath.slice(rawPath.lastIndexOf("/") + 1);
+  const dot = base.lastIndexOf(".");
+  const lang = dot > 0 ? base.slice(dot + 1) : "";
+  const formatted = `${label}\n${fence}${lang}\n${body}\n${fence}\n`;
+
+  try {
+    editor.setClipboard(formatted);
+  } catch {}
+
+  const xdg = editor.getEnv("XDG_STATE_HOME");
+  const home = editor.getEnv("HOME") ?? "";
+  const stateDir = `${xdg || (home ? `${home}/.local/state` : "/tmp")}/fresh-ide`;
+  const reqPath = `${stateDir}/send-to-agent-request.json`;
+  const payload = JSON.stringify({ ts: Date.now(), label, text: formatted, cwd, path: rawPath });
+  const wrote = editor.replaceFile(reqPath, payload) || editor.writeFile(reqPath, payload);
+  if (!wrote) {
+    await editor.spawnProcess("mkdir", ["-p", stateDir]).result;
+    editor.writeFile(reqPath, payload);
+  }
+
+  const res = await editor.spawnProcess("herdr-app.exe", ["do", "ide-sidebar.sendToAgent"], cwd).result;
+  if (res.exit_code !== 0) {
+    editor.setStatus(`Send to Agent failed (${res.exit_code})`);
+    return;
+  }
+  editor.setStatus(`Sent ${label} to Agent`);
+}
+
 async function on_request(path: string): Promise<void> {
   const name = path.split("/").pop() ?? "";
   if (name !== `${daemonKey}.json`) return;
@@ -588,8 +670,9 @@ async function on_request(path: string): Promise<void> {
 
   const action = typeof req.action === "string" ? req.action : "";
   const isBuiltin = BUILTIN_ACTIONS.has(action);
+  const isDirect = action === "selection_send_to_agent";
   const command = PLUGIN_COMMANDS.get(action);
-  if (!isBuiltin && !command) return;
+  if (!isBuiltin && !isDirect && !command) return;
   lastHandled = stamp;
 
   // No snapshot (the open request was missed) means the caret stays put;
@@ -603,6 +686,8 @@ async function on_request(path: string): Promise<void> {
   try {
     if (isBuiltin) {
       editor.executeAction(action);
+    } else if (isDirect) {
+      await sendSelectionToAgent();
     } else if (command) {
       await editor.runCommand(command);
     }
