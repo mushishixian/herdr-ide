@@ -75,7 +75,8 @@
     "ctrl-alt-z": "mod.open:git-undo",
     "ctrl-alt-h": "mod.open:git-history",
     "ctrl-shift-a": "ide-sidebar.aiCommit",
-    "ctrl-shift-alt-a": "ide-sidebar.aiSync"
+    "ctrl-shift-alt-a": "ide-sidebar.aiSync",
+    "alt-f12": "ide-sidebar.toggleTerminal"
   },
   "terminal": {
     "ctrl-backspace": "send:\u0017",

@@ -243,6 +243,79 @@ function rememberOpenedFile(space, root, file, line) {
 
 const labeledEditorTerms = new Set();
 const jumpingByTab = new Map();
+let bottomToggleBusy = false;
+
+async function toggleBottomTerminal(cx) {
+  if (bottomToggleBusy) return;
+  const space = spaces().find((s) => s.active);
+  const activeTab = space?.tabs?.find((t) => t.active)?.id;
+  if (!activeTab) return;
+  const bareTabId = String(activeTab).split("/").pop();
+  const tabPanes = panes().filter((p) => p.tab === activeTab);
+  if (!tabPanes.length) return;
+  const termsByAddr = terminalMap();
+  const trackedId = shared("ide.editor.paneByTab")?.[activeTab] ?? null;
+  const editorPane = pickEditorPanes(tabPanes, trackedId, getIdeSettings(), termsByAddr, null)[0] ?? null;
+  const bottomMap = { ...(shared("ide.bottomTerm.byTab") ?? {}) };
+  const rememberedAddr = bottomMap[activeTab] ?? null;
+
+  const isBottomTerm = (t) => Boolean(t && (t.labels?.["ide.bottom-for"] === bareTabId || (rememberedAddr && t.address === rememberedAddr)));
+
+  // 1. Currently visible in this tab -> park it (keeps shell/cwd/history alive) and return focus to editor.
+  const visibleBottom = tabPanes.find((p) => p.terminal && isBottomTerm(termsByAddr.get(p.terminal)));
+  if (visibleBottom) {
+    if (tabPanes.length <= 1) return;
+    run("terminal.park", { terminal: visibleBottom.terminal });
+    if (editorPane) run("pane.focus", { pane: editorPane.pane });
+    return;
+  }
+
+  const anchorPane = editorPane ?? tabPanes.find((p) => p.focused) ?? tabPanes[0];
+  if (!anchorPane) return;
+
+  bottomToggleBusy = true;
+  try {
+    // 2. Parked in background -> bring it back below the editor pane.
+    const visibleAddrs = new Set(panes().map((p) => p.terminal).filter(Boolean));
+    const parkedBottom = [...termsByAddr.values()].find((t) => t.state === "live" && isBottomTerm(t) && !visibleAddrs.has(t.address));
+    if (parkedBottom) {
+      run("pane.focus", { pane: anchorPane.pane });
+      if (cx?.sleep) await cx.sleep(40);
+      run("terminal.keep", { terminal: parkedBottom.address, place: "down" });
+      if (cx?.sleep) {
+        for (const waitMs of [40, 80, 160]) {
+          await cx.sleep(waitMs);
+          if (panes().some((p) => p.tab === activeTab && p.terminal === parkedBottom.address)) {
+            run("pane.focus", { terminal: parkedBottom.address });
+            break;
+          }
+        }
+      }
+      return;
+    }
+
+    // 3. Not created yet -> split down under the editor pane and tag it.
+    const beforeIds = new Set(tabPanes.map((p) => p.pane));
+    run("pane.split", { direction: "down", pane: anchorPane.pane });
+    if (cx?.sleep) {
+      for (const waitMs of [40, 80, 140, 240, 400]) {
+        await cx.sleep(waitMs);
+        const created = panes().find((p) => p.tab === activeTab && !beforeIds.has(p.pane));
+        if (created) {
+          if (created.terminal) {
+            bottomMap[activeTab] = created.terminal;
+            setShared("ide.bottomTerm.byTab", bottomMap);
+            hc(["label", created.terminal, `ide.bottom-for=${bareTabId}`]).catch(() => {});
+          }
+          run("pane.focus", { pane: created.pane });
+          break;
+        }
+      }
+    }
+  } finally {
+    bottomToggleBusy = false;
+  }
+}
 
 function terminalMap() {
   const map = new Map();
@@ -313,7 +386,9 @@ function pickEditorPanes(tabPanes, trackedId, cfg, termsByAddr, spawning) {
 }
 
 function findNonEditorTerminal(tabPanes, trackedId, termsByAddr) {
+  const isNotBottom = (p) => !p.terminal || !termsByAddr?.get(p.terminal)?.labels?.["ide.bottom-for"];
   return (
+    tabPanes.find((p) => p.terminal && isNotBottom(p) && !isEditorPane(p, trackedId, termsByAddr)) ??
     tabPanes.find((p) => p.terminal && !isEditorPane(p, trackedId, termsByAddr)) ??
     tabPanes.find((p) => !isEditorPane(p, trackedId, termsByAddr))
   );

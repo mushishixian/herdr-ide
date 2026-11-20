@@ -146,6 +146,7 @@ export default class IdeSidebar extends View {
         else if (cmd === "aiCommit") this.startBgGitJob("ai-commit", cx2);
         else if (cmd === "aiSync") this.startBgGitJob("ai-sync", cx2);
         else if (cmd === "sync") this.startBgGitJob("sync", cx2);
+        else if (cmd === "toggleTerminal") toggleBottomTerminal(cx2);
         cx2.notify();
       }
     });
