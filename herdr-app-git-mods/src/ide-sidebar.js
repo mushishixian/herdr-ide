@@ -2157,7 +2157,7 @@ export default class IdeSidebar extends View {
         .rounded(6)
         .text_size(11.5)
         .cursor_pointer()
-        .when(active, (el) => el.bg(t.accent).text_color("#ffffff").font_semibold())
+        .when(active, (el) => el.bg(t.selected).text_color(t.foreground).font_semibold())
         .when(!active, (el) => el.text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)))
         .on_click((_e, cx) => {
           if (id === "settings" && this.view === "settings") {
