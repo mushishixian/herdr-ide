@@ -87,6 +87,7 @@
     "ctrl-v": "terminal.paste_image",
     "ctrl-insert": "terminal.copy",
     "shift-insert": "terminal.paste",
-    "ctrl-tab": "ide-sidebar.recent"
+    "ctrl-tab": "ide-sidebar.recent",
+    "alt-f12": "ide-sidebar.toggleTerminal"
   }
 }
