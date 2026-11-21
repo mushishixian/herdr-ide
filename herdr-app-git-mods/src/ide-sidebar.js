@@ -975,8 +975,9 @@ export default class IdeSidebar extends View {
         } else {
           await exec("rm", ["-rf", abs], { on: this.on });
         }
+        bumpGitDirty();
         notify({ title: "Deleted", body: rel, level: "info" });
-        this.refresh(cx);
+        this.refresh(cx, { force: true });
       } catch (e) {
         this.note = String(e?.message ?? e);
         cx.notify();
@@ -1869,6 +1870,14 @@ export default class IdeSidebar extends View {
                   this.runGit(g.args, g.title, cx);
                 }))
                 .child(miniBtn("scm-git-no", "Cancel", "Cancel", (_e, cx) => { this.confirmGit = null; cx.notify(); })),
+            ),
+          )
+          .when(Boolean(this.confirmDel), (el2) =>
+            el2.child(
+              h_flex().mx(4).mt(4).p(7).gap(6).items_center().rounded(6).bg(t.raised).border_1().border_color(t.blocked)
+                .child(div().flex_1().truncate().text_size(11.5).child(`Delete ${this.confirmDel}?`))
+                .child(miniBtn("scm-del-yes", "Delete", "Delete file from disk", (_e, cx) => this.deleteItem(this.confirmDel, cx)))
+                .child(miniBtn("scm-del-no", "Cancel", "Cancel", (_e, cx) => { this.confirmDel = null; cx.notify(); })),
             ),
           )
           .child(
