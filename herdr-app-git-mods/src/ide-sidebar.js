@@ -134,7 +134,6 @@ export default class IdeSidebar extends View {
     setShared("ide.recent.overlay", null);
     setShared("ide.glh.open", null);
     setShared("ide.diff.overlay", null);
-    setShared("ide.bottomTerm.overlay", null);
     // Global keystrokes reach the sidebar (always shown) as <mod>.<command>
     // via keys.json: ctrl-tab switches recent files, and ctrl-alt-o relays the
     // Fresh editor's line-history request (git_line_history.ts writes it and
@@ -580,9 +579,6 @@ export default class IdeSidebar extends View {
     if (switched) {
       this.context = k;
       cx.spawn(async (cx2) => syncAgentSessions(cx2));
-      if (shared("ide.bottomTerm.overlay")) {
-        cx.spawn(async (cx2) => openOrSyncBottomTerminal(cx2, { focusTerm: false }));
-      }
       this.cwd = cwd;
       this.on = on;
       this.root = null;
@@ -2103,9 +2099,9 @@ export default class IdeSidebar extends View {
           .child(row("set-bot-h", "Bottom Terminal Height", `${cfg.bottomTermHeight}px`, (_e, cx) => {
             const h = cycle(cfg.bottomTermHeight, [120, 160, 200, 240, 300, 360]);
             updateIdeSettings({ bottomTermHeight: h });
-            if (shared("ide.bottomTerm.overlay")) {
-              cx.spawn(async (cx2) => openOrSyncBottomTerminal(cx2, { focusTerm: false }));
-            }
+            const addr = (shared("ide.bottomTerm.bySpace") ?? {})[spaces().find((s) => s.active)?.id ?? ""];
+            const pane = addr && panes().find((p) => p.terminal === addr);
+            if (pane) run("layout.resize", { id: pane.pane, px: h });
             cx.notify();
           }))
 

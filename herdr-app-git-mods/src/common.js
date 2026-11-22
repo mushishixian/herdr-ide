@@ -23,6 +23,7 @@ const DEFAULT_IDE_SETTINGS = {
   autoRestoreFiles: true,
   autoResumeAgent: true,
   autoReveal: true,
+  uiScale: 1,                     // chrome scale factor; 1080p reference is 1, 2K screens use ~1.33
 };
 
 function classifyFileIcon(name, isDir, isOpen) {
@@ -246,16 +247,6 @@ const labeledEditorTerms = new Set();
 const jumpingByTab = new Map();
 let bottomToggleBusy = false;
 
-function findLayoutNode(node, id) {
-  if (!node) return null;
-  if (node.id === id) return node;
-  for (const child of node.children ?? []) {
-    const hit = findLayoutNode(child, id);
-    if (hit) return hit;
-  }
-  return null;
-}
-
 async function ensureBottomTerminalForSpace(space, cwd, on) {
   const bareSpaceId = String(space?.id || "default").split("/").pop();
   const bySpace = { ...(shared("ide.bottomTerm.bySpace") ?? {}) };
@@ -290,85 +281,45 @@ async function ensureBottomTerminalForSpace(space, cwd, on) {
   return addr;
 }
 
-function computeEditorBottomRect(space, cfg) {
-  const heightPx = Number(cfg.bottomTermHeight) || 160;
-  const curLayout = layout();
-  const spacesNode = findLayoutNode(curLayout, "spaces-rail");
-  const sidebarNode = findLayoutNode(curLayout, "sidebar");
-  const winBarW = shared("ide.winSize")?.width ?? 0;
-  const sbSize = shared("ide.sidebarSize");
-  const spacesW = spacesNode && !spacesNode.hidden ? (spacesNode.size?.px ?? cfg.spacesWidth ?? 210) : 0;
-  const sidebarW = sidebarNode && !sidebarNode.hidden ? (sbSize?.width || sidebarNode.size?.px || cfg.sidebarWidth || 300) : 0;
-  const bodyH = sbSize?.height || 720;
-
-  const leftX = 6 + (spacesW > 0 ? spacesW + 8 : 0) + (sidebarW > 0 ? sidebarW + 8 : 0);
-  const fullWinW = winBarW > 0 ? winBarW + 12 : leftX + 960;
-  const mainW = Math.max(360, fullWinW - leftX - 6);
-
-  const activeTab = space?.tabs?.find((t) => t.active)?.id;
-  const tabPanes = activeTab ? panes().filter((p) => p.tab === activeTab) : [];
-  const termsByAddr = terminalMap();
-  const trackedId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
-  const hasRightPane = tabPanes.some((p) => !isEditorPane(p, trackedId, termsByAddr));
-  const edW = hasRightPane ? Math.max(320, Math.floor((mainW - 8) / 2)) : mainW;
-
-  const bodyTop = 6 + 38 + 8;
-  const y = Math.max(bodyTop + 40, bodyTop + bodyH - heightPx);
-  return { x: leftX, y, width: edW, height: heightPx };
-}
-
-async function openOrSyncBottomTerminal(cx, { focusTerm = true } = {}) {
-  const space = spaces().find((s) => s.active);
-  if (!space) return;
-  const cfg = getIdeSettings();
-  const { cwd, on } = getContext();
-  const targetCwd = cwd || space.folder;
-  const addr = await ensureBottomTerminalForSpace(space, targetCwd, on ?? space.machine ?? null);
-  if (!addr) return;
-
-  const prevOv = shared("ide.bottomTerm.overlay");
-  if (prevOv) {
-    closeOverlay(prevOv);
-    setShared("ide.bottomTerm.overlay", null);
-  }
-  const rect = computeEditorBottomRect(space, cfg);
-  const ovId = openOverlay({
-    kind: "window",
-    width: rect.width,
-    height: rect.height,
-    at: { x: rect.x, y: rect.y },
-    layout: {
-      type: "column",
-      children: [
-        { id: "ide-bot-hdr", type: "block", size: { px: 24 }, content: { mod: "ide-bottom-bar", props: { terminal: addr, cwd: targetCwd } } },
-        { id: "ide-bot-term", type: "block", content: { terminal: addr } },
-      ],
-    },
-  });
-  setShared("ide.bottomTerm.overlay", ovId);
-}
-
 async function toggleBottomTerminal(cx) {
   if (bottomToggleBusy) return;
   const space = spaces().find((s) => s.active);
   if (!space) return;
-  const cfg = getIdeSettings();
-  const existingOv = shared("ide.bottomTerm.overlay");
+  const { cwd, on } = getContext();
+  const addr = await ensureBottomTerminalForSpace(space, cwd || space.folder, on ?? space.machine ?? null);
+  if (!addr) return;
 
-  if (existingOv) {
-    setShared("ide.bottomTerm.overlay", null);
-    closeOverlay(existingOv);
-    const activeTab = space.tabs?.find((t) => t.active)?.id;
-    const tabPanes = activeTab ? panes().filter((p) => p.tab === activeTab) : [];
-    const trackedId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
-    const ed = pickEditorPanes(tabPanes, trackedId, cfg, terminalMap(), null)[0] ?? tabPanes[0];
-    if (ed) run("pane.focus", { pane: ed.pane });
+  const shown = panes().find((p) => p.terminal === addr);
+  if (shown) {
+    bottomToggleBusy = true;
+    try {
+      run("terminal.park", { terminal: addr });
+      const trackedId = shared("ide.editor.paneByTab")?.[shown.tab];
+      const ed = trackedId ? panes().find((p) => p.pane === trackedId) : null;
+      if (ed) run("pane.focus", { pane: ed.pane });
+    } finally {
+      bottomToggleBusy = false;
+    }
     return;
   }
 
   bottomToggleBusy = true;
   try {
-    await openOrSyncBottomTerminal(cx, { focusTerm: true });
+    // Split below the tracked editor pane, where the old floating terminal sat.
+    const activeTab = space.tabs?.find((t) => t.active)?.id;
+    const trackedId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
+    const host = (trackedId && panes().find((p) => p.pane === trackedId)) || panes().find((p) => p.tab === activeTab);
+    if (host && !host.focused) run("pane.focus", { pane: host.pane });
+    run("terminal.keep", { terminal: addr, place: "down" });
+    const height = Number(getIdeSettings().bottomTermHeight) || 160;
+    for (let i = 0; i < 20; i++) {
+      await cx.sleep(100);
+      const pane = panes().find((p) => p.terminal === addr);
+      if (!pane) continue;
+      run("layout.resize", { id: pane.pane, px: height });
+      run("pane.focus", { pane: pane.pane });
+      return;
+    }
   } finally {
     bottomToggleBusy = false;
   }

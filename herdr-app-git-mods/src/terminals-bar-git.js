@@ -4,6 +4,14 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, run, theme, home, openOverlay, window as win, shared, setShared } from "herdr";
 
+// Chrome lengths go through S(): uiScale (ide-settings.json) multiplies every
+// px value, so a 2K machine sets uiScale ~1.33 while 1080p keeps the default 1.
+const uiScale = () => {
+  const s = shared("ide.settings")?.uiScale;
+  return typeof s === "number" && s >= 0.5 && s <= 3 ? s : 1;
+};
+const S = (px) => Math.round(px * uiScale() * 100) / 100;
+
 // Top-bar palette derived from the theme so it follows light/dark appearance.
 let C = null;
 function refreshColors(t) {
@@ -36,18 +44,18 @@ function tile(t, p) {
   return div()
     .relative()
     .flex_none()
-    .w(24)
-    .h(24)
-    .rounded(8)
+    .w(S(24))
+    .h(S(24))
+    .rounded(S(8))
     .flex()
     .items_center()
     .justify_center()
     .bg(g?.tile ?? "#5a6370")
-    .when(Boolean(g?.icon && g.tint), (el) => el.child(svg(g.icon).size(14).text_color("#ffffff")))
-    .when(Boolean(g?.icon && !g.tint), (el) => el.child(image(g.icon).w(14).h(14)))
-    .when(!g?.icon, (el) => el.text_size(12).font_semibold().text_color("#ffffff").child(g?.glyph ?? ">"))
+    .when(Boolean(g?.icon && g.tint), (el) => el.child(svg(g.icon).size(S(14)).text_color("#ffffff")))
+    .when(Boolean(g?.icon && !g.tint), (el) => el.child(image(g.icon).w(S(14)).h(S(14))))
+    .when(!g?.icon, (el) => el.text_size(S(12)).font_semibold().text_color("#ffffff").child(g?.glyph ?? ">"))
     .when(Boolean(dot), (el) =>
-      el.child(div().absolute().top(-1).right(-1).w(7).h(7).rounded_full().bg(dot).border_1().border_color(C.tray)),
+      el.child(div().absolute().top(-1).right(-1).w(S(7)).h(S(7)).rounded_full().bg(dot).border_1().border_color(C.tray)),
     );
 }
 
@@ -60,8 +68,8 @@ function windowButton(id, icon, command) {
     div()
       .id(id)
       .flex_none()
-      .w(24)
-      .h(24)
+      .w(S(24))
+      .h(S(24))
       .rounded_full()
       .flex()
       .items_center()
@@ -71,7 +79,7 @@ function windowButton(id, icon, command) {
       .cursor_pointer()
       .hover((s) => s.bg(C.edge).text_color(C.text))
       .on_click(() => run(command))
-      .child(svg(`mods/terminals-bar-git/${icon}.svg`).size(14)),
+      .child(svg(`mods/terminals-bar-git/${icon}.svg`).size(S(14))),
   );
 }
 
@@ -79,27 +87,27 @@ function iconButton(id, icon, tip, onClick) {
   return own(div())
     .id(id)
     .flex_none()
-    .p(7)
-    .rounded(8)
+    .p(S(7))
+    .rounded(S(8))
     .text_color(C.dim)
     .cursor_pointer()
     .tooltip(tip)
     .hover((s) => s.bg(C.chip).text_color(C.text))
     .on_click(onClick)
-    .child(svg(`mods/terminals-bar-git/${icon}.svg`).size(16));
+    .child(svg(`mods/terminals-bar-git/${icon}.svg`).size(S(16)));
 }
 
 function pillBtn(id, label, tip, onClick) {
   return own(div())
     .id(id)
     .flex_none()
-    .h(26)
-    .px(8)
+    .h(S(26))
+    .px(S(8))
     .flex()
     .items_center()
-    .rounded(7)
+    .rounded(S(7))
     .bg(C.chip)
-    .text_size(11.5)
+    .text_size(S(11.5))
     .text_color(C.dim)
     .cursor_pointer()
     .tooltip(tip)
@@ -151,17 +159,17 @@ export default class TerminalsBarGit extends View {
       return own(h_flex())
         .id(`tm-${c.id}`)
         .flex_shrink(1)
-        .w(240)
+        .w(S(240))
         .min_w(0)
         .h_full()
-        .pl(5)
-        .pr(12)
-        .gap(9)
+        .pl(S(5))
+        .pr(S(12))
+        .gap(S(9))
         .items_center()
-        .rounded(13)
+        .rounded(S(13))
         .border_1()
         .cursor_pointer()
-        .text_size(13)
+        .text_size(S(13))
         .when(c.active, (el) => el.bg(C.tab).border_color(C.tabEdge))
         .when(!c.active, (el) => el.border_color("#00000000").hover((s) => s.bg(C.hover)))
         .on_click(() => run("tab.select", { id: c.id }))
@@ -172,7 +180,7 @@ export default class TerminalsBarGit extends View {
         .child(
           h_flex()
             .min_w(0)
-            .gap(6)
+            .gap(S(6))
             .truncate()
             .child(div().flex_none().text_color(c.active ? C.text : C.dim).child(c.name))
             .when(Boolean(where), (el) => el.child(div().truncate().text_color(C.dim).child(where))),
@@ -188,36 +196,36 @@ export default class TerminalsBarGit extends View {
         }
       })
       .size_full()
-      .gap(6)
+      .gap(S(6))
       .items_center()
-      .when(w.platform === "macos" && w.titlebar === "none" && !w.fullscreen, (el) => el.pl(72))
+      .when(w.platform === "macos" && w.titlebar === "none" && !w.fullscreen, (el) => el.pl(S(72)))
       .child(
         own(h_flex())
           .id("tm-space")
           .flex_none()
-          .h(30)
-          .pl(10)
-          .pr(12)
-          .gap(8)
+          .h(S(30))
+          .pl(S(10))
+          .pr(S(12))
+          .gap(S(8))
           .items_center()
           .rounded_full()
           .bg(C.chip)
           .cursor_pointer()
-          .text_size(13)
+          .text_size(S(13))
           .text_color(C.dim)
           .hover((s) => s.text_color(C.text))
           .on_click(() => openOverlay({ mod: "picker", kind: "popup", at: "top", offset: 40, width: 640, height: 0.8 }))
-          .child(svg("mods/terminals-bar-git/stack.svg").size(15))
-          .child(div().max_w(140).truncate().text_color(C.text).child(space.name)),
+          .child(svg("mods/terminals-bar-git/stack.svg").size(S(15)))
+          .child(div().max_w(S(140)).truncate().text_color(C.text).child(space.name)),
       )
       .child(
         h_flex()
           .flex_shrink(1)
           .min_w(0)
-          .h(36)
-          .p(3)
-          .gap(3)
-          .rounded(16)
+          .h(S(36))
+          .p(S(3))
+          .gap(S(3))
+          .rounded(S(16))
           .bg(C.tray)
           .children(space.tabs.map(tab)),
       )
@@ -228,9 +236,9 @@ export default class TerminalsBarGit extends View {
             own(h_flex())
               .id("tm-git-branch")
               .flex_none()
-              .h(28)
-              .px(9)
-              .gap(5)
+              .h(S(28))
+              .px(S(9))
+              .gap(S(5))
               .items_center()
               .rounded_full()
               .bg(C.chip)
@@ -238,8 +246,8 @@ export default class TerminalsBarGit extends View {
               .tooltip("Switch branch (Ctrl+Alt+C)")
               .hover((s) => s.bg(C.edge))
               .on_click(() => run("mod.open", { name: "git-branch" }))
-              .child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.accent))
-              .child(div().max_w(130).truncate().text_size(12).text_color(C.text).child(curBranch)),
+              .child(svg("mods/workspace-chrome/branch.svg").size(S(13)).text_color(t.accent))
+              .child(div().max_w(S(130)).truncate().text_size(S(12)).text_color(C.text).child(curBranch)),
           )
           .child(pillBtn("tm-git-new", "+", "New branch (Ctrl+Alt+N)", () => run("mod.open", { name: "git-new" })))
           .child(pillBtn("tm-git-merge", "Merge", "Merge branch (Ctrl+Alt+X)", () => run("mod.open", { name: "git-merge" })))
@@ -257,14 +265,14 @@ export default class TerminalsBarGit extends View {
         own(div())
           .id("tm-sidebar")
           .flex_none()
-          .p(6)
-          .rounded(8)
+          .p(S(6))
+          .rounded(S(8))
           .text_color(C.dim)
           .cursor_pointer()
           .tooltip("Toggle IDE Sidebar (Ctrl+Shift+B)")
           .hover((s) => s.bg(C.chip).text_color(C.text))
           .on_click(() => run("layout.toggle", { id: "sidebar" }))
-          .child(svg("mods/workspace-chrome/sidebar.svg").size(15)),
+          .child(svg("mods/workspace-chrome/sidebar.svg").size(S(15))),
       )
       .child(iconButton("tm-keys", "command", "Command Palette", () => run("app.palette")))
       .child(iconButton("tm-new", "plus", "New Tab", () => run("tab.new", { space: space.id })))
@@ -272,9 +280,9 @@ export default class TerminalsBarGit extends View {
         el.child(
           h_flex()
             .flex_none()
-            .pl(6)
-            .pr(4)
-            .gap(8)
+            .pl(S(6))
+            .pr(S(4))
+            .gap(S(8))
             .child(windowButton("tm-min", "win-min", "window.minimize"))
             .child(windowButton("tm-max", w.maximized ? "win-restore" : "win-max", "window.maximize"))
             .child(windowButton("tm-close", "win-close", "window.close")),
