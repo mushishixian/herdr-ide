@@ -61,7 +61,9 @@ export default class IdeSidebar extends View {
     this.pendingFolders = new Set();
     this.marks = {};
     this.newPrompt = null; // null | "file" | "dir"
-    this.confirmDel = null;
+    this.sel = new Set(); // explorer multi-selection (rel paths)
+    this.selAnchor = null; // anchor for shift+click range selection
+    this.visiblePaths = []; // explorer rows in display order, rebuilt each render
     this.confirmGit = null; // { prompt, args, title }
     this.renameFrom = null;
     this.clipboard = null; // { mode: "copy" | "cut", path }
@@ -589,7 +591,8 @@ export default class IdeSidebar extends View {
       this.watched = null;
       this.error = null;
       this.note = null;
-      this.confirmDel = null;
+      this.sel.clear();
+      this.selAnchor = null;
       this.activeFile = null;
       this.lastAutoRevealedFile = null;
       this.pendingRevealPath = null;
@@ -958,21 +961,72 @@ export default class IdeSidebar extends View {
     });
   }
 
+  toggleSelect(path, cx) {
+    if (this.sel.has(path)) this.sel.delete(path);
+    else this.sel.add(path);
+    this.selAnchor = path;
+    cx.notify();
+  }
+
+  selectRange(path, cx) {
+    const vis = this.visiblePaths;
+    const from = this.selAnchor ? vis.indexOf(this.selAnchor) : -1;
+    const to = vis.indexOf(path);
+    this.sel.clear();
+    if (from >= 0 && to >= 0) {
+      const lo = Math.min(from, to);
+      const hi = Math.max(from, to);
+      for (let i = lo; i <= hi; i++) this.sel.add(vis[i]);
+    } else {
+      this.sel.add(path);
+      this.selAnchor = path;
+    }
+    cx.notify();
+  }
+
   deleteItem(rel, cx) {
+    this.deleteItems([rel], cx);
+  }
+
+  openDeleteConfirm(targets) {
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 240,
+      props: {
+        items: [
+          {
+            id: "title",
+            label: targets.length > 1 ? `Delete ${targets.length} items?` : `Delete ${targets[0].split("/").pop()}?`,
+            disabled: true,
+          },
+          { sep: true },
+          { id: "del_yes", label: "Delete", danger: true, hint: "Enter" },
+          { id: "del_no", label: "Cancel", hint: "Esc" },
+        ],
+        payload: { source: "confirm-del", targets },
+      },
+    });
+  }
+
+  deleteItems(paths, cx) {
     const base = this.root || this.cwd;
-    if (!base) return;
-    this.confirmDel = null;
+    if (!base || !paths?.length) return;
+    this.sel.clear();
+    this.selAnchor = null;
+    const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
+    const abs = paths.map((rel) => `${base}${sep}${rel}`);
     cx.spawn(async (cx) => {
       try {
-        const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
-        const abs = `${base}${sep}${rel}`;
         if (!this.on && win()?.platform === "windows") {
-          await exec("powershell", ["-NoProfile", "-Command", `Remove-Item -LiteralPath '${abs.replace(/'/g, "''")}' -Recurse -Force`], { on: this.on });
+          const lits = abs.map((a) => `'${a.replace(/'/g, "''")}'`).join(",");
+          await exec("powershell", ["-NoProfile", "-Command", `Remove-Item -LiteralPath ${lits} -Recurse -Force`], { on: this.on });
         } else {
-          await exec("rm", ["-rf", abs], { on: this.on });
+          await exec("rm", ["-rf", ...abs], { on: this.on });
         }
         bumpGitDirty();
-        notify({ title: "Deleted", body: rel, level: "info" });
+        notify({ title: "Deleted", body: paths.length === 1 ? paths[0] : `${paths.length} items`, level: "info" });
         this.refresh(cx, { force: true });
       } catch (e) {
         this.note = String(e?.message ?? e);
@@ -1061,25 +1115,33 @@ export default class IdeSidebar extends View {
 
   openExplorerMenu(entry, path) {
     const parentDir = entry.dir ? path : (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
+    const multiSel = this.sel.size > 1 && this.sel.has(path);
+    const targets = multiSel ? [...this.sel] : [path];
     const items = [];
-    if (!entry.dir) {
+    if (!entry.dir && !multiSel) {
       items.push({ id: "open", label: "Open in Editor", hint: "Enter" });
       items.push({ sep: true });
     }
     items.push({ id: "new_file", label: "New File…" });
     items.push({ id: "new_folder", label: "New Folder…" });
     items.push({ sep: true });
-    items.push({ id: "cut", label: "Cut" });
-    items.push({ id: "copy", label: "Copy" });
-    if (this.clipboard) items.push({ id: "paste", label: `Paste (${this.clipboard.path.split("/").pop()})` });
-    if (!entry.dir) items.push({ id: "duplicate", label: "Duplicate" });
+    if (!multiSel) {
+      items.push({ id: "cut", label: "Cut" });
+      items.push({ id: "copy", label: "Copy" });
+      if (this.clipboard) items.push({ id: "paste", label: `Paste (${this.clipboard.path.split("/").pop()})` });
+      if (!entry.dir) items.push({ id: "duplicate", label: "Duplicate" });
+      items.push({ sep: true });
+      items.push({ id: "rename", label: "Rename…" });
+    }
+    items.push({ id: "delete", label: multiSel ? `Delete Selected (${targets.length})` : "Delete", danger: true });
     items.push({ sep: true });
-    items.push({ id: "rename", label: "Rename…" });
-    items.push({ id: "delete", label: "Delete", danger: true });
-    items.push({ sep: true });
-    items.push({ id: "copy_path", label: "Copy Path" });
-    items.push({ id: "copy_rel", label: "Copy Relative Path" });
-    if (this.root) {
+    if (multiSel) {
+      items.push({ id: "copy_rel", label: "Copy Relative Paths" });
+    } else {
+      items.push({ id: "copy_path", label: "Copy Path" });
+      items.push({ id: "copy_rel", label: "Copy Relative Path" });
+    }
+    if (this.root && !multiSel) {
       items.push({ sep: true });
       items.push({ id: "stage", label: "Git: Stage (git add)" });
       items.push({ id: "gitignore", label: "Add to .gitignore" });
@@ -1089,7 +1151,7 @@ export default class IdeSidebar extends View {
       kind: "popup",
       at: "pointer",
       width: 220,
-      props: { items, payload: { source: "explorer", path, dir: entry.dir, parentDir } },
+      props: { items, payload: { source: "explorer", path, dir: entry.dir, parentDir, paths: targets } },
     });
   }
 
@@ -1180,6 +1242,9 @@ export default class IdeSidebar extends View {
 
   handleMenuAction(act, cx) {
     const p = act.payload ?? {};
+    if (act.id === "del_yes") return this.deleteItems(p.targets ?? [], cx);
+    if (act.id === "del_no") return;
+    if (p.source === "confirm-del") return;
     if (p.source === "commit") {
       if (act.id === "show_ref") return this.showRefDiff(p.hash, false, cx);
       if (act.id === "cherry_pick") return this.runGit(["cherry-pick", "--", p.hash], `Cherry-picked ${p.hash}`, cx);
@@ -1249,12 +1314,9 @@ export default class IdeSidebar extends View {
       return;
     }
     if (act.id === "delete") {
-      if (getIdeSettings().confirmDelete) {
-        this.confirmDel = path;
-        cx.notify();
-      } else {
-        this.deleteItem(path, cx);
-      }
+      const targets = p.source === "explorer" && Array.isArray(p.paths) && p.paths.length > 1 ? p.paths : [path];
+      if (getIdeSettings().confirmDelete) this.openDeleteConfirm(targets);
+      else this.deleteItems(targets, cx);
       return;
     }
     if (act.id === "copy_path") {
@@ -1263,7 +1325,8 @@ export default class IdeSidebar extends View {
       return;
     }
     if (act.id === "copy_rel") {
-      cx.spawn(async () => this.copyTextToClipboard(path));
+      const lines = p.source === "explorer" && Array.isArray(p.paths) && p.paths.length > 1 ? p.paths.join("\n") : path;
+      cx.spawn(async () => this.copyTextToClipboard(lines));
       return;
     }
     if (act.id === "stage") return this.runGit(["add", "--", path], null, cx);
@@ -1524,12 +1587,15 @@ export default class IdeSidebar extends View {
     const base = this.root || this.cwd;
     const rows = [];
     let activeRowIdx = -1;
+    this.visiblePaths = [];
     const walk = (prefix, depth) => {
       if (rows.length >= 800 || depth > 25) return;
       for (const entry of this.entries.get(prefix) ?? []) {
         const path = prefix ? `${prefix}/${entry.name}` : entry.name;
         const open = this.folders.has(path);
         const isActive = !entry.dir && this.activeFile === path;
+        const isSel = this.sel.has(path);
+        this.visiblePaths.push(path);
         const mark = cfg.gitDecorations ? this.marks[`${base}/${path}`] : null;
         if (this.pendingRevealPath && this.pendingRevealPath === path) {
           activeRowIdx = rows.length;
@@ -1547,9 +1613,29 @@ export default class IdeSidebar extends View {
             .cursor_pointer()
             .tooltip(this.formatPathTooltip(path, base, entry.name))
             .when(isActive, (el) => el.bg(t.selected).text_color(t.foreground).font_semibold())
-            .when(!isActive, (el) => el.hover((s) => s.bg(t.hover)))
-            .on_click((_e, cx) => (entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx)))
-            .on_mouse_down("right", () => this.openExplorerMenu(entry, path))
+            .when(!isActive && isSel, (el) => el.bg(t.hover).text_color(t.foreground))
+            .when(!isActive && !isSel, (el) => el.hover((s) => s.bg(t.hover)))
+            .on_click((e, cx) => {
+              const m = e?.modifiers;
+              if (m && (m.control || m.platform)) return this.toggleSelect(path, cx);
+              if (m && m.shift) return this.selectRange(path, cx);
+              this.sel.clear();
+              this.sel.add(path);
+              this.selAnchor = path;
+              cx.notify();
+              entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx);
+            })
+            .on_mouse_down("right", (_e, cx) => {
+              if (this.sel.size && !this.sel.has(path)) {
+                this.sel.clear();
+                this.selAnchor = path;
+                this.sel.add(path);
+                cx.notify();
+              } else if (!this.sel.size) {
+                this.selAnchor = path;
+              }
+              this.openExplorerMenu(entry, path);
+            })
             .child(renderFileIcon(div, svg, entry.name, entry.dir, open, cfg.iconTheme, t))
             .child(div().flex_1().min_w(0).truncate().text_size(12).child(entry.name))
             .when(entry.dir && this.pendingFolders.has(path), (el) => el.child(div().text_size(10.5).text_color(t.dim).child("…")))
@@ -1591,14 +1677,6 @@ export default class IdeSidebar extends View {
           .child(tinyBtn("ide-exp-newd", "+D", false, (_e, cx) => { this.newPrompt = "dir"; this.newNameInput.focus(); cx.notify(); }))
           .child(tinyBtn("ide-exp-hid", ".*", cfg.showHidden, (_e, cx) => { updateIdeSettings({ showHidden: !cfg.showHidden }); this.refresh(cx); }))
           .child(tinyBtn("ide-exp-ref", "↻", false, (_e, cx) => this.refresh(cx))),
-      )
-      .when(Boolean(this.confirmDel), (el) =>
-        el.child(
-          h_flex().p(8).gap(6).items_center().bg(t.raised).border_b(1).border_color(t.blocked)
-            .child(div().flex_1().truncate().text_size(11.5).child(`Delete ${this.confirmDel}?`))
-            .child(tinyBtn("ide-del-yes", "Delete", true, (_e, cx) => this.deleteItem(this.confirmDel, cx)))
-            .child(tinyBtn("ide-del-no", "Cancel", false, (_e, cx) => { this.confirmDel = null; cx.notify(); })),
-        ),
       )
       .when(Boolean(this.renameFrom), (el) =>
         el.child(
@@ -1865,14 +1943,6 @@ export default class IdeSidebar extends View {
                   this.runGit(g.args, g.title, cx);
                 }))
                 .child(miniBtn("scm-git-no", "Cancel", "Cancel", (_e, cx) => { this.confirmGit = null; cx.notify(); })),
-            ),
-          )
-          .when(Boolean(this.confirmDel), (el2) =>
-            el2.child(
-              h_flex().mx(4).mt(4).p(7).gap(6).items_center().rounded(6).bg(t.raised).border_1().border_color(t.blocked)
-                .child(div().flex_1().truncate().text_size(11.5).child(`Delete ${this.confirmDel}?`))
-                .child(miniBtn("scm-del-yes", "Delete", "Delete file from disk", (_e, cx) => this.deleteItem(this.confirmDel, cx)))
-                .child(miniBtn("scm-del-no", "Cancel", "Cancel", (_e, cx) => { this.confirmDel = null; cx.notify(); })),
             ),
           )
           .child(

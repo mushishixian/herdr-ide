@@ -1959,9 +1959,12 @@ function detectAgentKindFromTerm(term, pane) {
   return null;
 }
 
+const AGENT_INTERPRETERS = new Set(["node", "deno", "bun", "python", "python3"]);
+
 function buildAgentResumeCommand(kind, sessionId, origArgv) {
   const rawArgv = Array.isArray(origArgv) && origArgv.length ? origArgv : [kind];
-  const bin = String(rawArgv[0] || kind).split("/").pop() || kind;
+  const arg0 = String(rawArgv[0] || kind).split("/").pop() || kind;
+  const bin = AGENT_INTERPRETERS.has(arg0.toLowerCase()) ? kind : arg0;
   const kept = [];
   for (let i = 1; i < rawArgv.length; i++) {
     const tok = String(rawArgv[i] ?? "");
