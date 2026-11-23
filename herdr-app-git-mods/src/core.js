@@ -471,9 +471,7 @@ export default class GitBranch extends View {
         .items_center()
         .gap(4)
         .rounded(6)
-        .border_1()
-        .border_color(active ? t.accent + "55" : t.border)
-        .bg(active ? t.accent + "1f" : t.raised)
+        .bg(active ? t.accent + "1c" : t.raised)
         .text_size(11)
         .font_medium()
         .text_color(active ? t.accent : t.muted)
@@ -482,7 +480,7 @@ export default class GitBranch extends View {
         .tooltip(tip)
         .hover((s) =>
           active
-            ? s.bg(t.accent + "30")
+            ? s.bg(t.accent + "2c")
             : s.bg(t.hover).text_color(t.foreground),
         )
         .on_click(onClick)
@@ -497,18 +495,15 @@ export default class GitBranch extends View {
         .justify_center()
         .gap(5)
         .rounded(7)
-        .border_1()
         .text_size(12);
       if (disabled) {
         return base
-          .border_color(t.border)
           .bg(t.raised)
           .text_color(t.dim)
           .child(label);
       }
       if (variant === "primary") {
         return base
-          .border_color(t.solid)
           .bg(t.solid)
           .text_color(t.solid_foreground)
           .font_semibold()
@@ -519,17 +514,15 @@ export default class GitBranch extends View {
       }
       if (variant === "danger") {
         return base
-          .border_color(t.blocked)
           .bg(t.blocked + "22")
           .text_color(t.blocked)
           .font_semibold()
           .cursor_pointer()
-          .hover((s) => s.bg(t.blocked + "36"))
+          .hover((s) => s.bg(t.blocked + "34"))
           .on_click(onClick)
           .child(label);
       }
       return base
-        .border_color(t.input)
         .bg(t.raised)
         .text_color(t.foreground)
         .font_medium()
@@ -544,14 +537,12 @@ export default class GitBranch extends View {
       .gap(8)
       .child(
         h_flex()
-          .size(24)
+          .size(22)
           .flex_none()
           .items_center()
           .justify_center()
           .rounded(6)
-          .border_1()
-          .border_color(t.accent + "38")
-          .bg(t.accent + "1f")
+          .bg(t.accent + "1a")
           .child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.accent)),
       )
       .child(
@@ -570,8 +561,6 @@ export default class GitBranch extends View {
             .px(6)
             .py(1.5)
             .rounded(5)
-            .border_1()
-            .border_color(t.border)
             .bg(t.raised)
             .text_size(10.5)
             .font_medium()
@@ -622,8 +611,6 @@ export default class GitBranch extends View {
           .px(8)
           .items_center()
           .rounded(6)
-          .border_1()
-          .border_color(t.border)
           .bg(t.raised)
           .text_size(11)
           .text_color(t.dim)
@@ -638,9 +625,7 @@ export default class GitBranch extends View {
       .w_full()
       .p(3)
       .gap(3)
-      .rounded(9)
-      .border_1()
-      .border_color(t.border)
+      .rounded(8)
       .bg(t.background)
       .children(
         MODES.map((m) => {
@@ -654,8 +639,6 @@ export default class GitBranch extends View {
             .items_center()
             .justify_center()
             .rounded(6)
-            .border_1()
-            .border_color(active ? t.accent + "55" : "#00000000")
             .text_size(12)
             .cursor_pointer()
             .tooltip(m.key)
@@ -674,13 +657,11 @@ export default class GitBranch extends View {
             .px(10)
             .py(7)
             .rounded(8)
-            .border_1()
-            .border_color(t.border)
             .bg(t.background)
             .items_center()
             .gap(8)
             .cursor_pointer()
-            .hover((s) => s.bg(t.hover).border_color(t.accent + "55"))
+            .hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => {
               this.mergeFlipped = !this.mergeFlipped;
               this.at = 0;
@@ -706,8 +687,6 @@ export default class GitBranch extends View {
                 .px(6)
                 .py(1.5)
                 .rounded(4)
-                .border_1()
-                .border_color(t.border)
                 .bg(t.raised)
                 .text_size(10.5)
                 .text_color(t.dim)
@@ -728,9 +707,9 @@ export default class GitBranch extends View {
       .px(10)
       .gap(8)
       .items_center()
-      .rounded(9)
+      .rounded(8)
       .border_1()
-      .border_color(this.inputFocused ? t.accent : t.input)
+      .border_color(this.inputFocused ? t.accent + "66" : t.border + "66")
       .bg(t.background)
       .child(
         svg(`mods/workspace-chrome/${inputIcon}.svg`)
@@ -745,7 +724,7 @@ export default class GitBranch extends View {
         .gap(10)
         .rounded(8)
         .border_1()
-        .border_color(t.blocked + "88")
+        .border_color(t.blocked + "55")
         .bg(t.background)
         .child(div().text_size(12.5).text_color(t.foreground).child(text))
         .child(
@@ -788,7 +767,7 @@ export default class GitBranch extends View {
           .gap(8)
           .rounded(8)
           .border_1()
-          .border_color(t.blocked + "88")
+          .border_color(t.blocked + "55")
           .bg(t.background)
           .child(div().font_semibold().text_size(12.5).text_color(t.blocked).child("Merge stopped with conflicts / error"))
           .when(this.result.conflicts.length > 0, (el) =>
@@ -817,8 +796,6 @@ export default class GitBranch extends View {
         .px(8)
         .h(H)
         .rounded(6)
-        .border_1()
-        .border_color(on ? t.accent + "44" : "#00000000")
         .gap(8)
         .items_center()
         .cursor_pointer()
@@ -840,7 +817,7 @@ export default class GitBranch extends View {
               .items_center()
               .justify_center()
               .rounded(5)
-              .bg(t.accent + "22")
+              .bg(t.accent + "1c")
               .child(svg("mods/workspace-chrome/plus.svg").size(12).text_color(t.accent)),
           )
           .child(
@@ -878,9 +855,7 @@ export default class GitBranch extends View {
               .px(6)
               .py(1)
               .rounded(4)
-              .border_1()
-              .border_color(t.accent + "44")
-              .bg(t.accent + "22")
+              .bg(t.accent + "1c")
               .text_size(10.5)
               .font_medium()
               .text_color(t.accent)
@@ -894,8 +869,6 @@ export default class GitBranch extends View {
               .px(6)
               .py(1)
               .rounded(4)
-              .border_1()
-              .border_color(t.border)
               .bg(t.raised)
               .text_size(10.5)
               .text_color(t.dim)
@@ -925,9 +898,7 @@ export default class GitBranch extends View {
     const listEl = showListCard && !this.loading
       ? v_flex()
           .w_full()
-          .rounded(9)
-          .border_1()
-          .border_color(t.border)
+          .rounded(8)
           .bg(t.background)
           .p(4)
           .child(
