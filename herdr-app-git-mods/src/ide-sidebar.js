@@ -55,7 +55,7 @@ async function listDirectory(path, on) {
 
 export default class IdeSidebar extends View {
   init(p, cx) {
-    this.view = p?.view || "scm"; // "explorer" | "search" | "scm" | "settings"
+    this.view = p?.view || "scm"; // "explorer" | "scm" | "settings"
     this.entries = new Map();
     this.folders = new Set();
     this.pendingFolders = new Set();
@@ -109,10 +109,6 @@ export default class IdeSidebar extends View {
     this.thinking = "off";
     this.autoTriedSpaces = new Set();
 
-    // Search state
-    this.searchResults = [];
-    this.searchBusy = false;
-
     this.handle = cx.focus_handle();
     this.commitInput = InputState.new({ placeholder: "Commit message (Ctrl+Enter)…" });
     this.commitInput.on("change", (_e, cx) => { this.message = this.commitInput.value(); cx.notify(); });
@@ -123,9 +119,6 @@ export default class IdeSidebar extends View {
 
     this.renameInput = InputState.new({ placeholder: "New path…" });
     this.renameInput.on("submit", (_e, cx) => this.finishRename(cx));
-
-    this.searchInput = InputState.new({ placeholder: "Search in repo…" });
-    this.searchInput.on("submit", (_e, cx) => this.runInlineSearch(cx));
 
     this.aiUrlInput = InputState.new({ placeholder: "https://api.openai.com/v1" });
     this.aiKeyInput = InputState.new({ placeholder: "API Key (sk-…)" });
@@ -669,7 +662,7 @@ export default class IdeSidebar extends View {
         const firstVisit = Boolean(switched && space && !this.autoTriedSpaces.has(space.id));
         if (firstVisit) {
           this.autoTriedSpaces.add(space.id);
-          if (prevSnap?.lastView && this.view !== prevSnap.lastView) {
+          if (prevSnap?.lastView && prevSnap.lastView !== "search" && this.view !== prevSnap.lastView) {
             this.view = prevSnap.lastView;
             restoredExplorerView = this.view === "explorer";
           }
@@ -1547,33 +1540,6 @@ export default class IdeSidebar extends View {
     });
   }
 
-  runInlineSearch(cx) {
-    const q = this.searchInput.value().trim();
-    const base = this.root || this.cwd;
-    if (!q || !base) return;
-    this.searchBusy = true;
-    this.searchQueried = true;
-    cx.notify();
-    cx.spawn(async (cx) => {
-      let r = await execRg([
-        "--line-number", "--no-heading", "--color", "never", "-i", "-F",
-        "--max-filesize", "512K", "--max-columns", "240", "--max-count", "50",
-        "-g", "!vendor/**", "-g", "!node_modules/**", "-g", "!public/**", "-g", "!*.min.js",
-        "--", q, ".",
-      ], base, this.on);
-      if (!r) {
-        r = await exec("git", ["grep", "-n", "-i", "-F", "--", q], { cwd: base, on: this.on }).catch(() => null);
-      }
-      this.searchBusy = false;
-      this.searchResults = (r?.stdout ?? "").split("\n").filter(Boolean).slice(0, 120).map((rawLine) => {
-        const line = rawLine.replace(/\r$/, "");
-        const m = /^(.+?):(\d+):(.*)$/.exec(line);
-        return m ? { path: m[1].replace(/^\.\//, "").replace(/\\/g, "/"), line: Number(m[2]), text: m[3].trim() } : null;
-      }).filter(Boolean);
-      cx.notify();
-    });
-  }
-
   formatPathTooltip(relPath, base, leafOverride) {
     const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
     const relDisp = sep === "\\" ? relPath.replace(/\//g, "\\") : relPath;
@@ -1701,64 +1667,6 @@ export default class IdeSidebar extends View {
               .when(rows.length === 0, (el) => el.child(div().p(10).text_size(12).text_color(t.dim).child(this.error || (this.loadingExplorer ? "Loading files…" : "No files")))),
           )
           .child(Scrollbar.vertical("ide-exp-tree").absolute().inset_0()),
-      );
-  }
-
-  renderSearch(t, cx) {
-    const popBtn = (id, label, modName) =>
-      div()
-        .id(id)
-        .px(7)
-        .py(3)
-        .rounded(5)
-        .bg(t.raised)
-        .text_size(11)
-        .text_color(t.muted)
-        .cursor_pointer()
-        .hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .on_click(() => openOverlay({ mod: modName, kind: "popup", at: "top", offset: 32, width: 940, height: 0.80 }))
-        .child(label);
-
-    return v_flex()
-      .flex_1()
-      .min_h(0)
-      .p(8)
-      .gap(8)
-      .child(
-        h_flex().gap(4).flex_wrap()
-          .child(popBtn("ide-qo", "Files (Ctrl+Q)", "quick-open"))
-          .child(popBtn("ide-cs", "Search (Ctrl+Shift+F)", "content-search"))
-          .child(popBtn("ide-rp", "Replace (Ctrl+Shift+R)", "replace-popup"))
-          .child(popBtn("ide-sy", "Symbols (Ctrl+Alt+Q)", "symbol-search")),
-      )
-      .child(
-        h_flex().h(32).px(8).gap(6).items_center().rounded(7).border_1().border_color(t.border).bg(t.surface)
-          .child(svg("mods/workspace-chrome/search.svg").size(13).text_color(t.dim))
-          .child(Input.new(this.searchInput).flex_1().h_full().text_size(12).text_color(t.foreground)),
-      )
-      .child(
-        div().flex_1().min_h(0).relative().child(
-          v_flex().id("ide-sr-list").absolute().inset_0().overflow_y_scroll().gap(1)
-            .when(this.searchBusy, (el) => el.child(div().p(8).text_color(t.dim).child("Searching…")))
-            .when(!this.searchBusy && this.searchQueried && this.searchResults.length === 0, (el) => el.child(div().p(8).text_color(t.dim).child("No matches found")))
-            .children(
-              this.searchResults.map((m, i) => {
-                const base = this.root || this.cwd;
-                const leaf = `${m.path.split(/[\\/]/).pop() || m.path}:${m.line}`;
-                return v_flex()
-                  .id(`ide-sr-${i}`)
-                  .px(5)
-                  .py(3)
-                  .rounded(4)
-                  .cursor_pointer()
-                  .tooltip(this.formatPathTooltip(m.path, base, leaf))
-                  .hover((s) => s.bg(t.hover))
-                  .on_click((_e, cx) => this.openFile(m.path, m.line, cx))
-                  .child(div().text_size(11).text_color(t.accent).truncate().child(`${m.path}:${m.line}`))
-                  .child(div().text_size(11.5).text_color(t.foreground).truncate().child(m.text));
-              }),
-            ),
-        ).child(Scrollbar.vertical("ide-sr-list").absolute().inset_0()),
       );
   }
 
@@ -2282,7 +2190,6 @@ export default class IdeSidebar extends View {
           .border_b(1)
           .border_color(t.border)
           .child(tabBtn("explorer", "Files"))
-          .child(tabBtn("search", "Search"))
           .child(tabBtn("scm", `Git${this.staged.length + this.unstaged.length ? ` (${this.staged.length + this.unstaged.length})` : ""}`))
           .when(Boolean(curSyncBadge), (el) =>
             el.child(div().px(5).py(1).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).child(curSyncBadge)),
@@ -2291,7 +2198,6 @@ export default class IdeSidebar extends View {
           .child(tabBtn("settings", "⚙")),
       )
       .when(this.view === "explorer", (el) => el.child(this.renderExplorer(t, cx)))
-      .when(this.view === "search", (el) => el.child(this.renderSearch(t, cx)))
       .when(this.view === "scm", (el) => el.child(this.renderScm(t, cx)))
       .when(this.view === "settings", (el) => el.child(this.renderSettings(t, cx)));
   }
