@@ -3,10 +3,10 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, panes, focused, exec, theme, props, closeOverlay, openOverlay, notify } from "herdr";
 
 const MODES = [
-  { id: "switch", label: "Switch", key: "Ctrl+Alt+C" },
-  { id: "merge", label: "Merge", key: "Ctrl+Alt+X" },
-  { id: "rename", label: "Rename", key: "Ctrl+Alt+R" },
-  { id: "new", label: "New", key: "Ctrl+Alt+N" },
+  { id: "switch", label: "Switch", icon: "branch", key: "Ctrl+Alt+C" },
+  { id: "merge", label: "Merge", icon: "git-compare", key: "Ctrl+Alt+X" },
+  { id: "rename", label: "Rename", icon: "square-pen", key: "Ctrl+Alt+R" },
+  { id: "new", label: "New", icon: "plus", key: "Ctrl+Alt+N" },
 ];
 
 function isLocalChangesError(msg) {
@@ -43,6 +43,15 @@ export default class GitBranch extends View {
     this.branches = [];
 
     this.input = InputState.new({ placeholder: this.placeholder() });
+    this.inputFocused = true;
+    this.input.on("focus", (_e, cx) => {
+      this.inputFocused = true;
+      cx.notify();
+    });
+    this.input.on("blur", (_e, cx) => {
+      this.inputFocused = false;
+      cx.notify();
+    });
     this.input.on("change", (_e, cx) => {
       this.filter = this.input.value();
       this.at = 0;
@@ -442,8 +451,8 @@ export default class GitBranch extends View {
     if (this.at >= rows.length) this.at = Math.max(0, rows.length - 1);
     const sel = rows[this.at];
 
-    const H = 32;
-    const height = Math.min(288, rows.length * H);
+    const H = 34;
+    const height = Math.min(272, rows.length * H);
     const total = rows.length * H;
     const fixed = total > height;
     const maxScroll = Math.max(0, total - height);
@@ -454,56 +463,206 @@ export default class GitBranch extends View {
       if (top + H > this.scroll + height) this.scroll = top + H - height;
     }
 
-    const headerBtn = (id, label, tip, onClick) =>
-      div()
+    const headerBtn = (id, label, tip, active, onClick) =>
+      h_flex()
         .id(id)
-        .px(7)
-        .py(2)
-        .rounded(5)
+        .h(24)
+        .px(8)
+        .items_center()
+        .gap(4)
+        .rounded(6)
+        .border_1()
+        .border_color(active ? t.accent + "55" : t.border)
+        .bg(active ? t.accent + "1f" : t.raised)
         .text_size(11)
-        .text_color(t.muted)
+        .font_medium()
+        .text_color(active ? t.accent : t.muted)
+        .when(this.busy, (el) => el.opacity(0.55))
         .cursor_pointer()
         .tooltip(tip)
-        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .hover((s) =>
+          active
+            ? s.bg(t.accent + "30")
+            : s.bg(t.hover).text_color(t.foreground),
+        )
         .on_click(onClick)
         .child(label);
 
+    const actionBtn = (id, label, variant, disabled, onClick) => {
+      const base = h_flex()
+        .id(id)
+        .h(30)
+        .px(12)
+        .items_center()
+        .justify_center()
+        .gap(5)
+        .rounded(7)
+        .border_1()
+        .text_size(12);
+      if (disabled) {
+        return base
+          .border_color(t.border)
+          .bg(t.raised)
+          .text_color(t.dim)
+          .child(label);
+      }
+      if (variant === "primary") {
+        return base
+          .border_color(t.solid)
+          .bg(t.solid)
+          .text_color(t.solid_foreground)
+          .font_semibold()
+          .cursor_pointer()
+          .hover((s) => s.opacity(0.88))
+          .on_click(onClick)
+          .child(label);
+      }
+      if (variant === "danger") {
+        return base
+          .border_color(t.blocked)
+          .bg(t.blocked + "22")
+          .text_color(t.blocked)
+          .font_semibold()
+          .cursor_pointer()
+          .hover((s) => s.bg(t.blocked + "36"))
+          .on_click(onClick)
+          .child(label);
+      }
+      return base
+        .border_color(t.input)
+        .bg(t.raised)
+        .text_color(t.foreground)
+        .font_medium()
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover))
+        .on_click(onClick)
+        .child(label);
+    };
+
     const header = h_flex()
       .items_center()
-      .gap(6)
-      .child(svg("mods/workspace-chrome/branch.svg").size(15).text_color(t.accent))
-      .child(div().font_semibold().text_size(14).text_color(t.foreground).child(this.currentBranch || "Git"))
+      .gap(8)
+      .child(
+        h_flex()
+          .size(24)
+          .flex_none()
+          .items_center()
+          .justify_center()
+          .rounded(6)
+          .border_1()
+          .border_color(t.accent + "38")
+          .bg(t.accent + "1f")
+          .child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.accent)),
+      )
+      .child(
+        div()
+          .min_w(0)
+          .truncate()
+          .font_semibold()
+          .text_size(14)
+          .text_color(t.foreground)
+          .child(this.currentBranch || "Git Branch"),
+      )
       .when(Boolean(this.on), (el) =>
-        el.child(div().px(6).py(2).rounded(4).bg(t.hover).text_size(11).text_color(t.muted).child(this.on)),
+        el.child(
+          div()
+            .flex_none()
+            .px(6)
+            .py(1.5)
+            .rounded(5)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.raised)
+            .text_size(10.5)
+            .font_medium()
+            .text_color(t.muted)
+            .child(this.on),
+        ),
       )
       .child(div().flex_1())
       .when(Boolean(this.root), (el) => {
         const activeSp = spaces().find((s) => s.active);
         const sync = activeSp ? (shared("ide.gitSyncBySpace")?.[activeSp.id] ?? { ahead: 0, behind: 0 }) : { ahead: 0, behind: 0 };
         if (sync.behind > 0 && sync.ahead > 0) {
-          return el.child(headerBtn("gb-sync", `↓${sync.behind} ↑${sync.ahead} Sync`, `Pull ${sync.behind} & Push ${sync.ahead}`, (_e, cx) => this.runSync("sync", cx)));
+          return el.child(
+            headerBtn("gb-sync", `↓${sync.behind} ↑${sync.ahead} Sync`, `Pull ${sync.behind} & Push ${sync.ahead}`, true, (_e, cx) =>
+              this.runSync("sync", cx),
+            ),
+          );
         }
         return el
-          .child(headerBtn("gb-pull", sync.behind > 0 ? `↓${sync.behind} Pull` : "↓ Pull", "git pull (Ctrl+Alt+P)", (_e, cx) => this.runSync("pull", cx)))
-          .child(headerBtn("gb-push", sync.ahead > 0 ? `↑${sync.ahead} Push` : "↑ Push", "git push (Ctrl+Alt+K)", (_e, cx) => this.runSync("push", cx)));
+          .child(
+            h_flex()
+              .gap(5)
+              .items_center()
+              .child(
+                headerBtn(
+                  "gb-pull",
+                  sync.behind > 0 ? `↓${sync.behind} Pull` : "↓ Pull",
+                  "git pull (Ctrl+Alt+P)",
+                  sync.behind > 0,
+                  (_e, cx) => this.runSync("pull", cx),
+                ),
+              )
+              .child(
+                headerBtn(
+                  "gb-push",
+                  sync.ahead > 0 ? `↑${sync.ahead} Push` : "↑ Push",
+                  "git push (Ctrl+Alt+K)",
+                  sync.ahead > 0,
+                  (_e, cx) => this.runSync("push", cx),
+                ),
+              ),
+          );
       })
-      .child(headerBtn("gb-esc", "Esc", "Close", () => this.close()));
+      .child(
+        h_flex()
+          .id("gb-esc")
+          .h(24)
+          .px(8)
+          .items_center()
+          .rounded(6)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.raised)
+          .text_size(11)
+          .text_color(t.dim)
+          .cursor_pointer()
+          .tooltip("Close (Esc)")
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click(() => this.close())
+          .child("Esc"),
+      );
 
     const tabs = h_flex()
-      .gap(4)
+      .w_full()
+      .p(3)
+      .gap(3)
+      .rounded(9)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.background)
       .children(
         MODES.map((m) => {
           const active = this.mode === m.id;
-          return div()
+          return h_flex()
             .id(`gb-mode-${m.id}`)
-            .px(10)
-            .py(4)
+            .flex_1()
+            .h(26)
+            .px(8)
+            .gap(5)
+            .items_center()
+            .justify_center()
             .rounded(6)
+            .border_1()
+            .border_color(active ? t.accent + "55" : "#00000000")
             .text_size(12)
             .cursor_pointer()
-            .when(active, (el) => el.bg(t.accent).text_color("#ffffff").font_semibold())
+            .tooltip(m.key)
+            .when(active, (el) => el.bg(t.selected).text_color(t.foreground).font_semibold())
             .when(!active, (el) => el.text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)))
             .on_click((_e, cx) => this.setMode(m.id, cx))
+            .child(svg(`mods/workspace-chrome/${m.icon}.svg`).size(12).text_color(active ? t.accent : t.dim))
             .child(m.label);
         }),
       );
@@ -513,12 +672,15 @@ export default class GitBranch extends View {
         ? h_flex()
             .id("gb-merge-dir")
             .px(10)
-            .py(6)
-            .rounded(7)
-            .bg(t.hover)
+            .py(7)
+            .rounded(8)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.background)
             .items_center()
             .gap(8)
             .cursor_pointer()
+            .hover((s) => s.bg(t.hover).border_color(t.accent + "55"))
             .on_click((_e, cx) => {
               this.mergeFlipped = !this.mergeFlipped;
               this.at = 0;
@@ -528,6 +690,8 @@ export default class GitBranch extends View {
             .child(
               div()
                 .flex_1()
+                .min_w(0)
+                .truncate()
                 .text_size(12)
                 .text_color(t.foreground)
                 .child(
@@ -536,8 +700,27 @@ export default class GitBranch extends View {
                     : `Merge ${sel?.branch?.name ?? "<selected>"} → ${this.currentBranch ?? "HEAD"}`,
                 ),
             )
-            .child(div().text_size(11).text_color(t.dim).child("Tab to flip"))
+            .child(
+              div()
+                .flex_none()
+                .px(6)
+                .py(1.5)
+                .rounded(4)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.raised)
+                .text_size(10.5)
+                .text_color(t.dim)
+                .child("Tab to flip"),
+            )
         : null;
+
+    const inputIcon =
+      this.mode === "new"
+        ? "plus"
+        : this.mode === "rename"
+          ? "square-pen"
+          : "search";
 
     const inputBox = h_flex()
       .h(36)
@@ -547,57 +730,37 @@ export default class GitBranch extends View {
       .items_center()
       .rounded(9)
       .border_1()
-      .border_color(t.accent)
+      .border_color(this.inputFocused ? t.accent : t.input)
       .bg(t.background)
-      .child(svg("mods/workspace-chrome/search.svg").size(14).text_color(t.dim))
-      .child(Input.new(this.input).flex_1().h_full().text_size(13).text_color(t.foreground));
+      .child(
+        svg(`mods/workspace-chrome/${inputIcon}.svg`)
+          .size(14)
+          .text_color(this.mode === "new" || this.mode === "rename" ? t.accent : t.dim),
+      )
+      .child(Input.new(this.input).flex_1().h_full().text_size(12.8).text_color(t.foreground));
 
-    const confirmBox = (text, okLabel, onCancel, onOk) =>
+    const confirmBox = (text, okLabel, variant, onCancel, onOk) =>
       v_flex()
         .p(12)
         .gap(10)
         .rounded(8)
         .border_1()
-        .border_color(t.blocked)
+        .border_color(t.blocked + "88")
         .bg(t.background)
         .child(div().text_size(12.5).text_color(t.foreground).child(text))
         .child(
           h_flex()
             .gap(8)
             .justify_end()
-            .child(
-              div()
-                .id("gb-confirm-cancel")
-                .px(10)
-                .py(5)
-                .rounded(6)
-                .text_size(12)
-                .text_color(t.muted)
-                .cursor_pointer()
-                .hover((s) => s.bg(t.hover))
-                .on_click(onCancel)
-                .child("Cancel"),
-            )
-            .child(
-              div()
-                .id("gb-confirm-ok")
-                .px(12)
-                .py(5)
-                .rounded(6)
-                .bg(t.accent)
-                .text_size(12)
-                .font_semibold()
-                .text_color("#ffffff")
-                .cursor_pointer()
-                .on_click(onOk)
-                .child(okLabel),
-            ),
+            .child(actionBtn("gb-confirm-cancel", "Cancel", "secondary", false, onCancel))
+            .child(actionBtn("gb-confirm-ok", okLabel, variant, false, onOk)),
         );
 
     const stashBox = this.stashConfirm
       ? confirmBox(
           `Local uncommitted changes block switching to "${this.stashConfirm.name}". Stash changes, switch, and pop?`,
           "Stash & Switch (Enter)",
+          "primary",
           (_e, cx) => {
             this.stashConfirm = null;
             cx.notify();
@@ -610,6 +773,7 @@ export default class GitBranch extends View {
       ? confirmBox(
           `Branch "${this.forceDeleteConfirm.name}" is not fully merged. Force delete (git branch -D)?`,
           "Force Delete (Enter)",
+          "danger",
           (_e, cx) => {
             this.forceDeleteConfirm = null;
             cx.notify();
@@ -624,7 +788,7 @@ export default class GitBranch extends View {
           .gap(8)
           .rounded(8)
           .border_1()
-          .border_color(t.blocked)
+          .border_color(t.blocked + "88")
           .bg(t.background)
           .child(div().font_semibold().text_size(12.5).text_color(t.blocked).child("Merge stopped with conflicts / error"))
           .when(this.result.conflicts.length > 0, (el) =>
@@ -640,34 +804,8 @@ export default class GitBranch extends View {
               h_flex()
                 .justify_end()
                 .gap(8)
-                .child(
-                  div()
-                    .id("gb-merge-resolve")
-                    .px(10)
-                    .py(5)
-                    .rounded(6)
-                    .bg(t.accent)
-                    .text_size(12)
-                    .font_semibold()
-                    .text_color("#ffffff")
-                    .cursor_pointer()
-                    .on_click(() => this.openMergeEditor())
-                    .child("Resolve Conflicts (r)"),
-                )
-                .child(
-                  div()
-                    .id("gb-merge-abort")
-                    .px(10)
-                    .py(5)
-                    .rounded(6)
-                    .bg(t.blocked)
-                    .text_size(12)
-                    .font_semibold()
-                    .text_color("#ffffff")
-                    .cursor_pointer()
-                    .on_click((_e, cx) => this.runMergeAbort(cx))
-                    .child("Abort Merge (a)"),
-                ),
+                .child(actionBtn("gb-merge-abort", "Abort Merge (a)", "danger", this.busy, (_e, cx) => this.runMergeAbort(cx)))
+                .child(actionBtn("gb-merge-resolve", "Resolve Conflicts (r)", "primary", this.busy, () => this.openMergeEditor())),
             ),
           )
       : null;
@@ -676,111 +814,228 @@ export default class GitBranch extends View {
       const on = i === this.at;
       const base = h_flex()
         .id(`gb-row-${i}`)
-        .mx(2)
-        .px(10)
+        .px(8)
         .h(H)
-        .rounded(7)
+        .rounded(6)
+        .border_1()
+        .border_color(on ? t.accent + "44" : "#00000000")
         .gap(8)
         .items_center()
         .cursor_pointer()
-        .when(on, (el) => el.bg(t.hover))
-        .hover((s) => s.bg(t.hover))
+        .when(on, (el) => el.bg(t.selected))
+        .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
         .on_click((_e, cx) => this.activateRow(r, cx));
 
       const placed = fixed
         ? base.absolute().left(0).right(0).top(i * H - this.scroll).bottom(height - (i * H + H - this.scroll))
         : base;
 
-      if (r.kind === "new_prompt") {
+      if (r.kind === "new_prompt" || r.kind === "create") {
+        const label = r.kind === "new_prompt" ? "New branch…" : `Create branch "${r.name}"`;
         return placed
-          .text_color(t.accent)
-          .child(div().w(14).font_bold().child("+"))
-          .child(div().flex_1().font_semibold().child("New branch…"));
-      }
-      if (r.kind === "create") {
-        return placed
-          .text_color(t.accent)
-          .child(div().w(14).font_bold().child("+"))
-          .child(div().flex_1().font_semibold().child(`Create branch "${r.name}"`));
+          .child(
+            h_flex()
+              .size(20)
+              .flex_none()
+              .items_center()
+              .justify_center()
+              .rounded(5)
+              .bg(t.accent + "22")
+              .child(svg("mods/workspace-chrome/plus.svg").size(12).text_color(t.accent)),
+          )
+          .child(
+            div()
+              .flex_1()
+              .truncate()
+              .font_medium()
+              .text_color(on ? t.foreground : t.accent)
+              .child(label),
+          )
+          .child(div().text_size(11).text_color(t.dim).child(r.kind === "new_prompt" ? "Ctrl+Alt+N" : "Create"));
       }
       const b = r.branch;
       return placed
-        .child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(b.current ? t.accent : t.dim))
-        .child(div().flex_1().truncate().text_color(t.foreground).when(b.current, (d) => d.font_semibold()).child(b.name))
-        .when(b.current, (el) => el.child(div().text_size(11).text_color(t.accent).child("current")))
-        .when(b.remote, (el) => el.child(div().text_size(11).text_color(t.dim).child("remote")))
-        .when(!b.current && !b.remote && this.mode === "switch", (el) =>
+        .child(
+          h_flex()
+            .size(20)
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(b.current ? t.accent : t.dim)),
+        )
+        .child(
+          div()
+            .flex_1()
+            .truncate()
+            .text_color(t.foreground)
+            .when(b.current || on, (d) => d.font_semibold())
+            .child(b.name),
+        )
+        .when(b.current, (el) =>
           el.child(
             div()
-              .id(`gb-del-${i}`)
-              .px(5)
+              .flex_none()
+              .px(6)
               .py(1)
               .rounded(4)
-              .text_size(11)
+              .border_1()
+              .border_color(t.accent + "44")
+              .bg(t.accent + "22")
+              .text_size(10.5)
+              .font_medium()
+              .text_color(t.accent)
+              .child("current"),
+          ),
+        )
+        .when(b.remote, (el) =>
+          el.child(
+            div()
+              .flex_none()
+              .px(6)
+              .py(1)
+              .rounded(4)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.raised)
+              .text_size(10.5)
+              .text_color(t.dim)
+              .child("remote"),
+          ),
+        )
+        .when(!b.current && !b.remote && this.mode === "switch", (el) =>
+          el.child(
+            h_flex()
+              .id(`gb-del-${i}`)
+              .size(22)
+              .flex_none()
+              .items_center()
+              .justify_center()
+              .rounded(5)
               .text_color(t.dim)
               .tooltip(`Delete ${b.name}`)
-              .hover((s) => s.bg(t.raised).text_color(t.ansi1))
+              .hover((s) => s.bg(t.blocked + "22").text_color(t.ansi1))
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .on_click((_e, cx) => this.runDeleteBranch(b, false, cx))
-              .child("×"),
+              .child(svg("mods/workspace-chrome/x.svg").size(11)),
           ),
         );
     };
 
-    const listEl =
-      rows.length > 0
-        ? v_flex()
-            .id("gb-list")
-            .h(height)
-            .min_h(0)
-            .when(fixed, (el) =>
-              el.overflow_hidden().on_scroll_wheel((e, cx) => {
-                this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, maxScroll));
-                while (this.at < rows.length - 1 && this.at * H < this.scroll) this.at++;
-                while (this.at > 0 && this.at * H + H > this.scroll + height) this.at--;
-                cx.notify();
-              }),
-            )
-            .children(
-              rows
-                .map((r, i) => {
-                  if (fixed && (i * H + H <= this.scroll || i * H >= this.scroll + height)) return null;
-                  return rowEl(r, i);
-                })
-                .filter(Boolean),
-            )
-        : null;
+    const showListCard = this.mode === "switch" || this.mode === "merge";
+    const listEl = showListCard && !this.loading
+      ? v_flex()
+          .w_full()
+          .rounded(9)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.background)
+          .p(4)
+          .child(
+            rows.length > 0
+              ? v_flex()
+                  .id("gb-list")
+                  .relative()
+                  .w_full()
+                  .h(height)
+                  .min_h(0)
+                  .when(fixed, (el) =>
+                    el.overflow_hidden().on_scroll_wheel((e, cx) => {
+                      this.scroll = Math.max(0, Math.min(this.scroll - e.delta.y, maxScroll));
+                      while (this.at < rows.length - 1 && this.at * H < this.scroll) this.at++;
+                      while (this.at > 0 && this.at * H + H > this.scroll + height) this.at--;
+                      cx.notify();
+                    }),
+                  )
+                  .children(
+                    rows
+                      .map((r, i) => {
+                        if (fixed && (i * H + H <= this.scroll || i * H >= this.scroll + height)) return null;
+                        return rowEl(r, i);
+                      })
+                      .filter(Boolean),
+                  )
+              : div()
+                  .px(10)
+                  .py(14)
+                  .text_size(12)
+                  .text_color(t.dim)
+                  .child(this.mode === "merge" ? "No matching branches to merge." : "No branches found."),
+          )
+      : null;
+
+    const trimmedName = this.filter.trim();
+    const canSubmitForm =
+      !this.busy &&
+      !this.loading &&
+      Boolean(trimmedName) &&
+      (this.mode !== "rename" || trimmedName !== this.currentBranch);
 
     const actionFooter =
       this.mode === "new" || this.mode === "rename"
-        ? h_flex()
-            .justify_end()
-            .gap(8)
+        ? v_flex()
+            .gap(10)
+            .when(Boolean(this.currentBranch), (el) =>
+              el.child(
+                div()
+                  .px(2)
+                  .text_size(11.5)
+                  .text_color(t.dim)
+                  .child(
+                    this.mode === "new"
+                      ? `New branch will be created from ${this.currentBranch}.`
+                      : `Current branch "${this.currentBranch}" will be renamed.`,
+                  ),
+              ),
+            )
             .child(
-              div()
-                .id("gb-submit")
-                .px(14)
-                .py(6)
-                .rounded(7)
-                .bg(t.accent)
-                .text_size(12.5)
-                .font_semibold()
-                .text_color("#ffffff")
-                .cursor_pointer()
-                .on_click((_e, cx) => this.handleSubmit(cx))
-                .child(this.mode === "new" ? "Create & Switch (Enter)" : "Rename Branch (Enter)"),
+              h_flex()
+                .justify_end()
+                .gap(8)
+                .child(actionBtn("gb-cancel", "Cancel", "secondary", false, () => this.close()))
+                .child(
+                  actionBtn(
+                    "gb-submit",
+                    this.mode === "new" ? "Create & Switch (Enter)" : "Rename Branch (Enter)",
+                    "primary",
+                    !canSubmitForm,
+                    (_e, cx) => this.handleSubmit(cx),
+                  ),
+                ),
             )
         : null;
+
+    const hintFooter = showListCard
+      ? h_flex()
+          .items_center()
+          .gap(8)
+          .px(2)
+          .text_size(11)
+          .text_color(t.dim)
+          .child(
+            div()
+              .flex_1()
+              .truncate()
+              .child(
+                this.mode === "merge"
+                  ? "↑↓ select · Tab flip direction · Enter merge · Esc close"
+                  : "↑↓ select · Enter switch · Esc close",
+              ),
+          )
+          .when(rows.length > 0, (el) =>
+            el.child(div().flex_none().child(`${rows.length} item${rows.length === 1 ? "" : "s"}`)),
+          )
+      : null;
 
     return v_flex()
       .id("git-branch-popup")
       .track_focus(this.handle)
       .w_full()
       .min_h(0)
-      .p(16)
+      .p(14)
       .gap(10)
       .bg(t.popover)
-      .text_size(13)
+      .text_color(t.foreground)
+      .text_size(12.5)
       .on_key_down((e, cx) => {
         const k = e.key;
         if (k === "escape") {
@@ -831,6 +1086,7 @@ export default class GitBranch extends View {
       .when(Boolean(forceDeleteBox), (el) => el.child(forceDeleteBox))
       .when(Boolean(conflictBox), (el) => el.child(conflictBox))
       .when(Boolean(listEl), (el) => el.child(listEl))
+      .when(Boolean(hintFooter), (el) => el.child(hintFooter))
       .when(Boolean(actionFooter), (el) => el.child(actionFooter));
   }
 }
