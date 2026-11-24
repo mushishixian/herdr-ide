@@ -137,7 +137,7 @@ function classifyAgentOutput(raw, prevInfo, now, opts = {}) {
   if (isBlocked) status = "blocked";
   else if (hasWorkingSignal) status = "working";
   else if (wasWorking && (atPrompt || rawStatus === "idle")) status = "done";
-  else if (prevInfo && prevInfo.status === "done" && now - (prevInfo.doneAt ?? 0) < 15000) status = "done";
+  else if (prevInfo && prevInfo.status === "done") status = "done";
 
   return {
     status,
@@ -202,7 +202,7 @@ export default class Spaces extends View {
       if (!s) continue;
       if (isKnownCliAgent(p)) {
         const label = agentKind(`${p.program?.key || ""} ${p.program?.id || ""} ${p.program?.name || ""}`, p.title) || "Agent";
-        targets.push({ spaceId: s.id, spaceName: s.name || base(s.folder || "") || "Space", active: s.active && p.focused, terminal: p.terminal, label, spinTitle: SPIN_TITLE.test(p.title || "") });
+        targets.push({ spaceId: s.id, spaceName: s.name || base(s.folder || "") || "Space", active: s.active, terminal: p.terminal, label, spinTitle: SPIN_TITLE.test(p.title || "") });
       } else {
         delete this.termAgent[p.terminal];
       }
@@ -728,7 +728,7 @@ export default class Spaces extends View {
               .when(!tree, el => el.child(h_flex().size(14).flex_none().rounded(4).bg(fill).items_center().justify_center().text_size(9).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
               .child(div().flex_1().min_w(SIDE_MIN).truncate().text_size(12).font_medium().text_color(t.foreground).child(w.name))
               .when(Boolean(stGlyph || agentName), (el) => {
-                const highlight = detected === "working" || detected === "blocked";
+                const highlight = detected === "working" || detected === "blocked" || detected === "done";
                 return el.child(
                   h_flex()
                     .flex_none()
@@ -738,12 +738,13 @@ export default class Spaces extends View {
                     .rounded(4)
                     .when(detected === "working", (b) => b.bg(t.working + "22"))
                     .when(detected === "blocked", (b) => b.bg(t.blocked + "22"))
+                    .when(detected === "done", (b) => b.bg(t.ansi2 + "30"))
                     .items_center()
                     .when(Boolean(detected === "working"), (e) => e.child(div().text_size(9.5).text_color(stColor).child(stGlyph)))
                     .when(Boolean(detected && detected !== "working"), (e) =>
                       e.child(
                         detected === "done"
-                          ? div().text_size(9.5).text_color(stColor).child("✓")
+                          ? div().text_size(10.5).font_bold().text_color(stColor).child("✓")
                           : div().size(5).rounded_full().bg(detected === "idle" ? t.dim : stColor),
                       ),
                     )
