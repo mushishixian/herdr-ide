@@ -79,6 +79,17 @@
     "alt-f12": "ide-sidebar.toggleTerminal"
   },
   "terminal": {
+    "ctrl-alt-s": "mod.open:content-search",
+    "ctrl-alt-q": "mod.open:symbol-search",
+    "ctrl-alt-c": "mod.open:git-branch",
+    "ctrl-alt-x": "mod.open:git-merge",
+    "ctrl-alt-r": "mod.open:git-rename",
+    "ctrl-alt-n": "mod.open:git-new",
+    "ctrl-alt-u": "mod.open:merge-editor",
+    "ctrl-alt-p": "mod.open:git-pull",
+    "ctrl-alt-k": "mod.open:git-push",
+    "ctrl-alt-z": "mod.open:git-undo",
+    "ctrl-alt-h": "mod.open:git-history",
     "ctrl-backspace": "send:\u0017",
     "ctrl-left": "send:\u001bb",
     "ctrl-right": "send:\u001bf",

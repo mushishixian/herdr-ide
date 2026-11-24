@@ -1148,6 +1148,24 @@ export default class IdeSidebar extends View {
     });
   }
 
+  openExplorerBgMenu() {
+    const items = [
+      { id: "new_file", label: "New File…" },
+      { id: "new_folder", label: "New Folder…" },
+    ];
+    if (this.clipboard) items.push({ id: "paste", label: `Paste (${this.clipboard.path.split("/").pop()})` });
+    items.push({ sep: true });
+    items.push({ id: "collapse_all", label: "Collapse Folders" });
+    items.push({ id: "refresh", label: "Refresh" });
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 220,
+      props: { items, payload: { source: "explorer-bg", path: "", dir: true, parentDir: "" } },
+    });
+  }
+
   openScmMenu(f, kind) {
     const staged = kind === "staged";
     const conflict = kind === "conflict";
@@ -1269,7 +1287,16 @@ export default class IdeSidebar extends View {
     }
     const path = p.path;
     const base = this.root || this.cwd;
-    if (!path && act.id !== "new_file" && act.id !== "new_folder") return;
+    const allowNoPath = act.id === "new_file" || act.id === "new_folder" || act.id === "paste" || act.id === "collapse_all" || act.id === "refresh";
+    if (!path && !allowNoPath) return;
+
+    if (act.id === "collapse_all") {
+      this.folders.clear();
+      this.pendingRevealPath = null;
+      cx.notify();
+      return;
+    }
+    if (act.id === "refresh") return this.refresh(cx, { force: true });
 
     if (act.id === "open") return this.openFile(path, 1, cx);
     if (act.id === "diff") return this.showDiff(path, Boolean(p.staged), Boolean(p.untracked || p.status === "?"), cx);
@@ -1592,6 +1619,7 @@ export default class IdeSidebar extends View {
               entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx);
             })
             .on_mouse_down("right", (_e, cx) => {
+              cx.stop_propagation();
               if (this.sel.size && !this.sel.has(path)) {
                 this.sel.clear();
                 this.selAnchor = path;
@@ -1663,6 +1691,12 @@ export default class IdeSidebar extends View {
         div().flex_1().min_h(0).relative()
           .child(
             v_flex().id("ide-exp-tree").track_scroll(this.treeScroll).absolute().inset_0().overflow_y_scroll().p(2)
+              .on_mouse_down("right", (_e, cx) => {
+                cx.stop_propagation();
+                this.sel.clear();
+                this.selAnchor = null;
+                this.openExplorerBgMenu();
+              })
               .children(rows)
               .when(rows.length === 0, (el) => el.child(div().p(10).text_size(12).text_color(t.dim).child(this.error || (this.loadingExplorer ? "Loading files…" : "No files")))),
           )
