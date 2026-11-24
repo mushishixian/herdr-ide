@@ -567,6 +567,7 @@ export default class Spaces extends View {
       const head = h_flex().id(`machine-${m ?? "local"}`).h(22).flex_none().px(collapsed ? 0 : 6).gap(5).items_center().text_size(11).text_color(t.dim)
         .when(collapsed, el => el.mt(4).w(RAIL_CELL).justify_center().rounded(6).tooltip(login ? `${m} needs a login: run ${login}. Click for Copy.` : m ? `${m} · ${connected ? "connected" : (machine?.state ?? "asleep").replace(/_/g, " ")}` : "This computer"))
         .cursor_pointer().hover(s => s.bg(t.hover))
+        .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
           if (collapsed && login) { run("app.settings", { section: "machines" }); return; }
           folded ? this.folded.delete(m) : this.folded.add(m);
@@ -594,6 +595,7 @@ export default class Spaces extends View {
       const empty = h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(collapsed ? 0 : 8).gap(7).items_center().rounded(7)
         .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
         .on_click(() => run("space.new", { machine: m ?? "" }))
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); run("space.new", { machine: m ?? "" }); })
         .when(collapsed, el => el.w(RAIL_CELL).rounded(6).justify_center().tooltip(`New space on ${m ?? "this computer"}`)
           .child(h_flex().size(18).rounded(5).border_1().border_color(t.dim).items_center().justify_center()
             .child(svg("mods/workspace-chrome/plus.svg").size(10))))
@@ -685,7 +687,7 @@ export default class Spaces extends View {
         } else if (from === w.id) run("space.select", { id: w.id });
         cx.notify();
       })
-      .on_mouse_down("right", () => this.menu(w))
+      .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.menu(w); })
       .child((() => {
         const tabIds = new Set((w.tabs ?? []).map((c) => c.id));
         const tabPanes = panes().filter((p) => p.terminal && tabIds.has(p.tab));
@@ -814,11 +816,16 @@ export default class Spaces extends View {
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
         .when(!collapsed, el => el.child("Spaces"))
         .child(div().id("space-new").size(22).flex_none().flex().items_center().justify_center().rounded(5).hover(s => s.bg(t.hover).text_color(t.foreground))
-          .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(13))))
+          .on_click(() => run("space.new", { machine: spaces().find((s) => s.active)?.machine ?? "" })).child(svg("mods/workspace-chrome/plus.svg").size(13))))
       .child(v_flex().flex_1().min_h(0).gap(1).px(collapsed ? 0 : 6).pb(8).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
         .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
+        .on_mouse_down("right", (_e, cx) => {
+          cx.stop_propagation();
+          const m = spaces().find((s) => s.active)?.machine ?? null;
+          openOverlay({ mod: "ide-space-menu", kind: "popup", width: 260, height: 72, props: { tab: "blank", machine: m ?? "" } });
+        })
         .children(list));
   }
 }

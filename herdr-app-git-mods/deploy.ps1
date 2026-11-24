@@ -200,31 +200,6 @@ Deploy-Mod "ide-pane-header" @{ place = "none"; title = "Pane Header" } $phCode
 $smCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\ide-space-menu\main.js"), $utf8NoBom)
 Deploy-Mod "ide-space-menu" @{ place = "none" } $smCode
 
-# 11c. Sidebar footer (own copy of the built-in workspace-chrome: herdr-app rewrites
-# built-in mods whose content differs on every start, so patching them in place is lost).
-# The footer swaps "Add machine" for "Add space" (space.new without a folder = home).
-# Its svgs keep referencing mods/workspace-chrome (the stock mod stays installed).
-$wcCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\workspace-chrome-ide\main.js"), $utf8NoBom)
-Deploy-Mod "workspace-chrome-ide" @{ place = "none" } $wcCode
-
-# Point the layouts' FOOTER blocks (props.footer) at workspace-chrome-ide; the top bar
-# ("brand", no props) keeps the stock mod. Layout edits rebuild panes, so only while
-# herdr-app is closed (same guard as terminal_menu below).
-$appHome = "$env:USERPROFILE\.config\herdr-app"
-$footerRx = [regex]'"mod": "workspace-chrome"(\s*,\s*"props"\s*:\s*\{\s*"footer"\s*:\s*true\s*\})'
-$layoutsForFooter = @("terminals-git.json", "ide.json") | ForEach-Object { Join-Path $appHome "layouts\$_" } |
-  Where-Object { Test-Path $_ }
-if (($layoutsForFooter | Where-Object { $footerRx.IsMatch([System.IO.File]::ReadAllText($_)) }) -and (Get-Process herdr-app -ErrorAction SilentlyContinue)) {
-  Write-Warning "herdr-app is running: footer layout not switched to workspace-chrome-ide (editing layouts would rebuild open panes). Close herdr-app and run deploy.ps1 again."
-} else {
-  foreach ($path in $layoutsForFooter) {
-    $text = [System.IO.File]::ReadAllText($path, $utf8NoBom)
-    if (-not $footerRx.IsMatch($text)) { continue }
-    [System.IO.File]::WriteAllText($path, $footerRx.Replace($text, '"mod": "workspace-chrome-ide"$1'), $utf8NoBom)
-    Write-Host "Footer layout now uses workspace-chrome-ide: $path"
-  }
-}
-
 # 12. Layout root "terminal_menu" (text edit, idempotent; no JSON rewrite)
 function Set-TerminalMenuKey($path, $mod) {
   if (-not (Test-Path $path)) { return }

@@ -20,6 +20,9 @@ async function checkout(folder, on) {
 function items(p, git) {
   p = p ?? {};
   const tg = p.target ?? {};
+  if (p.tab === "blank") {
+    return [[p.machine ? `New space on ${p.machine}` : "New space here", "space.new", { machine: p.machine ?? "" }]];
+  }
   return [
     ["Rename", "space.rename", { id: tg.id }],
     ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
@@ -29,7 +32,7 @@ function items(p, git) {
 }
 
 function menuIcon(command) {
-  const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command === "worktree" ? "git-branch" : "terminal";
+  const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command === "worktree" ? "git-branch" : command === "space.new" ? "plus" : "terminal";
   return `mods/workspace-chrome/${name}.svg`;
 }
 
@@ -109,8 +112,8 @@ export default class IdeSpaceMenu extends View {
                 .hover((s) => s.bg(t.hover))
                 .on_click(() => this.choose(i))
                 .child(svg(menuIcon(it[1])).size(14).flex_none().text_color(t.muted))
-                .child(div().flex_1().child(it[0]))
-                .child(div().text_size(11).text_color(t.dim).child(shortcut(it[1], it[2]))),
+                .child(div().flex_1().min_w(0).truncate().child(it[0]))
+                .child(div().flex_none().text_size(11).text_color(t.dim).child(shortcut(it[1], it[2]))),
             ),
         ),
       );
