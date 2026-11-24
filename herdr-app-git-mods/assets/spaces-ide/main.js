@@ -64,31 +64,31 @@ export function tone(t, status) {
 
 const FRAMES = ["◐", "◓", "◑", "◒"];
 
+function agentKind(prog, title) {
+  const s = String(prog || "").toLowerCase();
+  const ti = String(title || "").toLowerCase();
+  if (s.includes("fresh") || s.includes("nvim") || ti.includes("— fresh") || ti.includes(" - fresh")) return null;
+  if (/cmdc|command[- ]?code/.test(s) || /command code|^⌘\s/.test(ti)) return "cmdc";
+  if (/codebuddy|\bcbc\b/.test(s) || ti.includes("codebuddy")) return "codebuddy";
+  if (s.includes("claude") || ti.includes("claude")) return "claude";
+  if (s.includes("codex") || ti.includes("codex")) return "codex";
+  if (s.includes("gemini") || ti.includes("gemini")) return "gemini";
+  if (s.includes("opencode") || ti.includes("opencode")) return "opencode";
+  if (/\bdsh\b/.test(s)) return "dsh";
+  if (/\baider\b/.test(s)) return "aider";
+  if (/\bpi\b/.test(s)) return "pi";
+  if (/\bomp\b/.test(s)) return "omp";
+  return null;
+}
+
 function detectAgentLabel(tabPanes, spaceAgents) {
-  const live = spaceAgents[0];
-  if (live) {
-    const raw = (live.program?.name || live.program?.id || "").toLowerCase();
-    if (raw.includes("claude")) return "claude";
-    if (raw.includes("codex")) return "codex";
-    if (raw.includes("gemini")) return "gemini";
-    if (raw.includes("opencode")) return "opencode";
-    if (raw.includes("pi")) return "pi";
-    if (raw.includes("omp")) return "omp";
-    return live.program?.name || live.program?.id || "agent";
+  for (const live of spaceAgents) {
+    const kind = agentKind(live.program?.name || live.program?.id, live.title);
+    if (kind) return kind;
   }
   for (const p of tabPanes) {
-    const prog = `${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
-    const title = (p.title || "").toLowerCase();
-    if (prog.includes("fresh") || prog.includes("nvim") || title.includes("— fresh") || title.includes(" - fresh")) continue;
-    if (/cmdc|command[- ]?code/.test(prog) || /command code|^⌘\s/.test(title)) return "cmdc";
-    if (/codebuddy|\bcbc\b/.test(prog) || title.includes("codebuddy")) return "codebuddy";
-    if (prog.includes("claude") || title.includes("claude")) return "claude";
-    if (prog.includes("codex") || title.includes("codex")) return "codex";
-    if (prog.includes("gemini") || title.includes("gemini")) return "gemini";
-    if (prog.includes("opencode") || title.includes("opencode")) return "opencode";
-    if (/\bdsh\b/.test(prog)) return "dsh";
-    if (/\baider\b/.test(prog)) return "aider";
-    if (p.program && !p.program.shell) return p.program.id || p.program.name;
+    const kind = agentKind(`${p.program?.id || ""} ${p.program?.name || ""}`, p.title);
+    if (kind) return kind;
   }
   return null;
 }
@@ -97,12 +97,8 @@ const SPIN_CHARS = "\u2800-\u28FF\u25D0-\u25D3◐◓◑◒✢✣✤✥✦✧✩�
 const SPIN_TITLE = new RegExp(`^\\s*[${SPIN_CHARS}]`, "u");
 
 function isKnownCliAgent(p) {
-  const prog = `${p.program?.key || ""} ${p.program?.id || ""} ${p.program?.name || ""}`.toLowerCase();
-  const title = (p.title || "").toLowerCase();
-  if (prog.includes("fresh") || prog.includes("nvim") || title.includes("— fresh") || title.includes(" - fresh")) return false;
-  if (/cmdc|command[- ]?code|codebuddy|cbc|claude|codex|gemini|opencode|dsh|aider/.test(prog)) return true;
-  if (/command code|codebuddy|\bcbc\b|claude|codex|gemini|opencode|aider|^⌘\s/.test(title) || SPIN_TITLE.test(p.title || "")) return true;
-  return Boolean(p.program && !p.program.shell);
+  const prog = `${p.program?.key || ""} ${p.program?.id || ""} ${p.program?.name || ""}`;
+  return Boolean(agentKind(prog, p.title)) || SPIN_TITLE.test(p.title || "");
 }
 const SPIN_LINE = new RegExp(`^\\s*[${SPIN_CHARS}]\\s*\\S.*(?:…|\\.\\.\\.)`, "u");
 // A live status line such as "✹ Tidying… (101s · running REPL · Task running for a while)".
@@ -198,7 +194,7 @@ export default class Spaces extends View {
       const s = tabToSpace.get(p.tab);
       if (!s) continue;
       if (isKnownCliAgent(p)) {
-        const label = p.program?.name || p.program?.key || "Agent";
+        const label = agentKind(`${p.program?.key || ""} ${p.program?.id || ""} ${p.program?.name || ""}`, p.title) || "Agent";
         targets.push({ spaceId: s.id, spaceName: s.name || base(s.folder || "") || "Space", active: s.active && p.focused, terminal: p.terminal, label, spinTitle: SPIN_TITLE.test(p.title || "") });
       } else {
         delete this.termAgent[p.terminal];
