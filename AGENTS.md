@@ -17,7 +17,7 @@
 
 - 软件：`%LOCALAPPDATA%\Programs\herdr-app\herdr-app.exe`（本体，不含 mods）
 - mod 实际加载自：`%USERPROFILE%\.config\herdr-app\mods\<mod>\main.js`
-- **mod 只在 herdr-app 启动时读取**：改完必须部署 + 重启 herdr-app。关闭 app 不影响 herdr-core，pane 与终端会保留。
+- **mod 只在 herdr-app 启动时读取**：改完必须部署 + 重启 herdr-app。关闭 app 不影响 herdr-core，pane 与终端会保留。 
 
 ## 改完的标准流程
 
