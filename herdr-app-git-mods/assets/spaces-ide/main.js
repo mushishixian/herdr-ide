@@ -68,6 +68,7 @@ function agentKind(prog, title) {
   const s = String(prog || "").toLowerCase();
   const ti = String(title || "").toLowerCase();
   if (s.includes("fresh") || s.includes("nvim") || ti.includes("— fresh") || ti.includes(" - fresh")) return null;
+  if (/antigravity|\bagy\b/.test(s)) return "agy";
   if (/cmdc|command[- ]?code/.test(s) || /command code|^⌘\s/.test(ti)) return "cmdc";
   if (/codebuddy|\bcbc\b/.test(s) || ti.includes("codebuddy")) return "codebuddy";
   if (s.includes("claude") || ti.includes("claude")) return "claude";
@@ -83,12 +84,14 @@ function agentKind(prog, title) {
 
 function detectAgentLabel(tabPanes, spaceAgents) {
   for (const live of spaceAgents) {
-    const kind = agentKind(live.program?.name || live.program?.id, live.title);
-    if (kind) return kind;
+    const prog = live.program?.name || live.program?.id;
+    const kind = agentKind(prog, live.title) ?? (live.program?.agent ? prog : null);
+    if (kind) return String(kind);
   }
   for (const p of tabPanes) {
-    const kind = agentKind(`${p.program?.id || ""} ${p.program?.name || ""}`, p.title);
-    if (kind) return kind;
+    const prog = p.program?.id || p.program?.name;
+    const kind = agentKind(`${p.program?.id || ""} ${p.program?.name || ""}`, p.title) ?? (p.program?.agent ? prog : null);
+    if (kind) return String(kind);
   }
   return null;
 }
@@ -98,11 +101,11 @@ const SPIN_TITLE = new RegExp(`^\\s*[${SPIN_CHARS}]`, "u");
 
 function isKnownCliAgent(p) {
   const prog = `${p.program?.key || ""} ${p.program?.id || ""} ${p.program?.name || ""}`;
-  return Boolean(agentKind(prog, p.title)) || SPIN_TITLE.test(p.title || "");
+  return Boolean(agentKind(prog, p.title)) || p.program?.agent === true || SPIN_TITLE.test(p.title || "");
 }
-const SPIN_LINE = new RegExp(`^\\s*[${SPIN_CHARS}]\\s*\\S.*(?:…|\\.\\.\\.)`, "u");
+const SPIN_LINE = new RegExp(`^\\s*[${SPIN_CHARS}]\\s*\\S.{0,31}?(?:…|\\.\\.\\.)`, "u");
 // A live status line such as "✹ Tidying… (101s · running REPL · Task running for a while)".
-const WORKING_TEXT = /\(\s*\d+s\s*·|\b\d+s\s*·\s*(?:running|working|thinking|waiting)\b|Task running for a while|\brunning (?:REPL|command|tool|tools|task|tasks)\b/i;
+const WORKING_TEXT = /\(\s*\d+s\s*·|\b\d+s\s*·\s*(?:running|working|thinking|waiting)\b|Task running for a while|\brunning (?:REPL|command|tool|tools|task|tasks)\b|\bProcessing\b/i;
 
 function classifyAgentOutput(raw, prevInfo, now, opts = {}) {
   const lines = (raw || "").split("\n").map((l) => l.replace(/\r$/, "").trim()).filter(Boolean);
@@ -110,14 +113,18 @@ function classifyAgentOutput(raw, prevInfo, now, opts = {}) {
   const bottom = lines.slice(-6).join("\n");
   const spinTitle = Boolean(opts.spinTitle);
 
-  const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel|esc\s*(?:取消|中断)/i.test(lines.slice(-8).join("\n"));
-  const hasWorkingLine = lines.slice(-8).some((l) => SPIN_LINE.test(l) || WORKING_TEXT.test(l));
+  const hasInterruptHint = /esc to interrupt|ctrl\+c to interrupt|ctrl-c to interrupt|press esc to cancel|esc\s*(?:取消|中断)/i.test(lines.slice(-14).join("\n"));
+  const hasWorkingLine = lines.slice(-14).some((l) => SPIN_LINE.test(l) || WORKING_TEXT.test(l));
   const promptLine = /^[❯›>$%]\s*(?:Ask your question|Ask anything|Type (?:a|your) message|Try\s+"[^"]*"|输入.*|.*)?$/i;
   const hasPromptGlyph = lines.slice(-5).some((l) => /^[❯›>](?:\s|$)/.test(l));
-  const atPrompt = (lines.slice(-6).some((l) => promptLine.test(l)) || hasPromptGlyph) && !hasWorkingLine && !hasInterruptHint && !spinTitle;
+  // A question waiting on the user: Command Code's QUESTION block (its picked-option
+  // line "❯ 1. …" would otherwise read as an input prompt) and the usual y/n / approve UIs.
+  const questionUI = /\bType something\b|^\s*❯\s*\d+\s*[.、)]|^\s*QUESTION\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/im.test(lines.slice(-10).join("\n"));
+  const atPrompt = !questionUI && ((lines.slice(-6).some((l) => promptLine.test(l)) || hasPromptGlyph) && !hasWorkingLine && !hasInterruptHint && !spinTitle);
   const isBlocked =
-    !atPrompt &&
-    /\b(allow once|allow for this session|do you want to|approve|reject|select an option|press enter to confirm)\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/i.test(lines.slice(-10).join("\n"));
+    questionUI ||
+    (!atPrompt &&
+      /\b(allow once|allow for this session|do you want to|approve|reject|select an option|press enter to confirm)\b|\(y\/n\)|\[y\/n\]|\[Y\/n\]|\[y\/N\]/i.test(lines.slice(-10).join("\n")));
   const hasWorkingVerb =
     !atPrompt &&
     /^(?:Thinking|Generating|Searching|Running|Executing|Reading|Writing|Editing|Working|Repairing|Tidying|Planning|Calling)\b/im.test(bottom);
@@ -685,7 +692,14 @@ export default class Spaces extends View {
         const spAgents = agents().filter((a) => tabIds.has(a.tab));
         const agentName = detectAgentLabel(tabPanes, spAgents);
         const spinWorking = !w.status && tabPanes.some((p) => /^[\u2800-\u28FF\u25D0-\u25D3◐◓◑◒⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(p.title || ""));
-        const detected = w.status || this.spaceAgent[w.id] || (spinWorking ? "working" : null);
+        // Union of the mod's probe and herdr's own tracking (same urgency order as the
+        // probe's rank): a live state wins, and "done" sticks while either still reports it.
+        const urgency = { blocked: 4, working: 3, done: 2, idle: 1 };
+        const probed = this.spaceAgent[w.id];
+        const reported = w.status;
+        const detected = probed && reported
+          ? ((urgency[probed] ?? 0) >= (urgency[reported] ?? 0) ? probed : reported)
+          : (probed || reported || (spinWorking ? "working" : null));
         const runningProg = !detected && tabPanes.some((p) => isKnownCliAgent(p));
         const stGlyph = detected === "working"
           ? FRAMES[this.spinIdx % FRAMES.length]
