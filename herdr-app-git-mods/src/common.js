@@ -281,6 +281,20 @@ async function ensureBottomTerminalForSpace(space, cwd, on) {
   return addr;
 }
 
+// terminal.park and terminal.keep finish in the background, and panes() keeps
+// listing the old tree until they land. Both branches therefore wait for the
+// layout to show the change they asked for before returning: a toggle pressed
+// right after the other one used to see the stale pane, park it again and do
+// nothing visible (the "first alt+f12 does nothing, the second works" report).
+async function waitForPane(cx, addr, wantShown, tries = 20) {
+  for (let i = 0; i < tries; i++) {
+    const pane = panes().find((p) => p.terminal === addr) ?? null;
+    if (Boolean(pane) === wantShown) return pane;
+    await cx.sleep(100);
+  }
+  return panes().find((p) => p.terminal === addr) ?? null;
+}
+
 async function toggleBottomTerminal(cx) {
   if (bottomToggleBusy) return;
   const space = spaces().find((s) => s.active);
@@ -294,6 +308,7 @@ async function toggleBottomTerminal(cx) {
     bottomToggleBusy = true;
     try {
       run("terminal.park", { terminal: addr });
+      await waitForPane(cx, addr, false);
       const trackedId = shared("ide.editor.paneByTab")?.[shown.tab];
       const ed = trackedId ? panes().find((p) => p.pane === trackedId) : null;
       if (ed) run("pane.focus", { pane: ed.pane });
@@ -311,14 +326,11 @@ async function toggleBottomTerminal(cx) {
     const host = (trackedId && panes().find((p) => p.pane === trackedId)) || panes().find((p) => p.tab === activeTab);
     if (host && !host.focused) run("pane.focus", { pane: host.pane });
     run("terminal.keep", { terminal: addr, place: "down" });
-    const height = Number(getIdeSettings().bottomTermHeight) || 160;
-    for (let i = 0; i < 20; i++) {
-      await cx.sleep(100);
-      const pane = panes().find((p) => p.terminal === addr);
-      if (!pane) continue;
+    const pane = await waitForPane(cx, addr, true, 30);
+    if (pane) {
+      const height = Number(getIdeSettings().bottomTermHeight) || 160;
       run("layout.resize", { id: pane.pane, px: height });
       run("pane.focus", { pane: pane.pane });
-      return;
     }
   } finally {
     bottomToggleBusy = false;

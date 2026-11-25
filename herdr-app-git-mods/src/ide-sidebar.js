@@ -136,13 +136,17 @@ export default class IdeSidebar extends View {
     cx.spawn(async (cx2) => {
       for (;;) {
         const cmd = await nextCommand();
-        if (cmd === "recent") this.switchRecentFile(cx2);
-        else if (cmd === "lineHistory") this.openFreshLineHistory(cx2);
-        else if (cmd === "aiCommit") this.startBgGitJob("ai-commit", cx2);
-        else if (cmd === "aiSync") this.startBgGitJob("ai-sync", cx2);
-        else if (cmd === "sync") this.startBgGitJob("sync", cx2);
-        else if (cmd === "toggleTerminal") toggleBottomTerminal(cx2);
-        else if (cmd === "sendToAgent") cx2.spawn(async (cx3) => { await sendSelectionToAgent(cx3); cx3.notify(); });
+        try {
+          if (cmd === "recent") this.switchRecentFile(cx2);
+          else if (cmd === "lineHistory") this.openFreshLineHistory(cx2);
+          else if (cmd === "aiCommit") this.startBgGitJob("ai-commit", cx2);
+          else if (cmd === "aiSync") this.startBgGitJob("ai-sync", cx2);
+          else if (cmd === "sync") this.startBgGitJob("sync", cx2);
+          else if (cmd === "toggleTerminal") await toggleBottomTerminal(cx2);
+          else if (cmd === "sendToAgent") cx2.spawn(async (cx3) => { await sendSelectionToAgent(cx3); cx3.notify(); });
+        } catch (e) {
+          notify({ title: "IDE", body: String(e?.message ?? e), level: "error", timeout: 4000 });
+        }
         cx2.notify();
       }
     });
