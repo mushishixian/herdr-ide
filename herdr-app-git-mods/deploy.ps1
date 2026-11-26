@@ -130,11 +130,14 @@ foreach ($s in $searches) {
   } $code
 }
 
-# 5. Unified IDE Sidebar (Explorer / Search / Source Control / Settings)
+# 5. Unified IDE Sidebar (Explorer / Search / Source Control / Settings + Terminal link handler)
 $sbCode = Bundle-WithCommon "src\ide-sidebar.js"
 Deploy-Mod "ide-sidebar" @{
   place = "none"; title = "IDE Sidebar"
+  link_handlers = @(@{ kind = "file"; pattern = ".*" })
 } $sbCode
+$linkCode = Bundle-WithCommon "src\ide-link.js"
+[System.IO.File]::WriteAllText((Join-Path $herdrMods "ide-sidebar\link.js"), $linkCode, $utf8NoBom)
 
 # 6. Center File Editor Pane (Built-in fallback & center Diff viewer)
 $edCode = Bundle-WithCommon "src\ide-editor.js"
@@ -200,27 +203,29 @@ Deploy-Mod "ide-pane-header" @{ place = "none"; title = "Pane Header" } $phCode
 $smCode = [System.IO.File]::ReadAllText((Join-Path $repoRoot "mods\ide-space-menu\main.js"), $utf8NoBom)
 Deploy-Mod "ide-space-menu" @{ place = "none" } $smCode
 
-# 12. Layout root "terminal_menu" (text edit, idempotent; no JSON rewrite)
-function Set-TerminalMenuKey($path, $mod) {
+# 12. Layout root keys ("terminal_menu", "link_handlers") (text edit, idempotent; no JSON rewrite)
+function Set-LayoutRootKey($path, $key, $jsonLiteral) {
   if (-not (Test-Path $path)) { return }
   $text = [System.IO.File]::ReadAllText($path, $utf8NoBom)
-  if ($text -match '"terminal_menu"\s*:') { Write-Host "terminal_menu already set: $path"; return }
+  if ($text -match "`"$key`"\s*:") { Write-Host "$key already set: $path"; return }
   $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
   $rx = [regex]'(?m)^([ \t]*)"id": "root",(?=\r?$)'
   if (-not $rx.IsMatch($text)) { Write-Warning "no root id line in $path"; return }
-  $new = $rx.Replace($text, { param($m) $m.Value + $nl + $m.Groups[1].Value + '"terminal_menu": "' + $mod + '",' }, 1)
+  $new = $rx.Replace($text, { param($m) $m.Value + $nl + $m.Groups[1].Value + "`"$key`": $jsonLiteral," }, 1)
   [System.IO.File]::WriteAllText($path, $new, $utf8NoBom)
-  Write-Host "Added terminal_menu to $path"
+  Write-Host "Added $key to $path"
 }
 $appHome = "$env:USERPROFILE\.config\herdr-app"
 # herdr-app hot-reloads a changed layout file and rebuilds its panes (closing running
 # terminals), so only edit layouts while the app is closed.
-$layoutsToFix = @("terminals-git.json", "ide.json") | ForEach-Object { Join-Path $appHome "layouts\$_" } |
-  Where-Object { (Test-Path $_) -and -not ([System.IO.File]::ReadAllText($_) -match '"terminal_menu"\s*:') }
-if ($layoutsToFix -and (Get-Process herdr-app -ErrorAction SilentlyContinue)) {
-  Write-Warning "herdr-app is running: terminal_menu not added to layouts (editing them would rebuild open panes). Close herdr-app and run deploy.ps1 again."
+$layoutPaths = @("terminals-git.json", "ide.json") | ForEach-Object { Join-Path $appHome "layouts\$_" } | Where-Object { Test-Path $_ }
+$layoutsNeedingMenu = $layoutPaths | Where-Object { -not ([System.IO.File]::ReadAllText($_) -match '"terminal_menu"\s*:') }
+$layoutsNeedingLinks = $layoutPaths | Where-Object { -not ([System.IO.File]::ReadAllText($_) -match '"link_handlers"\s*:') }
+if (($layoutsNeedingMenu -or $layoutsNeedingLinks) -and (Get-Process herdr-app -ErrorAction SilentlyContinue)) {
+  Write-Warning "herdr-app is running: layout keys not added (editing them would rebuild open panes). Close herdr-app and run deploy.ps1 again."
 } else {
-  foreach ($path in $layoutsToFix) { Set-TerminalMenuKey $path "ide-term-menu" }
+  foreach ($path in $layoutsNeedingMenu) { Set-LayoutRootKey $path "terminal_menu" '"ide-term-menu"' }
+  foreach ($path in $layoutsNeedingLinks) { Set-LayoutRootKey $path "link_handlers" '["ide-sidebar"]' }
 }
 
 # 13. Fresh plugins into WSL ~/.config/fresh/plugins (every assets\fresh-plugins\*.ts)

@@ -1,6 +1,7 @@
 {
   "id": "root",
   "terminal_menu": "ide-term-menu",
+  "link_handlers": ["ide-sidebar"],
   "cloned_from": {
     "name": "terminals",
     "version": "0.1.16"
