@@ -5,7 +5,7 @@ import { spaces, agents, theme, run, window, keys, openOverlay, shared } from "h
 export default class GitStatus extends View {
   init(_p, cx) {
     this.lastBranchSig = "";
-    cx.timer.every(250, (cx2) => {
+    cx.timer.every(800, (cx2) => {
       const space = spaces().find((s) => s.active);
       if (!space) return;
       const b = shared("ide.branchBySpace")?.[space.id] || space.branch || "";

@@ -119,7 +119,7 @@ function pillBtn(id, label, tip, onClick) {
 export default class TerminalsBarGit extends View {
   init(_p, cx) {
     this.lastSyncSig = "";
-    cx.timer.every(250, (cx2) => {
+    cx.timer.every(800, (cx2) => {
       const space = spaces().find((p) => p.active);
       if (!space) return;
       const curBranch = shared("ide.branchBySpace")?.[space.id] || space.branch || "";

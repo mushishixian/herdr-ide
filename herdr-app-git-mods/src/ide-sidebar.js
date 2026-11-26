@@ -153,20 +153,24 @@ export default class IdeSidebar extends View {
     this.bootPromise = this.bootSettings(cx);
     this.refresh(cx);
     cx.spawn(async (cx2) => syncAgentSessions(cx2));
-    cx.timer.every(25, (cx2) => this.pollSharedSignals(cx2));
-    cx.timer.every(1500, (cx) => {
+    cx.timer.every(120, (cx2) => this.pollSharedSignals(cx2));
+    cx.timer.every(2500, (cx) => {
+      const activeWin = Boolean(win()?.active);
       if (!checking()) {
         this.syncWorkPane();
-        cx.spawn(async (cx2) => syncAgentSessions(cx2));
+        if (activeWin) cx.spawn(async (cx2) => syncAgentSessions(cx2));
       }
+      const now = Date.now();
+      const probeInterval = activeWin ? 4000 : 15000;
       if (locationKey() !== this.context) {
         this.refresh(cx);
-      } else if (this.view === "scm" && this.root && !this.loading && !this.probing) {
+      } else if (this.view === "scm" && this.root && !this.loading && !this.probing && now - (this.lastStatusProbeAt ?? 0) >= probeInterval) {
+        this.lastStatusProbeAt = now;
         this.probeStatus(cx);
       }
       const cfg = getIdeSettings();
-      const now = Date.now();
-      if (!this.lastTick || now - this.lastTick >= cfg.refreshSec * 1000) {
+      const refreshInterval = (activeWin ? cfg.refreshSec : Math.max(cfg.refreshSec * 3, 30)) * 1000;
+      if (!this.lastTick || now - this.lastTick >= refreshInterval) {
         this.lastTick = now;
         this.refresh(cx);
       }
@@ -175,13 +179,15 @@ export default class IdeSidebar extends View {
         recordWorkspaceSnapshot(space, this.root, this.view);
         const activeTab = space.tabs?.find((t) => t.active)?.id;
         if (activeTab) {
-          const sig = panes().filter((p) => p.tab === activeTab).map((p) => p.pane).join(",");
+          const tabPanes = panes().filter((p) => p.tab === activeTab);
+          const sig = tabPanes.map((p) => p.pane).join(",");
           if (this.seenTabPanes.get(activeTab) !== sig) {
             this.seenTabPanes.set(activeTab, sig);
             enforceTabEditorOrderAndMouse(activeTab, cfg);
           } else {
-            for (const p of panes().filter((x) => x.tab === activeTab && x.terminal && editorEngineOf(x) !== "")) {
-              syncEditorRightClick(p);
+            const termsByAddr = terminalMap();
+            for (const p of tabPanes) {
+              if (p.terminal && editorEngineOf(p) !== "") syncEditorRightClick(p, termsByAddr);
             }
           }
           const edRoot = this.root || this.cwd || space.folder;
@@ -390,8 +396,9 @@ export default class IdeSidebar extends View {
     const now = Date.now();
     if (
       this.view === "explorer" &&
+      win()?.active &&
       !this.probingFreshActive &&
-      now - (this.lastFreshProbeAt ?? 0) >= 550 &&
+      now - (this.lastFreshProbeAt ?? 0) >= 1000 &&
       (this.on !== null || win()?.platform !== "windows") &&
       getIdeSettings().autoReveal !== false
     ) {
@@ -652,6 +659,7 @@ export default class IdeSidebar extends View {
     const targetContext = this.context;
     const myLoadSeq = this.loadSeq;
     cx.spawn(async (cx) => {
+      let scmChanged = switched || Boolean(opts?.force);
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
         await this.bootPromise?.catch(() => {});
@@ -716,6 +724,7 @@ export default class IdeSidebar extends View {
           }
         }
 
+        const prevError = this.error;
         if (this.root) {
           const seqAtStart = shared("ide.git.dirtySeq") ?? 0;
           const git = (args) => exec("git", [...READ, ...args], { cwd: this.root, on });
@@ -726,26 +735,46 @@ export default class IdeSidebar extends View {
             git(["stash", "list", "--pretty=%gd%x09%s"]),
           ]);
           if (this.context !== targetContext || myLoadSeq !== this.loadSeq) return;
-          this.branch = br.code === 0 ? br.stdout.trim() : "HEAD";
+          const nextBranch = br.code === 0 ? br.stdout.trim() : "HEAD";
+          if (nextBranch !== this.branch) {
+            this.branch = nextBranch;
+            scmChanged = true;
+          }
           const activeSp = spaces().find((s) => s.active);
           if (activeSp?.id && this.branch && this.branch !== "HEAD" && (shared("ide.git.dirtySeq") ?? 0) === seqAtStart) {
             const bySpace = { ...(shared("ide.branchBySpace") ?? {}) };
             if (bySpace[activeSp.id] !== this.branch) {
               bySpace[activeSp.id] = this.branch;
               setShared("ide.branchBySpace", bySpace);
+              scmChanged = true;
             }
           }
-          this.applyStatusOutput(st.stdout ?? "", { seqAtStart });
-          this.commits = (logR.stdout ?? "").split("\n").filter(Boolean).map((l) => {
-            const [hash, subject, rel] = l.split("\t");
-            return { hash, subject, rel };
-          });
-          this.stashes = (stashR.stdout ?? "").split("\n").filter(Boolean).map((l) => {
-            const [ref, msg] = l.split("\t");
-            return { ref, msg };
-          });
+          const stRaw = st.stdout ?? "";
+          if (stRaw !== this.lastStatusRaw) {
+            this.applyStatusOutput(stRaw, { seqAtStart });
+            scmChanged = true;
+          }
+          const logRaw = logR.stdout ?? "";
+          if (logRaw !== this.lastLogRaw) {
+            this.lastLogRaw = logRaw;
+            this.commits = logRaw.split("\n").filter(Boolean).map((l) => {
+              const [hash, subject, rel] = l.split("\t");
+              return { hash, subject, rel };
+            });
+            scmChanged = true;
+          }
+          const stashRaw = stashR.stdout ?? "";
+          if (stashRaw !== this.lastStashRaw) {
+            this.lastStashRaw = stashRaw;
+            this.stashes = stashRaw.split("\n").filter(Boolean).map((l) => {
+              const [ref, msg] = l.split("\t");
+              return { ref, msg };
+            });
+            scmChanged = true;
+          }
         }
         if (this.context === targetContext && myLoadSeq === this.loadSeq) this.error = null;
+        if (prevError !== null) scmChanged = true;
       } catch (e) {
         if (this.context === targetContext && myLoadSeq === this.loadSeq) {
           this.error = String(e?.message ?? e);
@@ -753,7 +782,7 @@ export default class IdeSidebar extends View {
       } finally {
         if (myLoadSeq === this.loadSeq) {
           this.loading = false;
-          cx.notify();
+          if (scmChanged || this.error) cx.notify();
         }
       }
     });

@@ -349,6 +349,8 @@ export default class Spaces extends View {
     this.spaceAgent = {}; // spaceId -> status
     this.agentChanged = {}; // terminal -> { s, at }
     this.titleCache = {}; // terminal -> { sessionId, title, checkedAt }
+    this.lastProbeKey = {}; // terminal -> turn|title|focus
+    this.lastProbedAt = {}; // terminal -> ms
     this.probingAgents = false;
     this.probingTitles = false;
     this.probeCursor = 0;
@@ -391,9 +393,9 @@ export default class Spaces extends View {
     if (checking()) return;
     this.refreshMachines(cx);
     cx.timer.every(15000, (cx2) => this.refreshMachines(cx2));
-    cx.timer.every(250, (cx2) => this.checkNew(cx2));
-    cx.timer.every(900, (cx2) => this.probeCustomAgents(cx2));
-    cx.timer.every(2500, (cx2) => this.probeAgentTitles(cx2));
+    cx.timer.every(1000, (cx2) => this.checkNew(cx2));
+    cx.timer.every(1200, (cx2) => this.probeCustomAgents(cx2));
+    cx.timer.every(5000, (cx2) => this.probeAgentTitles(cx2));
     this.probeAgentTitles(cx);
   }
 
@@ -408,6 +410,7 @@ export default class Spaces extends View {
     for (const s of sp) {
       for (const t of s.tabs ?? []) tabToSpace.set(t.id, s);
     }
+    const now = Date.now();
     const liveTerminals = new Set();
     for (const p of ps) {
       if (!p.terminal || p.status) continue;
@@ -418,17 +421,35 @@ export default class Spaces extends View {
         liveTerminals.add(p.terminal);
         const kind = detectKind(p, tm, null) || "agent";
         const label = AGENT_META[kind]?.label || kind;
+        const probeKey = `${tm?.turn ?? ""}|${p.title ?? ""}|${p.focused ? 1 : 0}|${s.active ? 1 : 0}`;
+        const prevStatus = this.termAgent[p.terminal]?.status;
+        const activeState = prevStatus === "working" || prevStatus === "blocked";
+        const keyChanged = this.lastProbeKey[p.terminal] !== probeKey;
+        const fallbackDue = tm?.turn == null && now - (this.lastProbedAt[p.terminal] ?? 0) >= 5000;
+        const idleRefreshDue = now - (this.lastProbedAt[p.terminal] ?? 0) >= 20000;
+        const shouldProbe = !this.termAgent[p.terminal] || activeState || keyChanged || fallbackDue || idleRefreshDue;
         targets.push({
           spaceId: s.id,
-          spaceName: base(s.folder || place(s, ps)) || s.name || "Space",
+          spaceName: base(place(s, ps) || s.folder) || s.name || "Space",
           active: s.active,
           focused: p.focused,
           terminal: p.terminal,
           label,
           spinTitle: SPIN_TITLE.test(p.title || ""),
+          probeKey,
+          shouldProbe,
         });
       } else {
         delete this.termAgent[p.terminal];
+        delete this.lastProbeKey[p.terminal];
+        delete this.lastProbedAt[p.terminal];
+      }
+    }
+    for (const k of Object.keys(this.termAgent)) {
+      if (!liveTerminals.has(k)) {
+        delete this.termAgent[k];
+        delete this.lastProbeKey[k];
+        delete this.lastProbedAt[k];
       }
     }
     if (!targets.length) {
@@ -439,19 +460,23 @@ export default class Spaces extends View {
       return;
     }
 
-    // Round-robin slices of 12 so even >12 agents all stay fresh without flooding hc.
+    const dueTargets = targets.filter((t) => t.shouldProbe);
+    if (!dueTargets.length) return;
+
+    // Round-robin slices of 12 so even >12 active agents stay fresh without flooding hc.
     const batchSize = 12;
-    const start = targets.length <= batchSize ? 0 : this.probeCursor % targets.length;
+    const start = dueTargets.length <= batchSize ? 0 : this.probeCursor % dueTargets.length;
     const batch = [];
-    for (let i = 0; i < Math.min(batchSize, targets.length); i++) {
-      batch.push(targets[(start + i) % targets.length]);
+    for (let i = 0; i < Math.min(batchSize, dueTargets.length); i++) {
+      batch.push(dueTargets[(start + i) % dueTargets.length]);
     }
-    this.probeCursor = (start + batch.length) % Math.max(1, targets.length);
+    this.probeCursor = (start + batch.length) % Math.max(1, dueTargets.length);
 
     this.probingAgents = true;
     cx.spawn(async (cx2) => {
+      let uiChanged = false;
       try {
-        const now = Date.now();
+        const ts = Date.now();
         const winActive = Boolean(window()?.active);
         const soundsOn = settings()?.sounds?.enabled !== false;
         await Promise.all(
@@ -459,11 +484,14 @@ export default class Spaces extends View {
             try {
               const r = await hc(["read", tg.terminal, "--lines", "18"]);
               if (r.code !== 0) return;
+              this.lastProbeKey[tg.terminal] = tg.probeKey;
+              this.lastProbedAt[tg.terminal] = ts;
               const prev = this.termAgent[tg.terminal];
-              const info = classifyAgentOutput(r.stdout, prev, now, { spinTitle: tg.spinTitle });
+              const info = classifyAgentOutput(r.stdout, prev, ts, { spinTitle: tg.spinTitle });
               const becameDone = prev?.rawStatus === "working" && info.rawStatus === "idle" && info.status === "done";
               const becameBlocked = prev?.rawStatus !== "blocked" && info.rawStatus === "blocked";
               if (tg.active && tg.focused && winActive && info.status === "done") info.status = "idle";
+              if (!prev || prev.status !== info.status) uiChanged = true;
               this.termAgent[tg.terminal] = info;
               if (becameDone) {
                 if (soundsOn) playSound("done");
@@ -487,8 +515,13 @@ export default class Spaces extends View {
           const cur = nextSpace[tg.spaceId];
           if (!cur || (rank[st] ?? 0) > (rank[cur] ?? 0)) nextSpace[tg.spaceId] = st;
         }
+        const prevKeys = Object.keys(this.spaceAgent);
+        const nextKeys = Object.keys(nextSpace);
+        if (prevKeys.length !== nextKeys.length || nextKeys.some((k) => this.spaceAgent[k] !== nextSpace[k])) {
+          uiChanged = true;
+        }
         this.spaceAgent = nextSpace;
-        cx2.notify();
+        if (uiChanged) cx2.notify();
       } finally {
         this.probingAgents = false;
       }
@@ -522,8 +555,11 @@ export default class Spaces extends View {
       if (kind === "codex" && cleanAgentTitle(p.title, kind, base(s.folder || place(s, ps)))) continue;
 
       const sid = tm?.labels?.["ide.agent_session"] || this.titleCache[p.terminal]?.sessionId || null;
+      const turn = tm?.turn ?? null;
       const cached = this.titleCache[p.terminal];
-      const stale = !cached || (sid && cached.sessionId !== sid) || now - cached.checkedAt >= (cached.title ? 10000 : 3000);
+      // Once a title is cached and the terminal hasn't produced new output, avoid re-spawning python3.
+      const interval = cached?.title ? (cached.turn !== turn ? 15000 : 120000) : 5000;
+      const stale = !cached || (sid && cached.sessionId !== sid) || now - cached.checkedAt >= interval;
       if (!stale) continue;
 
       const on = s.machine ?? null;
@@ -534,6 +570,7 @@ export default class Spaces extends View {
         kind,
         sessionId: sid,
         pid: tm?.foreground?.pid || tm?.pid || null,
+        turn,
       });
       byMachine.set(on, list);
     }
@@ -558,7 +595,7 @@ export default class Spaces extends View {
             const nextTitle = hit?.title || prev?.title || null;
             const nextSid = hit?.sessionId || it.sessionId || prev?.sessionId || null;
             if (nextTitle !== prev?.title || nextSid !== prev?.sessionId) updated = true;
-            this.titleCache[it.address] = { sessionId: nextSid, title: nextTitle, checkedAt: ts };
+            this.titleCache[it.address] = { sessionId: nextSid, title: nextTitle, turn: it.turn, checkedAt: ts };
           }
         }
         if (updated) {
@@ -581,7 +618,6 @@ export default class Spaces extends View {
     const now = Date.now();
     const sp = spaces();
     const ps = panes();
-    const ag = agents();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
     const due = this.due(now, sp, ps);
     const dirtySeq = shared("ide.git.dirtySeq") ?? 0;
@@ -598,8 +634,6 @@ export default class Spaces extends View {
       sp.map((s) => `${s.id}:${s.active}:${s.status}:${this.spaceAgent[s.id] ?? ""}`).join(";") +
       "|" +
       ps.map((p) => `${p.pane}:${p.focused}:${p.status}:${p.program?.id ?? ""}:${p.title ?? ""}`).join(";") +
-      "|" +
-      ag.map((a) => `${a.pane}:${a.status}`).join(";") +
       `|${foc?.terminal ?? ""}:${foc?.pane ?? ""}`;
     const ageBucket = Math.floor(now / 30000);
     const ageTicked = ageBucket !== this.lastAgeTick;
@@ -847,6 +881,7 @@ export default class Spaces extends View {
           machine: w.machine ?? null,
           name: folderName,
           folderPath: folderRaw,
+          branch: null,
           spaces: [],
           primary: w,
           active: false,
@@ -856,9 +891,14 @@ export default class Spaces extends View {
         groups.push(grp);
       }
       grp.spaces.push(w);
+      const wGit = this.git[where(w, ps)];
+      const wBranch = (wGit?.branch && wGit.branch !== "(detached)" ? wGit.branch : null) || w.branch || null;
       if (w.active) {
         grp.active = true;
         grp.primary = w;
+        if (wBranch) grp.branch = wBranch;
+      } else if (!grp.branch && wBranch) {
+        grp.branch = wBranch;
       }
 
       const tabIds = new Set((w.tabs ?? []).map((c) => c.id));
@@ -957,6 +997,7 @@ export default class Spaces extends View {
     const targetSpace = grp.primary;
     const targetIndex = sp.findIndex((s) => s.id === targetSpace.id);
 
+    const tip = grp.folderPath ? (grp.branch ? `${grp.folderPath} (${grp.branch})` : grp.folderPath) : grp.branch;
     const header = h_flex()
       .relative()
       .id(`space-grp-${targetSpace.id}`)
@@ -967,7 +1008,7 @@ export default class Spaces extends View {
       .items_center()
       .rounded(6)
       .cursor_pointer()
-      .when(Boolean(grp.folderPath), (el) => el.tooltip(grp.folderPath))
+      .when(Boolean(tip), (el) => el.tooltip(tip))
       .when(headerActive, (el) => el.bg(t.selected))
       .when(!headerActive, (el) => el.hover((s) => s.bg(t.hover)))
       .when(this.pressed === targetSpace.id && this.over !== targetSpace.id, (el) => el.opacity(0.5))
@@ -1024,7 +1065,21 @@ export default class Spaces extends View {
           .text_color("#ffffff")
           .child([...grp.name][0]?.toUpperCase() ?? "?"),
       )
-      .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_medium().text_color(t.foreground).child(grp.name));
+      .child(div().flex_shrink(1).min_w(44).truncate().text_size(12.5).font_medium().text_color(t.foreground).child(grp.name))
+      .child(div().flex_1().min_w(2))
+      .when(Boolean(grp.branch), (el) =>
+        el.child(
+          h_flex()
+            .flex_shrink(2)
+            .min_w(26)
+            .gap(3)
+            .items_center()
+            .text_size(11)
+            .text_color(t.dim)
+            .child(svg("mods/workspace-chrome/branch.svg").size(10).flex_none())
+            .child(div().min_w(0).truncate().child(grp.branch)),
+        ),
+      );
 
     const rows = grp.items.map((it, idx) => this.renderAgentRow(it, grp, idx === grp.items.length - 1, t));
     return [header, ...rows];

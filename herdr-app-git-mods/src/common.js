@@ -1967,6 +1967,8 @@ print(json.dumps({it["address"]: probe_one(it) for it in items}))
 const agentProbeCache = new Map(); // addr -> { fgPid, sessionId, shellPid, checkedAt }
 const reconnectedShells = new Set(); // `${addr}:${shellPid}`
 let agentSyncBusy = false;
+let lastAgentSyncSig = "";
+let lastAgentSyncAt = 0;
 
 function detectAgentKindFromTerm(term, pane) {
   const candidates = [
@@ -2048,9 +2050,16 @@ async function syncAgentSessions(cx) {
   const tabPanes = panes().filter((p) => p.tab === activeTab);
   if (!tabPanes.length) return;
   const termsByAddr = terminalMap();
+  const syncSig = `${activeTab}|` + tabPanes.map((p) => {
+    const t = p.terminal ? termsByAddr.get(p.terminal) : null;
+    return `${p.terminal ?? ""}:${t?.foreground?.pid ?? ""}:${t?.foreground?.name ?? ""}:${t?.labels?.["ide.agent_session"] ?? ""}`;
+  }).join(";");
+  const now = Date.now();
+  if (syncSig === lastAgentSyncSig && now - lastAgentSyncAt < 10000) return;
+  lastAgentSyncSig = syncSig;
+  lastAgentSyncAt = now;
   const cfg = getIdeSettings();
   const on = space.machine ?? null;
-  const now = Date.now();
 
   agentSyncBusy = true;
   try {
