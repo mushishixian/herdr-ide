@@ -1,21 +1,152 @@
-import { View, div, svg } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Scrollbar, v_virtual_list } from "gpui-base";
+import { mkdir, writeFile, unlink } from "fs/promises";
+import { Buffer } from "buffer";
 import {
   exec, readTextFile, writeTextFile, theme, settings, props,
-  shared, setShared, notify, checking, window as win, run, closeOverlay,
+  shared, setShared, notify, checking, window as win, run, closeOverlay, appHome,
 } from "herdr";
+
+const IMG_LOAD_PY = `
+import base64, json, os, re, shutil, struct, sys
+
+p = sys.argv[1]
+dst_win = sys.argv[2] if len(sys.argv) > 2 else ""
+if not os.path.isfile(p):
+    sys.exit(2)
+sz = os.path.getsize(p)
+
+dst_wsl = None
+if dst_win and len(dst_win) >= 3 and dst_win[1] == ":" and dst_win[2] in ("\\\\", "/"):
+    cand = "/mnt/" + dst_win[0].lower() + "/" + dst_win[3:].replace("\\\\", "/")
+    if os.path.isdir("/mnt/" + dst_win[0].lower()):
+        dst_wsl = cand
+
+if not dst_wsl and sz > 5 * 1024 * 1024:
+    print(json.dumps({"tooLarge": True, "size": sz, "limit": "5 MB"}))
+    sys.exit(0)
+if dst_wsl and sz > 50 * 1024 * 1024:
+    print(json.dumps({"tooLarge": True, "size": sz, "limit": "50 MB"}))
+    sys.exit(0)
+
+with open(p, "rb") as f:
+    head = f.read(65536)
+
+w = h = 0
+ext = os.path.splitext(p)[1].lower().lstrip(".")
+try:
+    if head[:8] == b"\\x89PNG\\r\\n\\x1a\\n" and len(head) >= 24:
+        w, h = struct.unpack(">II", head[16:24])
+    elif head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 10:
+        w, h = struct.unpack("<HH", head[6:10])
+    elif head[:2] == b"BM" and len(head) >= 26:
+        w, h = struct.unpack("<ii", head[18:26])
+        h = abs(h)
+    elif head[:4] == b"RIFF" and head[8:12] == b"WEBP" and len(head) >= 30:
+        chunk = head[12:16]
+        if chunk == b"VP8 " and len(head) >= 30:
+            w, h = struct.unpack("<HH", head[26:30])
+            w &= 0x3FFF; h &= 0x3FFF
+        elif chunk == b"VP8L" and len(head) >= 25:
+            b0, b1, b2, b3 = head[21:25]
+            w = 1 + (b0 | ((b1 & 0x3F) << 8))
+            h = 1 + (((b1 & 0xC0) >> 6) | (b2 << 2) | ((b3 & 0x0F) << 10))
+        elif chunk == b"VP8X" and len(head) >= 30:
+            w = 1 + int.from_bytes(head[24:27], "little")
+            h = 1 + int.from_bytes(head[27:30], "little")
+    elif head[:2] == b"\\xff\\xd8":
+        with open(p, "rb") as jf:
+            jdata = jf.read(min(sz, 524288))
+        i = 2
+        while i + 9 < len(jdata):
+            if jdata[i] != 0xFF:
+                i += 1; continue
+            m = jdata[i + 1]
+            if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h, w = struct.unpack(">HH", jdata[i + 5:i + 9])
+                break
+            if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
+                i += 2; continue
+            ln = struct.unpack(">H", jdata[i + 2:i + 4])[0]
+            i += 2 + max(2, ln)
+    elif head[:4] == b"\\x00\\x00\\x01\\x00" and len(head) >= 8:
+        w = head[6] or 256
+        h = head[7] or 256
+    elif ext == "svg":
+        txt = head[:16384].decode("utf-8", errors="ignore")
+        mv = re.search(r'viewBox=["\\\']\\s*[0-9.eE+-]+\\s+[0-9.eE+-]+\\s+([0-9.eE+-]+)\\s+([0-9.eE+-]+)', txt, re.I)
+        mw = re.search(r'<svg[^>]*\\bwidth=["\\\']([0-9.]+)(?:px)?["\\\']', txt, re.I)
+        mh = re.search(r'<svg[^>]*\\bheight=["\\\']([0-9.]+)(?:px)?["\\\']', txt, re.I)
+        if mw and mh:
+            w, h = int(float(mw.group(1))), int(float(mh.group(1)))
+        elif mv:
+            w, h = int(float(mv.group(1))), int(float(mv.group(2)))
+except Exception:
+    pass
+
+if dst_wsl:
+    os.makedirs(os.path.dirname(dst_wsl), exist_ok=True)
+    shutil.copy2(p, dst_wsl)
+    print(json.dumps({"size": sz, "width": w, "height": h, "direct": True}))
+else:
+    with open(p, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    print(json.dumps({"size": sz, "width": w, "height": h, "b64": b64}))
+`;
+
+const IMG_LOAD_NODE = `
+const fs = require("fs");
+const path = require("path");
+const src = process.argv[1], dst = process.argv[2];
+const st = fs.statSync(src);
+if (st.size > 25 * 1024 * 1024) { console.log(JSON.stringify({ tooLarge: true, size: st.size })); process.exit(0); }
+const data = fs.readFileSync(src);
+fs.mkdirSync(path.dirname(dst), { recursive: true });
+fs.writeFileSync(dst, data);
+let w = 0, h = 0;
+const ext = path.extname(src).toLowerCase().slice(1);
+if (data[0]===0x89 && data[1]===0x50 && data.length>=24) { w = data.readUInt32BE(16); h = data.readUInt32BE(20); }
+else if (data.slice(0,3).toString()==="GIF" && data.length>=10) { w = data.readUInt16LE(6); h = data.readUInt16LE(8); }
+else if (data.slice(0,2).toString()==="BM" && data.length>=26) { w = Math.abs(data.readInt32LE(18)); h = Math.abs(data.readInt32LE(22)); }
+else if (data.slice(0,4).toString()==="RIFF" && data.slice(8,12).toString()==="WEBP" && data.length>=30) {
+  const ch = data.slice(12,16).toString();
+  if (ch==="VP8 ") { w = data.readUInt16LE(26)&0x3fff; h = data.readUInt16LE(28)&0x3fff; }
+  else if (ch==="VP8L") { const b0=data[21],b1=data[22],b2=data[23],b3=data[24]; w=1+(b0|((b1&0x3f)<<8)); h=1+(((b1&0xc0)>>6)|(b2<<2)|((b3&0x0f)<<10)); }
+  else if (ch==="VP8X") { w=1+(data[24]|(data[25]<<8)|(data[26]<<16)); h=1+(data[27]|(data[28]<<8)|(data[29]<<16)); }
+} else if (data[0]===0xff && data[1]===0xd8) {
+  let i=2; while (i+9<data.length) { if (data[i]!==0xff){i++;continue;} const m=data[i+1]; if ([0xc0,0xc1,0xc2,0xc3,0xc5,0xc6,0xc7,0xc9,0xca,0xcb,0xcd,0xce,0xcf].includes(m)) { h=data.readUInt16BE(i+5); w=data.readUInt16BE(i+7); break; } if (m===0xd8||m===0xd9||(m>=0xd0&&m<=0xd7)){i+=2;continue;} i+=2+Math.max(2,data.readUInt16BE(i+2)); }
+} else if (data[0]===0&&data[1]===0&&data[2]===1&&data[3]===0&&data.length>=8) { w=data[6]||256; h=data[7]||256; }
+else if (ext==="svg") {
+  const txt = data.slice(0,16384).toString("utf8");
+  const mv = /viewBox=["']\\s*[0-9.eE+-]+\\s+[0-9.eE+-]+\\s+([0-9.eE+-]+)\\s+([0-9.eE+-]+)/i.exec(txt);
+  const mw = /<svg[^>]*\\bwidth=["']([0-9.]+)(?:px)?["']/i.exec(txt), mh = /<svg[^>]*\\bheight=["']([0-9.]+)(?:px)?["']/i.exec(txt);
+  if (mw&&mh) { w=Math.round(+mw[1]); h=Math.round(+mh[1]); } else if (mv) { w=Math.round(+mv[1]); h=Math.round(+mv[2]); }
+}
+console.log(JSON.stringify({ size: st.size, width: w, height: h }));
+`;
+
+function formatBytes(b) {
+  if (!b && b !== 0) return "";
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 export default class IdeEditor extends View {
   init(p, cx) {
     this.isOverlay = Boolean(p?.overlay || props()?.overlay);
-    this.tabs = []; // [{ key, kind: "file"|"diff", title, file, staged, untracked, ref, isStash, root, on, raw, dirty, diffLines, diffWidth, diffStats }]
+    this.tabs = []; // [{ key, kind: "file"|"diff"|"image", ... }]
     this.activeKey = null;
     this.editing = true;
     this.code = null;
     this.error = null;
     this.loadingDiff = false;
+    this.loadingImage = false;
     this.wrapLines = true;
     this.diffBoxW = 0;
+    this.imgBoxW = 0;
+    this.imgBoxH = 0;
+    this.imgSeq = 0;
     this.lastSeq = 0;
     this.handle = cx.focus_handle();
 
@@ -38,6 +169,9 @@ export default class IdeEditor extends View {
 
   async close(_cx) {
     if (!this.isOverlay) return;
+    for (const tb of this.tabs) {
+      if (tb.imgCacheAbs) unlink(tb.imgCacheAbs).catch(() => {});
+    }
     setShared("ide.diff.overlay", null);
     closeOverlay(props()?.overlay);
   }
@@ -54,18 +188,21 @@ export default class IdeEditor extends View {
     if (req.kind === "diff") {
       return `diff:${req.on ?? "local"}:${req.root}:${req.ref || (req.untracked ? "Q" : req.staged ? "S" : "U")}:${req.file || ""}`;
     }
+    if (req.kind === "image") {
+      return `image:${req.on ?? "local"}:${req.root}/${req.file}`;
+    }
     return `file:${req.on ?? "local"}:${req.root}/${req.file}`;
   }
 
   openRequest(req, cx) {
-    const kind = req.kind === "diff" ? "diff" : "file";
+    const kind = req.kind === "diff" ? "diff" : req.kind === "image" ? "image" : "file";
     const key = this.tabKey({ ...req, kind });
     let tab = this.tabs.find((t) => t.key === key);
     if (!tab) {
       tab = {
         key,
         kind,
-        title: req.title || (kind === "diff" ? `Diff: ${(req.file || req.ref || "").split("/").pop()}` : (req.file || "").split("/").pop()),
+        title: req.title || (kind === "diff" ? `Diff: ${(req.file || req.ref || "").split("/").pop()}` : (req.file || "").split(/[\\/]/).pop()),
         file: req.file ?? null,
         staged: Boolean(req.staged),
         untracked: Boolean(req.untracked),
@@ -79,6 +216,12 @@ export default class IdeEditor extends View {
         diffLines: [],
         diffWidth: 400,
         diffStats: { add: 0, del: 0 },
+        imgRelPath: null,
+        imgCacheAbs: null,
+        imgWidth: 0,
+        imgHeight: 0,
+        imgSize: 0,
+        imgZoom: null, // null = Fit to window, else number (1 = 100%)
       };
       this.tabs.push(tab);
     } else if (req.line) {
@@ -91,6 +234,7 @@ export default class IdeEditor extends View {
 
   loadTab(tab, cx) {
     if (tab.kind === "diff") return this.loadDiffTab(tab, cx);
+    if (tab.kind === "image") return this.loadImageTab(tab, cx);
     const sep = !tab.on && win()?.platform === "windows" ? "\\" : "/";
     const abs = `${tab.root}${sep}${tab.file}`;
     cx.spawn(async (cx) => {
@@ -135,6 +279,71 @@ export default class IdeEditor extends View {
       } catch (e) {
         this.error = String(e?.message ?? e);
         cx.notify();
+      }
+    });
+  }
+
+  loadImageTab(tab, cx) {
+    this.code?.release();
+    this.code = null;
+    this.error = null;
+    if (tab.imgRelPath) {
+      this.loadingImage = false;
+      cx.notify();
+      return;
+    }
+    this.reloadImageTab(tab, cx);
+  }
+
+  reloadImageTab(tab, cx) {
+    this.code?.release();
+    this.code = null;
+    this.error = null;
+    this.loadingImage = true;
+    cx.notify();
+    const prevCache = tab.imgCacheAbs;
+    const seq = ++this.imgSeq;
+    const ext = (String(tab.file || "").split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "") || "png";
+    const relDir = "cache/img-preview";
+    const relPath = `${relDir}/${shortHash(tab.key)}-${seq}.${ext}`;
+    const homeRoot = String(appHome() || "").replace(/[\\/]+$/, "");
+    const winSep = win()?.platform === "windows" ? "\\" : "/";
+    const cacheDirAbs = `${homeRoot}${winSep}cache${winSep}img-preview`;
+    const cacheAbs = `${cacheDirAbs}${winSep}${shortHash(tab.key)}-${seq}.${ext}`;
+    const srcSep = !tab.on && win()?.platform === "windows" ? "\\" : "/";
+    const isAbs = tab.file?.startsWith("/") || /^[A-Za-z]:[\\/]/.test(tab.file || "");
+    const absPath = isAbs ? tab.file : `${String(tab.root || "").replace(/[\\/]+$/, "")}${srcSep}${tab.file}`;
+
+    cx.spawn(async (cx2) => {
+      try {
+        let meta = null;
+        if (tab.on !== null || win()?.platform !== "windows") {
+          const r = await exec("python3", ["-c", IMG_LOAD_PY, absPath, cacheAbs], { on: tab.on, timeout: 10000 });
+          if (r.code !== 0 || !r.stdout) throw new Error(r.stderr?.trim() || `Cannot read image: ${tab.file}`);
+          meta = JSON.parse(r.stdout);
+          if (meta.tooLarge) throw new Error(`Image too large (${formatBytes(meta.size)}, limit ${meta.limit || "25 MB"})`);
+          if (!meta.direct) {
+            await mkdir(cacheDirAbs, { recursive: true });
+            await writeFile(cacheAbs, Buffer.from(meta.b64, "base64"));
+          }
+        } else {
+          const r = await exec("node", ["-e", IMG_LOAD_NODE, absPath, cacheAbs], { on: null, timeout: 10000 });
+          if (r.code !== 0 || !r.stdout) throw new Error(r.stderr?.trim() || `Cannot read image: ${tab.file}`);
+          meta = JSON.parse(r.stdout);
+          if (meta.tooLarge) throw new Error(`Image too large (${formatBytes(meta.size)}, limit 25 MB)`);
+        }
+        if (prevCache && prevCache !== cacheAbs) unlink(prevCache).catch(() => {});
+        tab.imgRelPath = relPath;
+        tab.imgCacheAbs = cacheAbs;
+        tab.imgWidth = Number(meta.width) || 0;
+        tab.imgHeight = Number(meta.height) || 0;
+        tab.imgSize = Number(meta.size) || 0;
+        this.error = null;
+      } catch (e) {
+        this.error = String(e?.message ?? e);
+      } finally {
+        this.loadingImage = false;
+        cx2.notify();
       }
     });
   }
@@ -206,7 +415,8 @@ export default class IdeEditor extends View {
   closeTab(key, cx) {
     const idx = this.tabs.findIndex((t) => t.key === key);
     if (idx < 0) return;
-    this.tabs.splice(idx, 1);
+    const [removed] = this.tabs.splice(idx, 1);
+    if (removed?.imgCacheAbs) unlink(removed.imgCacheAbs).catch(() => {});
     if (this.tabs.length === 0) {
       this.code?.release();
       this.code = null;
@@ -286,8 +496,22 @@ export default class IdeEditor extends View {
     const t = theme();
     const active = this.tabs.find((tb) => tb.key === this.activeKey);
     const isDiff = active?.kind === "diff";
+    const isImage = active?.kind === "image";
     const vpH = cx?.viewport_size?.()?.height ?? 900;
     const overlayH = Math.max(460, Math.round(vpH * 0.88) - 12);
+
+    const stepImgZoom = (factor, cx2) => {
+      if (!active || !isImage) return;
+      const vpW = cx2?.viewport_size?.()?.width ?? 1600;
+      const estW = Math.round(vpW * 0.90) - 48;
+      const estH = overlayH - 96;
+      const bw = this.imgBoxW > 80 ? this.imgBoxW - 32 : estW;
+      const bh = this.imgBoxH > 80 ? this.imgBoxH - 32 : estH;
+      const fit = active.imgWidth > 0 && active.imgHeight > 0 ? Math.min(1, bw / active.imgWidth, bh / active.imgHeight) : 1;
+      const cur = active.imgZoom ?? fit;
+      active.imgZoom = Math.max(0.1, Math.min(8, Math.round(cur * factor * 100) / 100));
+      cx2.notify();
+    };
 
     const btn = (id, label, accent, onClick) =>
       div()
@@ -314,10 +538,24 @@ export default class IdeEditor extends View {
         if (this.isOverlay && e.key === "escape") {
           this.close(cx);
           cx.stop_propagation();
-        } else if (e.key === "s" && e.modifiers.control && !isDiff) {
+        } else if (isImage && (e.key === "=" || e.key === "+")) {
+          stepImgZoom(1.25, cx);
+          cx.stop_propagation();
+        } else if (isImage && (e.key === "-" || e.key === "_")) {
+          stepImgZoom(0.8, cx);
+          cx.stop_propagation();
+        } else if (isImage && e.key === "0") {
+          active.imgZoom = null;
+          cx.notify();
+          cx.stop_propagation();
+        } else if (isImage && e.key === "1") {
+          active.imgZoom = 1;
+          cx.notify();
+          cx.stop_propagation();
+        } else if (e.key === "s" && e.modifiers.control && !isDiff && !isImage) {
           this.saveActive(cx);
           cx.stop_propagation();
-        } else if (e.key === "o" && e.modifiers.control && e.modifiers.alt && !isDiff) {
+        } else if (e.key === "o" && e.modifiers.control && e.modifiers.alt && !isDiff && !isImage) {
           this.openLineHistory(cx);
           cx.stop_propagation();
         }
@@ -360,6 +598,7 @@ export default class IdeEditor extends View {
                       this.loadTab(tb, cx);
                     })
                     .when(tb.kind === "diff", (el) => el.child(div().text_size(10.5).text_color(t.accent).child("±")))
+                    .when(tb.kind === "image", (el) => el.child(div().text_size(10.5).text_color(t.ansi1).child("▣")))
                     .child(div().max_w(180).truncate().text_size(12).child((tb.dirty ? "● " : "") + label))
                     .child(
                       div()
@@ -385,7 +624,12 @@ export default class IdeEditor extends View {
                 this.wrapLines = !this.wrapLines;
                 cx.notify();
               }))
-              .when(Boolean(active.file), (el2) =>
+              .when(Boolean(active.file && isImageFile(active.file)), (el2) =>
+                el2.child(btn("ed-view-img", "View Image", true, (_e, cx) => {
+                  openInCenterEditor({ file: active.file, root: active.root, on: active.on, line: 1, direct: true }, cx);
+                })),
+              )
+              .when(Boolean(active.file && !isImageFile(active.file)), (el2) =>
                 el2.child(btn("ed-open-src", "Edit File", true, (_e, cx) => {
                   const wasOverlay = this.isOverlay;
                   if (wasOverlay) this.close(cx);
@@ -394,8 +638,28 @@ export default class IdeEditor extends View {
               )
               .child(btn("ed-diff-ref", "↻ Refresh", false, (_e, cx) => this.loadDiffTab(active, cx))),
           )
+          .when(Boolean(active && isImage), (el) => {
+            const vpW = cx?.viewport_size?.()?.width ?? 1600;
+            const bw = this.imgBoxW > 80 ? this.imgBoxW - 32 : Math.round(vpW * 0.90) - 48;
+            const bh = this.imgBoxH > 80 ? this.imgBoxH - 32 : overlayH - 96;
+            const fit = active.imgWidth > 0 && active.imgHeight > 0 ? Math.min(1, bw / active.imgWidth, bh / active.imgHeight) : 1;
+            const pct = Math.round((active.imgZoom ?? fit) * 100);
+            return el
+              .child(btn("ed-img-out", "−", false, (_e, cx2) => stepImgZoom(0.8, cx2)))
+              .child(div().px(6).text_size(11.5).text_color(t.muted).child(`${pct}%`))
+              .child(btn("ed-img-in", "+", false, (_e, cx2) => stepImgZoom(1.25, cx2)))
+              .child(btn("ed-img-fit", "Fit", active.imgZoom === null, (_e, cx2) => {
+                active.imgZoom = null;
+                cx2.notify();
+              }))
+              .child(btn("ed-img-100", "1:1", active.imgZoom === 1, (_e, cx2) => {
+                active.imgZoom = 1;
+                cx2.notify();
+              }))
+              .child(btn("ed-img-ref", "↻", false, (_e, cx2) => this.reloadImageTab(active, cx2)));
+          })
           .when(this.isOverlay, (el) => el.child(btn("ed-esc", "Esc", false, (_e, cx) => this.close(cx))))
-          .when(Boolean(active && !isDiff), (el) =>
+          .when(Boolean(active && !isDiff && !isImage), (el) =>
             el
               .child(btn("ed-mode", this.editing ? "Editing" : "Read-Only", false, (_e, cx) => this.toggleMode(cx)))
               .when(this.editing, (el2) => el2.child(btn("ed-save", "Save (Ctrl+S)", true, (_e, cx) => this.saveActive(cx)))),
@@ -423,9 +687,20 @@ export default class IdeEditor extends View {
                     ? (active.ref
                         ? `${active.isStash ? "Stash" : "Commit"} ${active.ref}`
                         : `${active.file} (${active.untracked ? "Untracked" : active.staged ? "Staged" : "Working Tree"})`)
-                    : active.file + (active.line > 1 ? `:${active.line}` : ""),
+                    : isImage
+                      ? active.file
+                      : active.file + (active.line > 1 ? `:${active.line}` : ""),
                 ),
             )
+            .when(isImage && (active.imgWidth > 0 || active.imgSize > 0), (el2) => {
+              const ext = (String(active.file || "").split(".").pop() || "").toUpperCase();
+              const info = [
+                active.imgWidth > 0 && active.imgHeight > 0 ? `${active.imgWidth} × ${active.imgHeight}` : "",
+                ext,
+                active.imgSize > 0 ? formatBytes(active.imgSize) : "",
+              ].filter(Boolean).join(" · ");
+              return el2.child(div().flex_none().text_color(t.muted).child(info));
+            })
             .when(isDiff && Boolean(active.diffStats), (el2) =>
               el2
                 .child(div().px(6).py(1).rounded(4).bg(t.ansi2 + "28").font_semibold().text_color(t.ansi2).child(`+${active.diffStats.add}`))
@@ -484,8 +759,53 @@ export default class IdeEditor extends View {
             .child(Scrollbar.vertical("ed-diff-list").viewport_from_layout().absolute().inset_0()),
         );
       })
-      .when(!this.error && !isDiff && Boolean(this.code), (el) => el.child(Editor.new(this.code).flex_1().min_h(0)))
-      .when(!this.error && !isDiff && !this.code, (el) =>
+      .when(!this.error && isImage, (el) => {
+        if (this.loadingImage) return el.child(div().p(20).text_color(t.dim).child("Loading image…"));
+        if (!active.imgRelPath) return el.child(div().p(20).text_color(t.dim).child("No image preview available."));
+        const vpW = cx?.viewport_size?.()?.width ?? 1600;
+        const bw = this.imgBoxW > 80 ? this.imgBoxW - 32 : Math.round(vpW * 0.90) - 48;
+        const bh = this.imgBoxH > 80 ? this.imgBoxH - 32 : overlayH - 96;
+        const iw = active.imgWidth || 400;
+        const ih = active.imgHeight || 300;
+        const maxFit = String(active.file || "").toLowerCase().endsWith(".svg") && iw < 128 && ih < 128 ? 6 : 1;
+        const fit = Math.min(maxFit, bw / iw, bh / ih);
+        const scale = active.imgZoom ?? fit;
+        const drawW = Math.max(1, Math.round(iw * scale));
+        const drawH = Math.max(1, Math.round(ih * scale));
+        const fits = drawW <= bw && drawH <= bh;
+        return el.child(
+          div()
+            .id("ed-img-wrap")
+            .flex_1()
+            .min_h(0)
+            .w_full()
+            .bg(t.background)
+            .overflow_scrollbar()
+            .on_size_change((sz, cx2) => {
+              if (sz?.width > 80 && sz?.height > 80 && (Math.abs(sz.width - this.imgBoxW) > 6 || Math.abs(sz.height - this.imgBoxH) > 6)) {
+                this.imgBoxW = sz.width;
+                this.imgBoxH = sz.height;
+                cx2.notify();
+              }
+            })
+            .child(
+              h_flex()
+                .when(fits, (c) => c.size_full().items_center().justify_center())
+                .when(!fits, (c) => c.min_w(Math.max(bw + 32, drawW + 32)).min_h(Math.max(bh + 32, drawH + 32)).p(16).items_center().justify_center())
+                .child(
+                  div()
+                    .p(2)
+                    .rounded(6)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.surface)
+                    .child(image(active.imgRelPath).w(drawW).h(drawH).flex_none()),
+                ),
+            ),
+        );
+      })
+      .when(!this.error && !isDiff && !isImage && Boolean(this.code), (el) => el.child(Editor.new(this.code).flex_1().min_h(0)))
+      .when(!this.error && !isDiff && !isImage && !this.code, (el) =>
         el.child(div().p(20).text_color(t.dim).child(active ? "Loading file…" : "Select a file from Files / Ctrl+Q to open here.")),
       );
   }

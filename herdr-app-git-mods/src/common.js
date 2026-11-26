@@ -4,6 +4,8 @@ import {
 } from "herdr";
 
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|svg|bmp|ico)$/i;
+const isImageFile = (file) => IMAGE_EXT_RE.test(String(file || ""));
 
 const DEFAULT_IDE_SETTINGS = {
   editorEngine: "fresh",          // "fresh" | "builtin" | "nvim" | "zed" | "vscode"
@@ -862,6 +864,22 @@ function replacePaneAndSplit({ victim, survivor, dir, splitOpts, tabPanes, activ
 }
 
 function openInCenterEditor({ file, root, on, line, direct }, cx) {
+  if (isImageFile(file)) {
+    const seq = (shared("ide.editor.open")?.seq ?? 0) + 1;
+    const payload = {
+      kind: "image",
+      title: String(file).split(/[\\/]/).pop() || "Image",
+      file,
+      root,
+      on: on ?? null,
+      seq,
+    };
+    setShared("ide.editor.open", payload);
+    if (!shared("ide.diff.overlay")) {
+      openOverlay({ mod: "ide-editor", kind: "popup", at: "top", offset: 24, width: 0.90, height: 0.88, props: payload });
+    }
+    return;
+  }
   const cfg = getIdeSettings();
   const diffOverlay = shared("ide.diff.overlay");
   if (diffOverlay) {
@@ -1026,6 +1044,10 @@ function openBuiltinPane(payload, cfg, tabPanes, paneMap, activeTab, existingEd,
 }
 
 function openDiffInCenterEditor({ title, file, staged, untracked, ref, isStash, root, on }, cx) {
+  if (untracked && !ref && isImageFile(file)) {
+    openInCenterEditor({ file, root, on, line: 1, direct: true }, cx);
+    return;
+  }
   const cfg = getIdeSettings();
   const seq = (shared("ide.editor.open")?.seq ?? 0) + 1;
   const payload = {
