@@ -295,6 +295,23 @@ async function waitForPane(cx, addr, wantShown, tries = 20) {
   return panes().find((p) => p.terminal === addr) ?? null;
 }
 
+// `hc run` answers before the app's own terminal table has the new terminal, so a
+// terminal.keep sent right after it is refused ("no running terminal"). Wait for
+// the core terminal to show up in terminals(), and retry the keep a few times.
+async function keepBottomTerminal(cx, addr) {
+  for (let i = 0; i < 12; i++) {
+    if (terminals().some((t) => t.address === addr)) break;
+    await cx.sleep(100);
+  }
+  for (let attempt = 0; attempt < 4; attempt++) {
+    run("terminal.keep", { terminal: addr, place: "down" });
+    const pane = await waitForPane(cx, addr, true, 15);
+    if (pane) return pane;
+    await cx.sleep(150);
+  }
+  return null;
+}
+
 async function toggleBottomTerminal(cx) {
   if (bottomToggleBusy) return;
   const space = spaces().find((s) => s.active);
@@ -325,8 +342,7 @@ async function toggleBottomTerminal(cx) {
     const trackedId = activeTab ? shared("ide.editor.paneByTab")?.[activeTab] : null;
     const host = (trackedId && panes().find((p) => p.pane === trackedId)) || panes().find((p) => p.tab === activeTab);
     if (host && !host.focused) run("pane.focus", { pane: host.pane });
-    run("terminal.keep", { terminal: addr, place: "down" });
-    const pane = await waitForPane(cx, addr, true, 30);
+    const pane = await keepBottomTerminal(cx, addr);
     if (pane) {
       const height = Number(getIdeSettings().bottomTermHeight) || 160;
       run("layout.resize", { id: pane.pane, px: height });
