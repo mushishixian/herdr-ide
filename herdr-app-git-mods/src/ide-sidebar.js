@@ -1096,6 +1096,70 @@ export default class IdeSidebar extends View {
     }
   }
 
+  // Drops arrive as absolute paths on this computer, and this app is a Windows
+  // binary, so they are always Windows paths. A WSL workspace takes the
+  // /mnt/<drive>/... form instead; a Windows workspace keeps them as-is.
+  // A remote Linux machine has no mapping, so it returns null.
+  dropPath(src, winHost) {
+    if (winHost) return src;
+    const m = /^([A-Za-z]):[\\/](.*)$/.exec(src);
+    if (!m) return src;
+    if (win()?.platform === "windows" && !/^\/mnt\/[A-Za-z](\/|$)/.test(this.root || this.cwd || "")) return null;
+    return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}`;
+  }
+
+  dropFiles(paths, targetDir, cx) {
+    const base = this.root || this.cwd;
+    if (!base || !paths?.length) return;
+    const now = Date.now();
+    if (now - (this.lastDropAt ?? 0) < 400) return;
+    this.lastDropAt = now;
+    // A workspace on this computer keeps Windows paths end to end. A WSL
+    // workspace rewrites drops into /mnt/<drive>/… and copies through sh.
+    const winHost = !this.on && win()?.platform === "windows";
+    const sep = winHost ? "\\" : "/";
+    const dest = targetDir ? `${base}${sep}${targetDir}` : base;
+    const srcs = paths.map((p) => this.dropPath(String(p), winHost)).filter(Boolean);
+    if (!srcs.length) {
+      notify({ title: "Drop Failed", body: "These files came from local Windows; this workspace is not a WSL path, so they cannot be copied in.", level: "warning", timeout: 5000 });
+      return;
+    }
+    cx.spawn(async (cx) => {
+      try {
+        let r;
+        if (winHost) {
+          // The payload goes in an env var: PowerShell 5.1 mangles quotes in native args.
+          const payload = toBase64Utf8(JSON.stringify({ dest, srcs }));
+          const ps = [
+            "$j = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:HERDR_DROP)) | ConvertFrom-Json",
+            "foreach ($s in $j.srcs) {",
+            "  if (-not (Test-Path -LiteralPath $s)) { continue }",
+            "  $leaf = Split-Path -Leaf $s",
+            "  $ext = [IO.Path]::GetExtension($leaf)",
+            "  $stem = if ($ext) { $leaf.Substring(0, $leaf.Length - $ext.Length) } else { $leaf }",
+            "  $name = $leaf",
+            "  $i = 1",
+            "  while (Test-Path -LiteralPath (Join-Path $j.dest $name)) { $name = $stem + '-' + $i + $ext; $i++ }",
+            "  Copy-Item -LiteralPath $s -Destination (Join-Path $j.dest $name) -Recurse -Force",
+            "}",
+          ].join("\n");
+          r = await exec("powershell", ["-NoProfile", "-Command", `$env:HERDR_DROP='${payload}'; ${ps}`], {});
+        } else {
+          const sh = 'dest=$1; shift; for src in "$@"; do [ -e "$src" ] || { echo "missing: $src" >&2; continue; }; b=${src##*/}; n=$b; i=1; while [ -e "$dest/$n" ]; do case "$b" in *.*) n=${b%.*}-$i.${b##*.} ;; *) n=$b-$i ;; esac; i=$((i+1)); done; cp -r "$src" "$dest/$n" || exit 1; done';
+          r = await exec("sh", ["-c", sh, "drop", dest, ...srcs], { on: this.on });
+        }
+        if (r.code !== 0) throw new Error((r.stderr || r.stdout || "Copy failed").trim());
+        bumpGitDirty();
+        notify({ title: "Dropped", body: `${paths.length} file(s) → ${targetDir || base.split(/[\\/]/).pop()}`, level: "success" });
+        this.refresh(cx, { force: true });
+      } catch (e) {
+        this.note = String(e?.message ?? e);
+        notify({ title: "Drop Failed", body: this.note, level: "error", timeout: 5000 });
+        cx.notify();
+      }
+    });
+  }
+
   async addToGitignore(rel, cx) {
     if (!this.root) return;
     const sep = !this.on && win()?.platform === "windows" ? "\\" : "/";
@@ -1149,6 +1213,24 @@ export default class IdeSidebar extends View {
       at: "pointer",
       width: 220,
       props: { items, payload: { source: "explorer", path, dir: entry.dir, parentDir, paths: targets } },
+    });
+  }
+
+  openExplorerBgMenu() {
+    const items = [
+      { id: "new_file", label: "New File…" },
+      { id: "new_folder", label: "New Folder…" },
+    ];
+    if (this.clipboard) items.push({ id: "paste", label: `Paste (${this.clipboard.path.split("/").pop()})` });
+    items.push({ sep: true });
+    items.push({ id: "collapse_all", label: "Collapse Folders" });
+    items.push({ id: "refresh", label: "Refresh" });
+    openOverlay({
+      mod: "ide-menu",
+      kind: "popup",
+      at: "pointer",
+      width: 220,
+      props: { items, payload: { source: "explorer-bg", path: "", dir: true, parentDir: "" } },
     });
   }
 
@@ -1273,7 +1355,16 @@ export default class IdeSidebar extends View {
     }
     const path = p.path;
     const base = this.root || this.cwd;
-    if (!path && act.id !== "new_file" && act.id !== "new_folder") return;
+    const allowNoPath = act.id === "new_file" || act.id === "new_folder" || act.id === "paste" || act.id === "collapse_all" || act.id === "refresh";
+    if (!path && !allowNoPath) return;
+
+    if (act.id === "collapse_all") {
+      this.folders.clear();
+      this.pendingRevealPath = null;
+      cx.notify();
+      return;
+    }
+    if (act.id === "refresh") return this.refresh(cx, { force: true });
 
     if (act.id === "open") return this.openFile(path, 1, cx);
     if (act.id === "diff") return this.showDiff(path, Boolean(p.staged), Boolean(p.untracked || p.status === "?"), cx);
@@ -1596,6 +1687,7 @@ export default class IdeSidebar extends View {
               entry.dir ? this.toggleFolder(path, cx) : this.openFile(path, 1, cx);
             })
             .on_mouse_down("right", (_e, cx) => {
+              cx.stop_propagation();
               if (this.sel.size && !this.sel.has(path)) {
                 this.sel.clear();
                 this.selAnchor = path;
@@ -1606,6 +1698,7 @@ export default class IdeSidebar extends View {
               }
               this.openExplorerMenu(entry, path);
             })
+            .when(entry.dir, (el) => el.on_drop((e, cx) => { cx.stop_propagation(); this.dropFiles(e?.paths, path, cx); }))
             .child(renderFileIcon(div, svg, entry.name, entry.dir, open, cfg.iconTheme, t))
             .child(div().flex_1().min_w(0).truncate().text_size(12).child(entry.name))
             .when(entry.dir && this.pendingFolders.has(path), (el) => el.child(div().text_size(10.5).text_color(t.dim).child("…")))
@@ -1665,8 +1758,15 @@ export default class IdeSidebar extends View {
       )
       .child(
         div().flex_1().min_h(0).relative()
+          .on_drop((e, cx) => this.dropFiles(e?.paths, "", cx))
           .child(
             v_flex().id("ide-exp-tree").track_scroll(this.treeScroll).absolute().inset_0().overflow_y_scroll().p(2)
+              .on_mouse_down("right", (_e, cx) => {
+                cx.stop_propagation();
+                this.sel.clear();
+                this.selAnchor = null;
+                this.openExplorerBgMenu();
+              })
               .children(rows)
               .when(rows.length === 0, (el) => el.child(div().p(10).text_size(12).text_color(t.dim).child(this.error || (this.loadingExplorer ? "Loading files…" : "No files")))),
           )
